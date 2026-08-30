@@ -1,0 +1,73 @@
+{
+  "region": "cn",
+  "poll_interval": 20,
+  "sprint_interval": 5,
+  "jitter": 0.3,
+  "timeout": 15,
+  "proxy": "",
+  "open_browser_on_hit": true,
+  "launch_watch": {
+    "slugs": [
+      "iphone-18",
+      "iphone-18-pro"
+    ]
+  },
+  "pickup": {
+    "enabled": true,
+    "location": "",
+    "stores": []
+  },
+  "autobuy": {
+    "enabled": false,
+    "mode": "auto",
+    "cdp_url": "",
+    "cdp_port": 9222,
+    "headless": false,
+    "profile_dir": ".browser-profile",
+    "trade_in": "不折抵",
+    "applecare": "不加 AppleCare",
+    "timeout_ms": 30000,
+    "pickup_store_name": "",
+    "warm": true,
+    "clear_bag_before_add": true
+  },
+  "watch": [],
+  "notifiers": {
+    "bark": {
+      "enabled": false,
+      "key": "把 Bark App 里的 key 填这里",
+      "server": "https://api.day.app",
+      "sound": "alarm",
+      "volume": 10,
+      "group": "iPhone"
+    },
+    "serverchan": {
+      "enabled": false,
+      "key": "SCTxxxxxxxx"
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "123456:ABC-DEF",
+      "chat_id": "123456789"
+    },
+    "wecom": {
+      "enabled": false,
+      "webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx"
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "https://example.com/hook"
+    },
+    "command": {
+      "enabled": false,
+      "cmd": "echo \"$HUNTER_TITLE $HUNTER_URL\" >> hits.log"
+    },
+    "desktop": {
+      "enabled": true
+    },
+    "sound": {
+      "enabled": true,
+      "repeat": 5
+    }
+  }
+}

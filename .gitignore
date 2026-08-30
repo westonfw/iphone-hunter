@@ -1,0 +1,7 @@
+config.json
+state.json
+hits.log
+__pycache__/
+*.pyc
+.venv/
+.browser-profile/
