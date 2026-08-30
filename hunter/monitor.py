@@ -67,7 +67,8 @@ class BaseWatcher:
         self.jitter = float(cfg.get("jitter", 0.3))
         self.fail_streak = 0
 
-        ab = cfg.get("autobuy") or {}
+        ab = dict(cfg.get("autobuy") or {})
+        ab.setdefault("region", cfg.get("region", "cn"))
         self.autobuy = AutoBuy(ab, root, log=log) if ab.get("enabled") else None
         self.autobuy_done = False
         # 预热：开卖前把产品页加载好、选项选好，放货时省掉整个页面加载
@@ -99,22 +100,24 @@ class BaseWatcher:
             try:
                 # 页面预热过就直接开火，省掉加载产品页那 700KB
                 r = self.autobuy.fire() if self.autobuy.warmed else self.autobuy.buy(url)
+                extra = f"\n订单号 {r.order_id}" if r.order_id else ""
                 self.bc.send(
                     f"{'✅' if r.ok else '⚠️'} 自动下单：{r.stage}",
-                    r.detail or "详见终端", r.url or url, critical=True,
+                    (r.detail or "详见终端") + extra, r.url or url, critical=True,
                 )
+                if not r.ok and not self.autobuy.order_placed:
+                    self.autobuy_done = False
             except AutoBuyUnavailable as e:
                 self.autobuy_done = False  # 环境问题，下次还能再试
                 self.log(f"[自动下单] 不可用：{e}")
                 self.bc.send("⚠️ 自动下单没能启动", str(e), url, critical=True)
             except Exception as e:
-                # 还没加进购物袋就失败 → 允许下一轮重试；已经加进去了就不再动，
-                # 免得重复加购。
-                if not self.autobuy.added_to_bag:
+                # 还没创建订单就可以再试：没加购则整段重来，已加购则下次只走结账。
+                if not self.autobuy.order_placed:
                     self.autobuy_done = False
-                    retry = "（还没加购，下一轮会重试）"
+                    retry = "（订单未创建，下一轮会重试）"
                 else:
-                    retry = "（已加购，不再自动重试）"
+                    retry = "（订单已创建，不再自动重试）"
                 self.log(f"[自动下单] 出错：{type(e).__name__}: {e} {retry}")
                 self.bc.send("⚠️ 自动下单失败，请手动下单",
                              f"{type(e).__name__}: {e}\n{retry}", url, critical=True)

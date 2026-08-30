@@ -29,7 +29,14 @@
     "timeout_ms": 30000,
     "pickup_store_name": "",
     "warm": true,
-    "clear_bag_before_add": true
+    "clear_bag_before_add": true,
+    "place_order": true,
+    "payment_method": "支付宝",
+    "delivery": "pickup",
+    "id_last4": "",
+    "pickup_last_name": "",
+    "pickup_first_name": "",
+    "pickup_phone": ""
   },
   "watch": [],
   "notifiers": {

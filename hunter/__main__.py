@@ -222,12 +222,13 @@ def cmd_rehearse(args) -> int:
 
     ab = dict(cfg.get("autobuy") or {})
     ab["enabled"] = True
+    ab.setdefault("region", args.region or cfg.get("region", "cn"))
     if args.show:
         ab["headless"] = False
     url = client.buy_url(slug, part)
 
     print("彩排会做这些事：打开机型页 → 选掉「折抵换购」和「AppleCare+」→ 检查加购按钮是否可点。")
-    print("它**不会**点加购，也不会下单。\n")
+    print("它**不会**点加购，也不会创建订单。\n")
     try:
         r = AutoBuy(ab, ROOT).rehearse(url)
     except AutoBuyUnavailable as e:
@@ -237,8 +238,77 @@ def cmd_rehearse(args) -> int:
     if r.detail:
         print(f"  {r.detail}")
     if r.ok:
-        print("\n下一步：确认那个 Chrome 里已经登录 Apple ID、收货地址和付款方式都在。")
-        print("确认无误后把 config.json 的 autobuy.enabled 改成 true。")
+        print("\n下一步：确认那个 Chrome 里已经登录 Apple ID、收货地址、发票都在，")
+        print("并把 config.json 的 autobuy.payment_method 设成支付宝或微信。")
+        print("确认无误后把 autobuy.enabled 改成 true：命中后会点「现在下单」创建待付款订单，付款仍是你自己来。")
+    return 0 if r.ok else 1
+
+
+def _target_from_args(args, cfg):
+    watch = cfg.get("watch") or []
+    if args.part:
+        part, slug = args.part, (args.slug or "")
+        if not slug:
+            for w in watch:
+                if w["part"] == part:
+                    slug = w.get("model_slug", "")
+    elif watch:
+        part, slug = watch[0]["part"], watch[0].get("model_slug", "")
+    else:
+        raise SystemExit("✗ 需要一个目标：加 --part <PART> --slug <机型>，或先跑 `parts <机型> --save`")
+    if not slug:
+        raise SystemExit(f"✗ 不知道 {part} 属于哪个机型页面，加 --slug")
+    return part, slug
+
+
+def cmd_buy(args) -> int:
+    """真跑一次下单：加购 → 现在下单 → 停在待付款。不经过库存监控。"""
+    cfg = load_config()
+    ab = dict(cfg.get("autobuy") or {})
+    if not args.confirm:
+        pay = ab.get("payment_method") or "支付宝"
+        store = ab.get("pickup_store_name") or "（未填，结账时请手动选）"
+        last4 = ab.get("id_last4") or ""
+        print("这会在你已登录的 Chrome 里走完整结账向导：")
+        print("  自提 → 身份证后四位 → 付款方式 → 检查订单 → Review 确认下单")
+        print("会生成一笔待付款订单，不会代你付款；超时未付订单会被取消。")
+        print(f"  支付方式：{pay}")
+        print(f"  取货门店：{store}")
+        print(f"  身份证后四位：{'已填' if last4 else '未填（PickupContact 会卡住）'}")
+        if not last4:
+            print("\n先在 config.json 的 autobuy.id_last4 填身份证后 4 位（可含 X）。")
+        print("\n确认后加上 --confirm：")
+        print("      python -m hunter buy --confirm")
+        return 1
+
+    part, slug = _target_from_args(args, cfg)
+    if (ab.get("delivery") or "pickup") == "pickup":
+        last4 = "".join(str(ab.get("id_last4") or "").split()).upper()
+        if len(last4) != 4:
+            print("✗ 到店取货必须先在 config.json 的 autobuy.id_last4 填身份证后 4 位。")
+            return 1
+
+    client = AppleClient(args.region or cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
+    ab["enabled"] = True
+    ab.setdefault("region", args.region or cfg.get("region", "cn"))
+    url = client.buy_url(slug, part)
+    print(f"目标：{part}（{slug}）")
+    print(f"购买页：{url}")
+    print("开始创建待付款订单……\n")
+    try:
+        r = AutoBuy(ab, ROOT).buy(url)
+    except AutoBuyUnavailable as e:
+        print(f"✗ {e}")
+        return 1
+    print(f"\n{'✓' if r.ok else '✗'} {r.stage}")
+    if r.order_id:
+        print(f"  订单号：{r.order_id}")
+    if r.detail:
+        print(f"  {r.detail}")
+    if r.url:
+        print(f"  {r.url}")
+    if r.ok:
+        print("\n请到打开的 Chrome 标签页完成付款。不要关那个窗口。")
     return 0 if r.ok else 1
 
 
@@ -277,6 +347,22 @@ def cmd_test(args) -> int:
     )
     print("\n已发送。手机/桌面没收到就去 config.json 检查对应渠道的 enabled 和密钥。")
     return 0
+
+
+def cmd_record(args) -> int:
+    """挂到已登录 Chrome，记录结账点击和步骤 URL。"""
+    from .record import run as record_run
+    cfg = load_config()
+    watch = cfg.get("watch") or []
+    url = ""
+    if watch:
+        client = AppleClient(args.region or cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
+        url = client.buy_url(watch[0].get("model_slug", ""), watch[0]["part"])
+    try:
+        return record_run(cfg, ROOT, buy_url=url)
+    except AutoBuyUnavailable as e:
+        print(f"✗ {e}")
+        return 1
 
 
 def main(argv=None) -> int:
@@ -324,11 +410,21 @@ def main(argv=None) -> int:
     sr.add_argument("--show", action="store_true", help="显示浏览器界面（用来登录 Apple ID）")
     sr.set_defaults(func=cmd_rehearse)
 
+    sb = sub.add_parser("buy", help="立刻加购并创建待付款订单（真会下单，需 --confirm）")
+    sb.add_argument("--part", help="目标 part number，默认取监控列表第一个")
+    sb.add_argument("--slug", help="机型页面标识")
+    sb.add_argument("--confirm", action="store_true",
+                    help="确认：会加购并点「现在下单」，生成待付款订单，付款仍由你自己完成")
+    sb.set_defaults(func=cmd_buy)
+
     si = sub.add_parser("inspect-checkout", help="只读查看结账页的配送方式控件")
     si.set_defaults(func=cmd_inspect)
 
     st = sub.add_parser("test", help="发一条测试通知，验证渠道配置")
     st.set_defaults(func=cmd_test)
+
+    sr = sub.add_parser("record", help="挂到 Chrome 记录你的人工结账操作")
+    sr.set_defaults(func=cmd_record)
 
     args = p.parse_args(argv)
     return args.func(args)

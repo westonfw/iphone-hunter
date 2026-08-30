@@ -1,25 +1,16 @@
-"""半自动下单：把结账前的操作全部代劳，只把「付款」那一下留给你。
+"""半自动下单：创建待付款订单，付款留给你。
 
-为什么需要它
-------------
-从「有货」到「付款成功」的时间账：轮询延迟 2.5s + 推送送达 1-5s +
-你看到手机 5-60s + 手动选配置结账 60-90s ≈ 70-150 秒。
-补货窗口常常只有几十秒，所以瓶颈根本不在监控，在最后那 90 秒。
-
-这个模块把 90 秒压到接近 0：检测到有货时，在你**已经登录好的**浏览器里
-自动完成「打开机型页 → 选掉必选项 → 加入购物袋 → 进入结账」，然后停下来
-响铃叫你，你只需要确认付款。
+检测到有货时，在你已经登录的浏览器里：
+  预热页点加购（atbtoken 必须由页面 JS 现算）
+  → 页面内同源请求 / 直跳结账（不傻等购物袋整页加载）
+  → 选取货与扫码支付
+  → 点「现在下单」
+  → 停在待付款 / 扫码页，响铃叫你去付。
 
 边界（硬性）
 -----------
-**绝不提交付款。** 流程停在结账/付款页就交还给你。这不是可配置项。
-原因有二：付款必须由你本人确认；Apple 结算页有风控，脚本化提交容易触发。
-
-必选项是怎么回事
----------------
-SKU 深链只能带出颜色和容量，页面上「折抵换购」和「AppleCare+」两组单选
-不选，「添加到购物袋」按钮会一直是 disabled——实测就是这样。这两组共约
-6 次点击，正是抢购时最容易手忙脚乱的地方，所以交给脚本。
+**绝不代你付款。** 不填支付密码、不确认 Apple Pay、不在信用卡路径上点下单。
+支付宝 / 微信 / 花呗点「现在下单」只是创建待付款订单，窗口内由你扫码。
 """
 
 from __future__ import annotations
@@ -31,6 +22,8 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+from .checkout import OrderPlacer
 
 DEFAULT_CDP_PORT = 9222
 
@@ -69,6 +62,7 @@ class BuyResult:
     stage: str          # 走到了哪一步
     url: str = ""
     detail: str = ""
+    order_id: str = ""
 
 
 def cdp_candidates(configured: str = "", port: int = DEFAULT_CDP_PORT) -> list[str]:
@@ -133,8 +127,9 @@ class AutoBuy:
         self.timeout = int(self.cfg.get("timeout_ms", 30000))
         # 到店取货：只做「尽力尝试 + 大声提醒」，见 _choose_pickup 的说明
         self.pickup_store_name = (self.cfg.get("pickup_store_name") or "").strip()
-        # 已经加进购物袋了就不能盲目重试，否则会重复下单
+        # 已经加进购物袋了就不能盲目重试加购，否则会重复下单
         self.added_to_bag = False
+        self.order_placed = False
         # 预热用的常驻会话
         self._pwctx = self._pw = self._ctx = self._page = None
         self._attached = False
@@ -144,6 +139,15 @@ class AutoBuy:
         # 加购前先清空购物袋。Apple 限购（iPhone 每人 2 台），袋里有存货
         # 会让新加的这台结不了账，而且 Apple 不弹错、只是静默卡住。
         self.clear_bag = bool(self.cfg.get("clear_bag_before_add", True))
+        self.place_order = bool(self.cfg.get("place_order", True))
+        self.payment_method = (self.cfg.get("payment_method") or "支付宝").strip()
+        self.delivery = (self.cfg.get("delivery") or "pickup").strip()
+        self.region = (self.cfg.get("region") or "cn").strip()
+        self.id_last4 = str(self.cfg.get("id_last4") or "")
+        self.pickup_last_name = str(self.cfg.get("pickup_last_name") or "")
+        self.pickup_first_name = str(self.cfg.get("pickup_first_name") or "")
+        self.pickup_email = str(self.cfg.get("pickup_email") or "")
+        self.pickup_phone = str(self.cfg.get("pickup_phone") or "")
 
     def find_cdp(self) -> tuple[str, dict] | None:
         for url in cdp_candidates(self.cdp_url, self.cdp_port):
@@ -250,7 +254,7 @@ class AutoBuy:
         return self._run(url, dry_run=True)
 
     def buy(self, url: str) -> BuyResult:
-        """真跑：加购 → 进结账页 → 停下叫人。不会提交付款。"""
+        """真跑：加购 → 创建待付款订单。不会代你付款。"""
         return self._run(url, dry_run=False)
 
     # ---------- 内部 ----------
@@ -332,14 +336,15 @@ class AutoBuy:
             self._pick(page, "applecare", self.applecare_text)
 
         # 已经超限就别再加了——加了也结不了账，只会让袋子更难收拾
-        if self.bag_over_limit and not dry_run:
+        if self.bag_over_limit and not dry_run and not self.added_to_bag:
             return BuyResult(
                 False, "⚠️ 购物袋已超限购，未加购", page.url,
                 f"{self.bag_over_limit}\n先把购物袋清空再抢，否则加多少都结不了账。")
 
-        ok, why = self._wait_add_button(page)
-        if not ok:
-            return BuyResult(False, "加购按钮不可用", page.url, why)
+        if not self.added_to_bag:
+            ok, why = self._wait_add_button(page)
+            if not ok:
+                return BuyResult(False, "加购按钮不可用", page.url, why)
 
         if dry_run:
             el = (time.monotonic() - t0)
@@ -347,59 +352,80 @@ class AutoBuy:
             return BuyResult(True, "排练通过（未加购）", page.url,
                              f"耗时 {el:.1f}s，选择器有效")
 
-        # 用 locator 而不是先前抓到的句柄——locator 每次操作都会重新定位
-        page.locator(SEL_ADD_TO_CART).first.click(timeout=self.timeout)
-        self.added_to_bag = True
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(2000)
-        self.log(f"[自动下单] 已加入购物袋（{time.monotonic() - t0:.1f}s）")
+        if not self.added_to_bag:
+            # 用 locator 而不是先前抓到的句柄——locator 每次操作都会重新定位
+            page.locator(SEL_ADD_TO_CART).first.click(timeout=self.timeout)
+            self.added_to_bag = True
+            # 只等加购请求出门，不加载 700KB 购物袋页（等 URL 变化最坏会烧掉数秒）
+            page.wait_for_timeout(600)
+            self.log(f"[自动下单] 已加入购物袋（{time.monotonic() - t0:.1f}s），不加载购物袋页")
+        else:
+            self.log("[自动下单] 购物袋里已有货，跳过加购，直接创建订单")
 
-        page.goto(page.url.split("/shop/")[0] + "/shop/bag",
-                  timeout=self.timeout, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
+        placer = OrderPlacer(
+            region=self.region,
+            pickup_store=self.pickup_store_name,
+            payment=self.payment_method,
+            delivery=self.delivery,
+            id_last4=self.id_last4,
+            last_name=self.pickup_last_name,
+            first_name=self.pickup_first_name,
+            email=self.pickup_email,
+            phone=self.pickup_phone,
+            timeout_ms=self.timeout,
+            log=self.log,
+        )
+        page = placer.enter(ctx, page)
+        if self._page is not None:
+            self._page = page
+        self._settle(page)
 
+        if _is_sign_in(page.url):
+            self.log(f"[自动下单] ⚠️ 被拦在登录页（{time.monotonic() - t0:.1f}s）")
+            return BuyResult(
+                False, "⚠️ 卡在登录页", page.url,
+                "商品已加入购物袋，但结账被登录墙拦住。"
+                "这个 Chrome 没登录 Apple ID——现在就去登录。")
+
+        if "/shop/checkout" not in page.url:
+            st = self.bag_state(page)
+            if st.get("limitMsg"):
+                return BuyResult(
+                    False, "⚠️ 购物袋超出限购", page.url,
+                    f"{st['limitMsg']}\n袋里有 {st.get('items')} 件，先清空再抢。")
+            # 直跳失败时退回旧路径：打开购物袋再点结账
+            page = self._checkout_via_bag(ctx, page)
+            if _is_sign_in(page.url):
+                return BuyResult(False, "⚠️ 卡在登录页", page.url,
+                                 "结账被登录墙拦住，先登录 Apple ID。")
+            if "/shop/checkout" not in page.url:
+                return BuyResult(False, "⚠️ 没能进入结账页", page.url,
+                                 f"加购后直跳失败（{time.monotonic() - t0:.1f}s），请手动接管。")
+
+        if not self.place_order:
+            pickup_note = self._choose_pickup(page)
+            return BuyResult(True, "已到结账页", page.url,
+                             (pickup_note + "\n" if pickup_note else "")
+                             + f"place_order=false，停在结账页。总耗时 {time.monotonic() - t0:.1f}s")
+
+        ok, stage, detail, order_id = placer.place(page, t0)
+        if ok:
+            self.order_placed = True
+        return BuyResult(ok, stage, page.url, detail, order_id=order_id)
+
+    def _checkout_via_bag(self, ctx, page):
+        """直跳结账失败时的退路：打开购物袋再点结账。"""
+        try:
+            origin = page.url.split("/shop/")[0]
+            page.goto(origin + "/shop/bag", timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(800)
+        except Exception:
+            pass
         for sel in CHECKOUT_SELECTORS:
             el = page.query_selector(sel)
             if el and el.is_enabled():
-                # 「结账」在新标签页里打开，点完必须切过去——否则后面全在
-                # 旧的购物袋页上操作，会误判成功（踩过这个坑）
-                page = self._click_checkout(ctx, page, el)
-                total = time.monotonic() - t0
-
-                if "/shop/checkout" not in page.url and not _is_sign_in(page.url):
-                    # 没进结账页，先查是不是撞了限购——这是最常见的原因，
-                    # 而且 Apple 不会主动弹错，只让流程静默卡住
-                    st = self.bag_state(page)
-                    if st.get("limitMsg"):
-                        self.log(f"[自动下单] ⚠️ 撞到限购：{st['limitMsg']}")
-                        return BuyResult(
-                            False, "⚠️ 购物袋超出限购", page.url,
-                            f"{st['limitMsg']}\n袋里有 {st.get('items')} 件，先清空再抢。")
-                    return BuyResult(False, "⚠️ 没能进入结账页", page.url,
-                                     f"点了结账但没跳转（{total:.1f}s），请手动接管。")
-
-                # Apple 未登录时会把结账拦到 signIn 页。这时候报「已到结账页」
-                # 是假成功——抢购当天你会以为一切就绪，实际卡在登录墙前面。
-                if _is_sign_in(page.url):
-                    self.log(f"[自动下单] ⚠️ 被拦在登录页（{total:.1f}s）——这个 Chrome 没登录 Apple ID")
-                    return BuyResult(
-                        False, "⚠️ 卡在登录页", page.url,
-                        f"商品已加入购物袋，但结账被登录墙拦住（{total:.1f}s）。\n"
-                        f"这个 Chrome 没登录 Apple ID——抢购当天会因此丢单，现在就去登录。")
-
-                t_ck = time.monotonic()
-                pickup_note = self._choose_pickup(page)
-                self.log(f"[自动下单] 取货选择耗时 {time.monotonic() - t_ck:.1f}s")
-                self.log(f"[自动下单] 已进入结账页（总耗时 "
-                         f"{time.monotonic() - t0:.1f}s）——请手动完成付款")
-                detail = f"总耗时 {total:.1f}s。付款请你自己点。"
-                if pickup_note:
-                    detail = f"{pickup_note}\n{detail}"
-                return BuyResult(True, "已到结账页", page.url, detail)
-
-        # 结账按钮没找到也不算失败：东西已经在袋里，人接手就行
-        return BuyResult(True, "已加购，停在购物袋", page.url,
-                         "没找到结账按钮（可能需要先登录）——商品已在袋中，请手动结账")
+                return self._click_checkout(ctx, page, el)
+        return page
 
     def _empty_bag(self, page) -> int:
         """清空购物袋，返回移除的件数。

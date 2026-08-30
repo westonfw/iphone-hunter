@@ -1,6 +1,6 @@
 config.json
 state.json
-hits.log
+checkout-trace.jsonl
 __pycache__/
 *.pyc
 .venv/

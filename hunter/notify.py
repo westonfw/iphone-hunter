@@ -10,10 +10,50 @@ import os
 import shutil
 import subprocess
 import sys
+from urllib.parse import urlparse
 
 import requests
 
 TIMEOUT = 8
+
+
+def store_app_url(url: str) -> str:
+    """官网购买页换成 Apple Store App 的 URL Scheme，点开直接进 App，不经过 Safari。
+
+    App 注册了 applestore:// 。https://store.apple.com/... 是 Universal Link，
+    iOS 仍可能先落到 Safari 再跳 App。换成 scheme 后系统直接交给 App。
+    路径沿用 App 分享格式 /<区>/xc/product/<part>；part 含颜色和容量。
+    """
+    if not url:
+        return url
+    p = urlparse(url)
+    host = (p.netloc or "").lower()
+    if "apple.com" not in host and p.scheme != "applestore":
+        return url
+    segs = [s for s in p.path.split("/") if s]
+    part = _part_from_path(segs)
+    if not part:
+        return url
+    if host.endswith("apple.com.cn"):
+        region = "cn"
+    elif segs and segs[0] not in ("shop", "xc", "buy-iphone", "product"):
+        region = segs[0]
+    else:
+        region = "cn" if p.scheme == "applestore" else ""
+    path = f"/{region}/xc/product/{part}" if region else f"/xc/product/{part}"
+    return f"applestore://store.apple.com{path}"
+
+
+def _part_from_path(segs: list[str]) -> str:
+    if "product" in segs:
+        i = segs.index("product")
+        if len(segs) > i + 1:
+            return "/".join(segs[i + 1:])
+    if "buy-iphone" in segs:
+        i = segs.index("buy-iphone")
+        if len(segs) > i + 2:
+            return "/".join(segs[i + 2:])
+    return ""
 
 
 def _p(*a) -> None:
@@ -34,6 +74,9 @@ class Bark(Notifier):
     """iOS 上最好用的一路：可以强制响铃，点通知直接打开购买页。
 
     key 从 Bark App 首页复制，形如 https://api.day.app/xxxxxxxx/ 里的 xxxxxxxx。
+    购买链接改成 applestore://store.apple.com/cn/xc/product/<part>，
+    点通知直接进 Apple Store App，不经过 Safari。
+    part 已包含颜色和容量；折抵、AppleCare、门店没有公开深链参数。
     """
 
     name = "bark"
@@ -49,7 +92,7 @@ class Bark(Notifier):
             "isArchive": 1,
         }
         if url:
-            payload["url"] = url
+            payload["url"] = store_app_url(url)
         if critical:
             # level=critical 会无视静音和专注模式，volume 最大 10
             payload["level"] = "critical"
