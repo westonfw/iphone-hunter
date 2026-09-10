@@ -203,6 +203,10 @@ class StockWatcher(BaseWatcher):
         if not self.items:
             raise SystemExit("config.json 里 watch 是空的，先跑 `parts <机型> --save` 填进去")
         self.parts = [i["part"] for i in self.items]
+        self.part_groups: dict[str, list[str]] = {}
+        for item in self.items:
+            group = item.get("request_group") or "default"
+            self.part_groups.setdefault(group, []).append(item["part"])
         self.slug_of = {i["part"]: i.get("model_slug", "") for i in self.items}
         self.note_of = {i["part"]: i.get("note", "") for i in self.items}
 
@@ -235,8 +239,12 @@ class StockWatcher(BaseWatcher):
 
     def run(self) -> None:
         self._ensure_warm()
-        avail = self.client.availability(self.parts)
-        pickup = self.client.pickup(self.parts, location=self.location) if self.pickup_on else {}
+        avail: dict[str, Availability] = {}
+        pickup: dict[str, list[StorePickup]] = {}
+        for parts in self.part_groups.values():
+            avail.update(self.client.availability(parts))
+            if self.pickup_on:
+                pickup.update(self.client.pickup(parts, location=self.location))
 
         for part in self.parts:
             self._check_buyable(part, avail.get(part))

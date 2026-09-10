@@ -143,7 +143,7 @@ def cmd_launch(args) -> int:
     cfg = load_config()
     slugs = args.slug or (cfg.get("launch_watch") or {}).get("slugs") or []
     if not slugs:
-        print("✗ 没有要盯的机型：用 --slug iphone-18 或在 config.json 的 launch_watch.slugs 里填")
+        print("✗ 没有要盯的机型：用 --slug iphone-18-pro 或在 config.json 的 launch_watch.slugs 里填")
         return 1
     LaunchWatcher(cfg, ROOT, slugs, sprint=args.sprint).loop()
     return 0
@@ -374,7 +374,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("parts", help="列出某机型全部配置的 part number")
-    sp.add_argument("slug", help="机型页面标识，如 iphone-17 / iphone-17-pro")
+    sp.add_argument("slug", help="机型页面标识，如 iphone-18-pro")
     sp.add_argument("--save", action="store_true", help="写进 config.json 的监控列表")
     sp.add_argument("--filter", help="只保存名称包含该关键词的配置，如 '512GB'")
     sp.set_defaults(func=cmd_parts)
@@ -390,7 +390,7 @@ def main(argv=None) -> int:
     ss.set_defaults(func=cmd_stores)
 
     sl = sub.add_parser("launch", help="盯新机型购买页何时上线（发布会当天用这个）")
-    sl.add_argument("--slug", action="append", help="可重复，如 --slug iphone-18 --slug iphone-18-pro")
+    sl.add_argument("--slug", action="append", help="可重复，如 --slug iphone-18-pro")
     sl.add_argument("--sprint", action="store_true", help="冲刺模式，用更短的轮询间隔")
     sl.set_defaults(func=cmd_launch)
 

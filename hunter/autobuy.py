@@ -33,7 +33,7 @@ SEL_ADD_TO_CART = '[data-autom="add-to-cart"]'
 SEL_SECTION = '[data-analytics-section="{}"]'
 
 # 购物袋页进入结账的按钮，Apple 改过几次名字，按顺序试。
-# Apple 对 iPhone 有限购（实测「每名顾客最多可购买 2 个 iPhone 17」）。
+# Apple 对 iPhone 有限购（iPhone 18 Pro 购买页注明 Pro / Pro Max 各限 2 部）。
 # 袋里超量时点结账既不跳转也不报错，只是静默不动——必须主动识别。
 LIMIT_PATTERNS = ("最多可购买", "请调整订单", "超出购买上限", "限购", "购买数量")
 

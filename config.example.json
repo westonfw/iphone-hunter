@@ -8,7 +8,6 @@
   "open_browser_on_hit": true,
   "launch_watch": {
     "slugs": [
-      "iphone-18",
       "iphone-18-pro"
     ]
   },

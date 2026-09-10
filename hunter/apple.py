@@ -107,7 +107,7 @@ class SkuInfo:
     slug: str
 
     def buy_url(self, base: str) -> str:
-        # part 形如 MG6W4CH/A，直接拼在 slug 后面，Apple 会跳到已选好该配置的购买页
+        # part 形如 MJT74CH/A，直接拼在 slug 后面，Apple 会跳到已选好该配置的购买页
         return f"{base}/shop/buy-iphone/{self.slug}/{self.part}"
 
 
@@ -251,7 +251,7 @@ class AppleClient:
             raise NotLive(f"{slug} 还没上线（跳转到 {r.url}）")
 
         skus: dict[str, SkuInfo] = {}
-        # 页面里内嵌的商品清单：{"sku":"MG6W4","partNumber":"MG6W4CH/A","price":{"fullPrice":5999.00},...,"name":"iPhone 17 256GB Black"}
+        # 页面里内嵌的商品清单：{"sku":"MJT74","partNumber":"MJT74CH/A","price":{"fullPrice":9999.00},...,"name":"iPhone 18 Pro 256GB Black"}
         pattern = re.compile(
             r'\{"sku":"[^"]+","partNumber":"(?P<part>[A-Z0-9]+[A-Z]{2}/A)"'
             r'(?:,"price":\{"fullPrice":(?P<price>[\d.]+)\})?'

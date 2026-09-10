@@ -75,7 +75,7 @@ Bark 走 `level=critical`：**静音、勿扰、专注模式都拦不住，会�
 ### 3. 找门店编号
 
 ```bash
-.venv/bin/python -m hunter stores 200000 --part MG6X4CH/A
+.venv/bin/python -m hunter stores 200000 --part MJT74CH/A
 ```
 
 ```
@@ -92,11 +92,24 @@ Bark 走 `level=critical`：**静音、勿扰、专注模式都拦不住，会�
 ### 4. 选定目标机型
 
 ```bash
-.venv/bin/python -m hunter parts iphone-17-pro                       # 看有哪些配置
-.venv/bin/python -m hunter parts iphone-17-pro --save --filter 512GB  # 存进监控列表
+.venv/bin/python -m hunter parts iphone-18-pro                       # 看 Pro / Pro Max 全部配置
+.venv/bin/python -m hunter parts iphone-18-pro --save --filter 512GB  # 存进监控列表
 ```
 
 `slug` 就是购买页 URL 的最后一段（`apple.com.cn/shop/buy-iphone/<slug>`）。
+
+#### iPhone 18 Pro 系列（中国大陆）
+
+根据 Apple 中国大陆官网 2026-09-10 公布的配置，iPhone 18 Pro 和 iPhone 18 Pro Max 共用购买页 slug `iphone-18-pro`。官网当前没有 `iphone-18` 购买页。两款机型都有黑色、银色、冰川蓝色和勃艮第酒红色，每款均为 256GB、512GB、1TB 和 2TB，合计 32 个 SKU。
+
+| 容量 | iPhone 18 Pro | iPhone 18 Pro Max |
+|---|---:|---:|
+| 256GB | RMB 9,999 | RMB 10,999 |
+| 512GB | RMB 11,999 | RMB 12,999 |
+| 1TB | RMB 15,499 | RMB 16,499 |
+| 2TB | RMB 20,499 | RMB 21,499 |
+
+Part number 由官网实时目录解析，不在代码里写死。运行上面的 `parts` 命令即可查看全部 32 个实际 part number；例如 `MJT74CH/A` 是 iPhone 18 Pro 256GB 黑色。官方信息见 [选购页](https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro) 和 [Apple 新闻稿](https://www.apple.com.cn/newsroom/2026/09/apple-debuts-iphone-18-pro-and-iphone-18-pro-max/)。
 
 ### 5. 抢购前必做：彩排
 
@@ -145,6 +158,7 @@ Bark 走 `level=critical`：**静音、勿扰、专注模式都拦不住，会�
 | `jitter` | 间隔抖动比例，默认 0.3 |
 | `open_browser_on_hit` | 命中时自动开浏览器（`autobuy` 开启时不用） |
 | `launch_watch.slugs` | `launch` 默认盯的机型 |
+| `watch[].request_group` | 可选请求分组；同组 SKU 合并查询，不同组分开查询 |
 | `pickup.location` | 查门店取货用的**邮政编码**，必填否则跳过门店监控 |
 | `pickup.stores` | 只盯这几家门店（如 `["R581"]`），留空 = 附近全部 |
 | `autobuy.enabled` | 命中时是否自动走到结账页，默认 `false`（**先跑 `rehearse`**） |
@@ -199,8 +213,8 @@ retail/pickup-message     →  北京 9 家店全部「今天可取货」
 **1. 加购请求确实抓到了**，而且比想象的简单——是个 GET，不是 POST，没有 CSRF 头：
 
 ```
-GET /shop/buy-iphone/iphone-17/mg6x4ch/a
-    ?product=MG6X4CH%2FA&purchaseOption=fullPrice&step=select
+GET /shop/buy-iphone/iphone-18-pro/mjt74ch/a
+    ?product=MJT74CH%2FA&purchaseOption=fullPrice&step=select
     &acpart=none&atbtoken=8
 ```
 
@@ -229,7 +243,7 @@ GET /shop/buy-iphone/iphone-17/mg6x4ch/a
 
 #### 坑 4：SKU 深链只能带出颜色和容量
 
-`/shop/buy-iphone/iphone-17/MG6X4CH/A` 能直接落在选好配置的页面，但**「添加到购物袋」按钮是 `disabled` 的**——页面上「折抵换购」和「AppleCare+」两组单选不选，按钮永远点不了。
+`/shop/buy-iphone/iphone-18-pro/MJT74CH/A` 能直接落在选好配置的页面，但**「添加到购物袋」按钮是 `disabled` 的**——页面上「折抵换购」和「AppleCare+」两组单选不选，按钮永远点不了。
 
 ```
 [tradein]    4 个选项，已选 0
@@ -252,7 +266,7 @@ Error: ElementHandle.is_enabled: Element is not attached to the DOM
 
 #### 坑 6：限购 2 台，超限时静默卡死
 
-> 每名顾客最多可购买 2 个 iPhone 17。在结帐之前，请调整订单中 iPhone 17 的总数。
+> 每位顾客限购 2 部 iPhone 18 Pro 和 2 部 iPhone 18 Pro Max。
 
 **Apple 超限时点「结账」既不跳转也不弹错，只是原地不动。** 代码会一路空等到超时——实测白烧 35 秒还报不出原因。抢购当天这就是直接出局。
 
@@ -360,7 +374,7 @@ networkingMode=mirrored
 8. **别开 VPN/代理**，容易被判风控。
 9. **提前 10 分钟挂上 `--sprint`**，让预热跑完。
 
-往年节奏：9 月上旬发布会 → 当周周五北京时间 20:00 开启预购 → 次周周五发售。以官方公告为准。
+iPhone 18 Pro 系列的官方时间：2026 年 9 月 12 日北京时间 20:00 开启预购，9 月 18 日正式发售。
 
 **关于首发预购**：中国大陆是**定时开售**，大家都知道时间，拼的是上面这些准备。**工具真正的主场是开售之后**——首批秒光后的补货、门店随机放货，都是随机时点掉出来的，那时候「被叫醒 + 4 秒加购」就是全部。
 
