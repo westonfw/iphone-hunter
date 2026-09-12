@@ -131,6 +131,41 @@ Part number 由官网实时目录解析，不在代码里写死。运行上面�
 
 ---
 
+## 只盯库存和取货状态
+
+不需要自动下单、只想「有货就叫我」的话，直接用 `watch`，别用 `run.sh`（那个会连带跑 `launch` 盯上架）。
+
+```bash
+python3 -m hunter watch            # 常规，poll_interval = 20s
+python3 -m hunter watch --sprint   # 开卖前 10 分钟，sprint_interval = 5s
+```
+
+`config.json` 里保证这几项，`watch` 就是纯监控形态：
+
+| 字段 | 值 | 效果 |
+|---|---|---|
+| `autobuy.enabled` | `false` | 命中只推送，不碰浏览器 |
+| `open_browser_on_hit` | `false` | 也不会自动弹浏览器 |
+| `pickup.enabled` | `true` | 查门店取货状态 |
+| `pickup.location` | 邮编，如 `200000` | 必填，否则跳过门店监控 |
+| `pickup.stores` | 如 `["R581","R359"]` | 只报这几家；留空 = 附近全部 |
+
+纯监控**不需要 venv 和 Playwright**，系统装个 `requests` 就能跑：
+
+```bash
+pip3 install requests
+```
+
+监控多个 SKU 时给它们填同一个 `request_group`，Apple 一次请求就能带回全部型号在每家门店的状态——**盯 12 个配置和盯 1 个，请求数一样**。
+
+想临时查一次就退出：
+
+```bash
+python3 -m hunter check --location 200000
+```
+
+---
+
 ## 命令
 
 | 命令 | 用途 |
@@ -139,7 +174,7 @@ Part number 由官网实时目录解析，不在代码里写死。运行上面�
 | `check [part...]` | 查一次就退出；`--location <邮编>` 顺带查门店 |
 | `stores <邮编>` | 列出附近直营店的编号 / 名称 / 地址 |
 | `launch --slug <机型>` | 持续盯机型购买页何时上线（**发布会当天用这个**） |
-| `watch` | 持续盯库存和门店，命中则预热 + 自动下单 |
+| `watch` | 持续盯库存和门店，命中则预热 + 自动下单；`autobuy.enabled: false` 时就是[纯监控](#只盯库存和取货状态) |
 | `connect` | 诊断能否挂到你已登录的 Chrome；`--launch` 直接开一个 |
 | `rehearse` | 彩排自动下单流程（不会真的下单） |
 | `inspect-checkout` | 只读查看结账页的配送方式控件 |
