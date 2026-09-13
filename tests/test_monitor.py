@@ -60,3 +60,52 @@ class StockWatcherNotificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaymentAlertTests(unittest.TestCase):
+    """订单创建成功、等待付款时的专门提醒。"""
+
+    def setUp(self):
+        from hunter.autobuy import BuyResult
+        self.BuyResult = BuyResult
+        self.w = StockWatcher.__new__(StockWatcher)
+        self.w.cfg = {"autobuy": {"payment_method": "招商银行",
+                                  "installment_months": 24}}
+        self.w.log = lambda *_: None
+        self.sends = []
+        self.w.bc = type("B", (), {
+            "send": lambda _s, *a, **k: self.sends.append((a, k))})()
+
+    def fire(self, **kw):
+        r = self.BuyResult(True, "已创建待付款订单",
+                           "https://secure7.www.apple.com.cn/shop/checkout/thankyou",
+                           "订单号 W1452578807。", order_id="W1452578807", **kw)
+        self.w._notify_pay(r, "🚨 刚放货：iPhone 18 Pro Max 256GB 银色")
+        return self.sends[0]
+
+    def test_title_says_go_pay_with_order_id(self):
+        (title, body, url), kw = self.fire()
+        self.assertIn("去付款", title)
+        self.assertIn("W1452578807", title)
+
+    def test_body_names_the_model_and_payment(self):
+        (title, body, url), kw = self.fire()
+        self.assertIn("iPhone 18 Pro Max 256GB 银色", body)
+        self.assertIn("招商银行 24 期", body)
+        self.assertIn("30 分钟", body)
+
+    def test_links_to_checkout_not_the_product_page(self):
+        # 点错了会跳去再买一台
+        (title, body, url), kw = self.fire()
+        self.assertIn("/shop/checkout", url)
+        self.assertNotIn("buy-iphone", url)
+
+    def test_is_critical_so_it_breaks_through_silent_mode(self):
+        (title, body, url), kw = self.fire()
+        self.assertTrue(kw.get("critical"))
+
+    def test_works_without_installments(self):
+        self.w.cfg["autobuy"]["installment_months"] = 0
+        (title, body, url), kw = self.fire()
+        self.assertIn("招商银行", body)
+        self.assertNotIn("期", body.split("\n")[1])

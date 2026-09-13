@@ -225,6 +225,56 @@ python3 -m hunter check --location 200000
 
 ---
 
+## 日志：终端 + 每个请求都落盘
+
+监控是挂通宵的活，终端 scrollback 留不住——而「凌晨三点被拦了几次、什么时候恢复的、
+放货那一刻请求耗时多少」恰恰是事后唯一有用的东西。所以每次运行都写两份：
+
+```
+logs/watch-2026-09-14.log            # 终端上看到的一切，每行带日期+秒级时间戳
+logs/watch-2026-09-14.requests.jsonl # 每个请求一行：URL / 参数 / 状态码 / 耗时 / 字节数 / 用的哪套身份
+```
+
+文件名带命令名，因为 `run.sh` 会同时跑 `launch` 和 `watch` 两个进程，写同一个文件会互相插行。
+按天滚动，超过 `keep_days` 天的自动删掉，不用配 logrotate。
+
+请求明细**只落盘、不打终端**：每轮一两条，打出来会把库存变化那几行刷没。被拦的请求照样记
+（`status: 541` + `error`）——校准预算靠的就是这些。
+
+```jsonl
+{"ts":"2026-09-14T01:12:03.118","cmd":"watch","n":88,"url":"https://www.apple.com.cn/shop/retail/pickup-message","params":{"parts.0":"MJT74CH/A","location":"200000"},"ms":794,"status":200,"bytes":57432,"ua":"Chrome/152.0.0.0"}
+```
+
+几个现成的用法：
+
+```bash
+# 这一天每小时发了多少请求 —— 拿它调 budget_per_hour
+jq -r .ts logs/watch-*.requests.jsonl | cut -c1-13 | uniq -c
+
+# 被拦了几次、什么时候
+jq -r 'select(.status>=400) | "\(.ts) \(.status) \(.ua)"' logs/watch-*.requests.jsonl
+
+# 响应耗时的分布（Apple 那边卡不卡）
+jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中位",a[int(NR/2)],"p95",a[int(NR*0.95)]}'
+```
+
+配置在 `logging` 段，不配就是下面这些默认值，开箱即写：
+
+```jsonc
+"logging": {
+  "enabled": true,      // 整个关掉就只打终端
+  "dir": "logs",        // 相对仓库根目录，也可以给绝对路径
+  "requests": true,     // 关掉就只留终端日志，不记请求明细
+  "keep_days": 14,      // 超过这么多天的日志自动删，0 = 永久保留
+  "echo": true          // false = 只写文件、终端不打（nohup 挂后台时用）
+}
+```
+
+日志里不会出现密码、身份证号、卡号：请求明细只记 Apple 的公开查询接口，结账那条链路走的是
+浏览器、本来就不经过这里，而终端输出里的这些字段早就是打码的。
+
+---
+
 ## 命令
 
 | 命令 | 用途 |
@@ -250,13 +300,14 @@ python3 -m hunter check --location 200000
 | `region` | 区域，默认 `cn` |
 | `pacing.*` | 请求节奏，见[怎么不被 block](#怎么不被-block跑得久比跑得快重要) |
 | `poll_interval` / `sprint_interval` | 老字段，只在没配 `pacing` 时当默认间隔用 |
+| `logging.*` | 日志落盘，见[日志](#日志终端--每个请求都落盘)。不配就用默认值 |
 | `open_browser_on_hit` | 命中时自动开浏览器（`autobuy` 开启时不用） |
 | `launch_watch.slugs` | `launch` 默认盯的机型 |
 | `watch[].request_group` | 可选请求分组；同组 SKU 合并查询，不同组分开查询 |
 | `pickup.location` | 查门店取货用的**邮政编码**，必填否则跳过门店监控 |
 | `pickup.stores` | 只盯这几家门店（如 `["R581"]`），留空 = 附近全部 |
 | `autobuy.enabled` | 命中时是否自动走到结账页，默认 `false`（**先跑 `rehearse`**） |
-| `autobuy.warm` | 是否预热产品页，默认 `true`。**这是慢网下最有效的一招** |
+| `autobuy.warm` | 是否预热产品页，**默认 `false`**。只在知道几点开卖时才开（发布会当晚提前半小时）；补货监控不知道什么时候放货，挂久了预热页的会话会过期 |
 | `autobuy.pickup_stores` | 可接受的取货门店名（如 `["五角场","浦东"]`）。放货那一刻真有货的会自动排到最前，留空 = 有货的都能下。老字段 `pickup_store_name` 仍兼容 |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
 | `autobuy.pickup_store_name` | 结账时尝试选的取货门店名，如 `"五角场"` |
@@ -495,9 +546,11 @@ hunter/autobuy.py   预热 + 半自动下单（挂你自己的 Chrome），停�
 hunter/notify.py    各通知渠道 + 打开浏览器
 hunter/monitor.py   轮询循环、状态指纹、状态落盘
 hunter/pacing.py    请求节奏：泊松间隔、每小时预算、AIMD 退避、冷热时段
+hunter/logbook.py   日志落盘：终端输出按天滚动 + 每个请求一行 jsonl
 hunter/__main__.py  命令行入口
 config.json         你的配置（已 gitignore）
 state.json          上一轮状态，避免重启后重复通知
+logs/               运行日志和请求明细（已 gitignore）
 .browser-profile/   退回模式用的独立 profile（挂你自己的 Chrome 时不用）
 ```
 

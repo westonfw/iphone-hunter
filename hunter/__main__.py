@@ -11,6 +11,7 @@ from .apple import REGIONS, AppleClient, Blocked, NotLive, Stock
 from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list,
                       cdp_candidates, inspect_checkout, launch_debug_chrome, probe_cdp,
                       windows_chrome)
+from .logbook import setup as setup_logbook
 from .monitor import LaunchWatcher, StockWatcher
 from .notify import Broadcaster
 
@@ -438,7 +439,41 @@ def main(argv=None) -> int:
     sr.set_defaults(func=cmd_record)
 
     args = p.parse_args(argv)
-    return args.func(args)
+
+    # 日志要在跑命令之前接上，之后所有 print 都会同时落盘。
+    # 配置读不出来（首次运行、格式错）也不该拦住命令本身，那就用默认值。
+    try:
+        log_cfg = (load_config().get("logging") or {})
+    except SystemExit:
+        log_cfg = {}
+    lb = setup_logbook(ROOT, log_cfg, command=args.cmd, argv=argv or sys.argv[1:])
+    if lb:
+        req = f"，请求明细 {lb.req_path.name}" if lb.req_path else ""
+        print(f"[日志] {lb.log_path}{req}")
+
+    outcome = ""
+    try:
+        rc = args.func(args)
+        outcome = f"退出码 {rc}"
+        return rc
+    except KeyboardInterrupt:
+        outcome = "被 Ctrl+C 中断"
+        raise
+    except SystemExit as e:
+        # argparse / 各命令用 SystemExit("说明") 报错退出。默认那条说明只会
+        # 打到真正的 stderr，绕过日志——手动打一遍，日志里才留得下原因。
+        if isinstance(e.code, str):
+            outcome = e.code
+            print(e.code)
+            return 1
+        outcome = f"退出码 {e.code}"
+        raise
+    except BaseException as e:
+        outcome = f"{type(e).__name__}: {e}"
+        raise
+    finally:
+        if lb:
+            lb.close(outcome)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ from enum import Enum
 
 import requests
 
+from .logbook import log_request
+
 # 一次只用一套完整的浏览器指纹：UA 得跟 sec-ch-ua / platform 对得上，
 # 只改 UA 而 client hints 还是旧的，反而比不发这些头更可疑。
 BROWSERS = [
@@ -158,6 +160,16 @@ _NAV_HEADERS = {
 }
 
 
+def _ua_tag(ua: str) -> str:
+    """把 UA 压成一个短标签（如 Chrome/152.0.0.0），日志里用来区分当前是哪套身份。
+
+    存整条 UA 没意义：每行都一样长、还把 jsonl 撑胖。真正要回看的是「被拦之后
+    换身份了吗、换成了哪个」。
+    """
+    tags = re.findall(r"(?:Edg|Chrome|Version|Firefox)/[\d.]+", ua)
+    return tags[-1] if tags else "?"
+
+
 def _retry_after(resp) -> float:
     """把 Retry-After 头解析成秒。对方明说了要等多久，就别自己猜。"""
     raw = (resp.headers.get("Retry-After") or "").strip()
@@ -226,10 +238,40 @@ class AppleClient:
 
     def _get(self, path: str, params: dict | None = None, want_json: bool = True,
              missing_means_not_live: bool = False, headers: dict | None = None):
+        """发一个请求并记账。每个请求都会写进 requests.jsonl（没装日志时是空操作）。
+
+        判定逻辑在 _decode 里，这里只负责发请求、计数、落日志——包括**失败的那些**：
+        被拦截的时刻和耗时正是事后校准预算时唯一有用的数据。
+        """
         url = path if path.startswith("http") else f"{self.base}{path}"
         self.requests_made += 1
-        r = self.s.get(url, params=params, timeout=self.timeout, allow_redirects=True,
-                       headers=headers)
+        rec: dict = {"n": self.requests_made, "url": url}
+        if params:
+            rec["params"] = {k: str(v) for k, v in params.items()}
+        t0 = time.monotonic()
+        try:
+            r = self.s.get(url, params=params, timeout=self.timeout, allow_redirects=True,
+                           headers=headers)
+        except requests.RequestException as e:
+            rec["ms"] = round((time.monotonic() - t0) * 1000)
+            rec["error"] = f"{type(e).__name__}: {e}"[:300]
+            log_request(**rec)
+            raise
+        rec["ms"] = round((time.monotonic() - t0) * 1000)
+        rec["status"] = r.status_code
+        rec["bytes"] = len(r.content)
+        rec["ua"] = _ua_tag(self.browser["ua"])
+        if r.history:
+            rec["final"] = r.url          # 被重定向了，落地在哪很关键（如跳回落地页）
+        try:
+            return self._decode(r, url, want_json, missing_means_not_live)
+        except Exception as e:
+            rec["error"] = f"{type(e).__name__}: {e}"[:300]
+            raise
+        finally:
+            log_request(**rec)
+
+    def _decode(self, r, url: str, want_json: bool, missing_means_not_live: bool):
         if r.status_code in (403, 429, 503, 541):
             raise Blocked(f"HTTP {r.status_code} @ {url}", _retry_after(r))
         if r.status_code == 404:

@@ -22,6 +22,13 @@
   },
   "timeout": 15,
   "proxy": "",
+  "logging": {
+    "enabled": true,
+    "dir": "logs",
+    "requests": true,
+    "keep_days": 14,
+    "echo": true
+  },
   "open_browser_on_hit": true,
   "launch_watch": {
     "slugs": [
@@ -44,7 +51,7 @@
     "applecare": "不加 AppleCare",
     "timeout_ms": 30000,
     "pickup_stores": [],
-    "warm": true,
+    "warm": false,
     "clear_bag_before_add": true,
     "place_order": true,
     "stop_at_review": false,

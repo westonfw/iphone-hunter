@@ -72,8 +72,13 @@ class BaseWatcher:
         ab.setdefault("region", cfg.get("region", "cn"))
         self.autobuy = AutoBuy(ab, root, log=log) if ab.get("enabled") else None
         self.autobuy_done = False
-        # 预热：开卖前把产品页加载好、选项选好，放货时省掉整个页面加载
-        self.warm_enabled = bool(ab.get("warm", True))
+        # 预热：开卖前把产品页加载好、选项选好，放货时省掉整个页面加载。
+        #
+        # **默认关。** 它只在「知道几点开卖」时成立（发布会当晚那种），提前
+        # 半小时预热、半小时内开火。补货监控不知道什么时候放货，挂几小时后
+        # 那个页面的会话早过期、atbtoken 也失效了，还白占一个标签页。
+        # 何况预热页固定是列表里第一个型号，别的型号命中照样得跳转。
+        self.warm_enabled = bool(ab.get("warm", False))
         self.warm_url = ""
         self.warm_failed_at = 0.0
 
@@ -96,14 +101,20 @@ class BaseWatcher:
             self.autobuy_done = True
             try:
                 # 页面预热过就直接开火，省掉加载产品页那 700KB
-                r = (self.autobuy.fire(in_stock) if self.autobuy.warmed
+                # url 一定要传给 fire：预热页是列表里第一个型号，
+                # 放货的可能是任何一个，不核对就会买错颜色/容量
+                r = (self.autobuy.fire(url, in_stock) if self.autobuy.warmed
                      else self.autobuy.buy(url, in_stock))
-                extra = f"\n订单号 {r.order_id}" if r.order_id else ""
-                self.bc.send(
-                    f"{'✅' if r.ok else '⚠️'} 自动下单：{r.stage}",
-                    (r.detail or "详见终端") + extra, r.url or url, critical=True,
-                )
-                if not r.ok and not self.autobuy.order_placed:
+                if r.ok and r.order_id:
+                    self._notify_pay(r, title)
+                else:
+                    self.bc.send(
+                        f"{'✅' if r.ok else '⚠️'} 自动下单：{r.stage}",
+                        r.detail or "详见终端", r.url or url, critical=True,
+                    )
+                # 只有「还有戏」的失败才留着下轮重试。货被抢走了就收手——
+                # 再试也是每轮白烧几十秒，还把提醒刷成一片失败。
+                if not r.ok and not self.autobuy.order_placed and r.retriable:
                     self.autobuy_done = False
             except AutoBuyUnavailable as e:
                 self.autobuy_done = False  # 环境问题，下次还能再试
@@ -123,6 +134,25 @@ class BaseWatcher:
 
         if self.open_browser:
             open_in_browser(url, log=self.log)
+
+    def _notify_pay(self, r, hit_title: str) -> None:
+        """订单已创建、等待付款——单独发一条，别混在「下单成功」里。
+
+        这条是整条链路上**唯一需要你动手**的提醒，所以标题直说去付款、
+        把倒计时和订单号放最前面。链接指向结账页（那儿有二维码），
+        不是产品页——点错了会跳去再买一台。
+        """
+        what = hit_title.split("：", 1)[-1] if "：" in hit_title else hit_title
+        pay = (self.cfg.get("autobuy") or {}).get("payment_method") or "扫码"
+        months = (self.cfg.get("autobuy") or {}).get("installment_months") or 0
+        how = f"{pay} {months} 期" if months else pay
+        self.bc.send(
+            f"💳 去付款！{r.order_id}",
+            f"{what}\n{how}，请在约 30 分钟内扫码支付，超时订单会被取消。\n"
+            f"点这条打开结账页。",
+            r.url, critical=True,
+        )
+        self.log(f"[{now()}] 💳 待付款订单 {r.order_id} —— 去付款（约 30 分钟）")
 
     def run(self) -> None:
         raise NotImplementedError

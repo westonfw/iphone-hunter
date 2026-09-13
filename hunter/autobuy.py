@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -36,6 +37,19 @@ DEFAULT_CDP_PORT = 9222
 # 这些 data-autom 是 Apple 自己的自动化测试钩子，比 class 名稳定得多，
 # 也不受界面语言影响。
 SEL_ADD_TO_CART = '[data-autom="add-to-cart"]'
+
+#: 页面上出现这些字样 = 这个型号现在买不到了（多半是刚被人抢走）。
+#: 跟「必选项没选完」是两回事：那个重试有用，这个重试没用。
+SOLD_OUT_MARKS = ("暂无供应", "已售罄", "售罄", "目前无法购买", "无法购买",
+                  "缺货", "Currently unavailable", "Sold Out")
+
+JS_SOLD_OUT = """
+(marks) => {
+    const body = document.body ? (document.body.innerText || "") : "";
+    for (const m of marks) if (body.includes(m)) return m;
+    return "";
+}
+"""
 SEL_SECTION = '[data-analytics-section="{}"]'
 
 # 购物袋页进入结账的按钮，Apple 改过几次名字，按顺序试。
@@ -50,6 +64,15 @@ CHECKOUT_SELECTORS = [
     'button:has-text("结账")',
     'a:has-text("结账")',
 ]
+
+
+_PART_IN_URL = re.compile(r"/([A-Z0-9]{4,}[A-Z]{2}/A)(?:[/?#]|$)", re.I)
+
+
+def _part_of(url: str) -> str:
+    """从购买页地址里取出 part number，取不到返回空串。"""
+    m = _PART_IN_URL.search(url or "")
+    return m.group(1).upper() if m else ""
 
 
 #: 判断逻辑在 checkout.py（那边的 enter/on_checkout 也要用，而它不能反向
@@ -68,6 +91,9 @@ class BuyResult:
     url: str = ""
     detail: str = ""
     order_id: str = ""
+    #: 这次失败值不值得下一轮再试。货被别人买走了就别再试了——
+    #: 页面会一直是「无法购买」，重试只是每轮白烧几十秒。
+    retriable: bool = True
 
 
 #: Apple ID 密码从这个环境变量读，**不从 config.json 读**。
@@ -312,14 +338,25 @@ class AutoBuy:
         rest = [s for s in allow if s not in first]
         return first + rest
 
-    def fire(self, in_stock: list[str] | None = None) -> BuyResult:
-        """放货瞬间调用：直接用预热好的页面加购并进结账。
+    def fire(self, url: str = "", in_stock: list[str] | None = None) -> BuyResult:
+        """放货瞬间调用：用预热好的页面加购并进结账。
+
+        url 是**这次真正命中的那个型号**的购买页，必须核对：预热页加载的是
+        监控列表里的第一个型号，而放货的可能是任何一个——不核对就会出现
+        「提示银色、袋里进黑色」。对不上就老实跳转，慢几秒也比买错强。
 
         in_stock 是监控刚查到「有货」的门店名，用来决定去哪家取。
         """
         if not self.warmed or self._page is None or self._page.is_closed():
             raise AutoBuyUnavailable("页面没预热好")
-        return self._drive(self._ctx, self._page, None, dry_run=False, in_stock=in_stock)
+        want, got = _part_of(url), _part_of(getattr(self._page, "url", ""))
+        if want and want != got:
+            self.log(f"[自动下单] 预热页是 {got or '未知'}，这次要买 {want}——"
+                     "跳转到正确型号（放弃预热加速）")
+            return self._drive(self._ctx, self._page, url, dry_run=False,
+                               in_stock=in_stock)
+        return self._drive(self._ctx, self._page, None, dry_run=False,
+                           in_stock=in_stock)
 
     def rehearse(self, url: str) -> BuyResult:
         """排练：走到「加入购物袋」前一步就停，不改动购物袋。
@@ -429,6 +466,12 @@ class AutoBuy:
         if not self.added_to_bag:
             ok, why = self._wait_add_button(page)
             if not ok:
+                if why.startswith("SOLD_OUT:"):
+                    mark = why.split(":", 1)[1]
+                    return BuyResult(
+                        False, "⚠️ 已经买不到了", page.url,
+                        f"页面显示「{mark}」——多半是刚被人抢走。不再重试这一单。",
+                        retriable=False)
                 return BuyResult(False, "加购按钮不可用", page.url, why)
 
         if dry_run:
@@ -812,6 +855,13 @@ class AutoBuy:
         except Exception:
             pass
 
+    def _sold_out(self, page) -> str:
+        """这个型号是不是已经买不到了。返回命中的字样或空串。"""
+        try:
+            return page.evaluate(JS_SOLD_OUT, list(SOLD_OUT_MARKS)) or ""
+        except Exception:
+            return ""
+
     def _wait_add_button(self, page) -> tuple[bool, str]:
         """等「添加到购物袋」变为可点。
 
@@ -837,6 +887,10 @@ class AutoBuy:
             except Exception as e:
                 # 重绘期间的瞬时错误，下一轮重新定位即可
                 last = f"定位加购按钮反复失败：{str(e)[:70]}"
+            gone = self._sold_out(page)
+            if gone:
+                # 别耗满 30 秒：页面已经明说买不到了，等下去不会变
+                return False, f"SOLD_OUT:{gone}"
             page.wait_for_timeout(300)
         return False, last
 
