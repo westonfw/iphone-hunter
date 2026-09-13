@@ -16,7 +16,7 @@ class StockWatcherNotificationTests(unittest.TestCase):
         self.watcher.log = lambda *_: None
         self.hits = []
         self.sends = []
-        self.watcher.hit = lambda *args: self.hits.append(args)
+        self.watcher.hit = lambda *args, **kw: self.hits.append((args, kw))
         self.watcher.bc = type(
             "BroadcasterSpy",
             (),
@@ -52,7 +52,10 @@ class StockWatcherNotificationTests(unittest.TestCase):
         self.watcher._check_pickup("PART", [store])
 
         self.assertEqual(1, len(self.hits))
-        self.assertIn("启动时已有货", self.hits[0][0])
+        args, kw = self.hits[0]
+        self.assertIn("启动时已有货", args[0])
+        # 有货的门店要交给自动下单，否则它只会去配置里写死的那家
+        self.assertEqual(["测试直营店"], kw["in_stock"])
 
 
 if __name__ == "__main__":

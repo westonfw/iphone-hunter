@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -23,7 +24,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from .checkout import OrderPlacer
+from .apple import REGIONS
+# fill_field 定义在 checkout.py：调用点在那边，而 checkout 不能反向
+# import autobuy（循环导入）。这里再导出一次，保持 autobuy 也能 import。
+from .checkout import (BTN_SIGN_IN, ID_ACCOUNT, ID_PWD, JS_FILL, OrderPlacer,
+                       click_id, eval_in_frames, fill_field, frame_for_id,
+                       is_sign_in, read_field, wait_settled)
 
 DEFAULT_CDP_PORT = 9222
 
@@ -46,10 +52,9 @@ CHECKOUT_SELECTORS = [
 ]
 
 
-def _is_sign_in(url: str) -> bool:
-    """Apple 未登录时结账会被重定向到 signIn 页。"""
-    u = (url or "").lower()
-    return "/signin" in u or "idmsa.apple.com" in u
+#: 判断逻辑在 checkout.py（那边的 enter/on_checkout 也要用，而它不能反向
+#: import autobuy）。这里起个别名，保持本模块内的老叫法。
+_is_sign_in = is_sign_in
 
 
 class AutoBuyUnavailable(RuntimeError):
@@ -63,6 +68,47 @@ class BuyResult:
     url: str = ""
     detail: str = ""
     order_id: str = ""
+
+
+#: Apple ID 密码从这个环境变量读，**不从 config.json 读**。
+#: config.json 会被备份、同步盘、误提交带出去，而 Apple ID 泄露牵连的
+#: 远不止买手机这一件事。
+PWD_ENV = "HUNTER_APPLE_PWD"
+
+def _mask(account: str) -> str:
+    """打日志用的账号遮罩：a***@example.com。别把完整账号写进日志。"""
+    name, _, host = account.partition("@")
+    head = name[:1] if name else ""
+    return f"{head}***@{host}" if host else f"{head}***"
+
+
+#: 登录页上等各个控件出现的上限（毫秒）。抽成常量是为了能调、也为了测试不空转。
+SIGNIN_WAIT = {"pwd": 2500, "account": 4000, "pwd_after_account": 8000}
+
+
+def _apple_password(cfg: dict, log=print) -> str:
+    """取 Apple ID 密码。只认环境变量。"""
+    if cfg.get("pwd"):
+        log(f"⚠️ config.json 里还留着 autobuy.pwd —— 已忽略，请删掉它。"
+            f"密码改用环境变量 {PWD_ENV}。")
+    return os.environ.get(PWD_ENV, "")
+
+
+def _store_list(*sources) -> list[str]:
+    """把 pickup_stores / pickup_store_name 归一成有序去重的门店名列表。
+
+    两个键都认：新的收一串，老的收一个字符串（也允许写成逗号分隔）。
+    """
+    out: list[str] = []
+    for src in sources:
+        if not src:
+            continue
+        items = src if isinstance(src, (list, tuple)) else str(src).replace("，", ",").split(",")
+        for x in items:
+            name = str(x).strip()
+            if name and name not in out:
+                out.append(name)
+    return out
 
 
 def cdp_candidates(configured: str = "", port: int = DEFAULT_CDP_PORT) -> list[str]:
@@ -125,8 +171,11 @@ class AutoBuy:
         self.trade_in_text = self.cfg.get("trade_in", "不折抵")
         self.applecare_text = self.cfg.get("applecare", "不加 AppleCare")
         self.timeout = int(self.cfg.get("timeout_ms", 30000))
-        # 到店取货：只做「尽力尝试 + 大声提醒」，见 _choose_pickup 的说明
-        self.pickup_store_name = (self.cfg.get("pickup_store_name") or "").strip()
+        # 到店取货：只做「尽力尝试 + 大声提醒」，见 _choose_pickup 的说明。
+        # 可以给一串门店——哪家真有货是放货那一刻才知道的，写死一家等于
+        # 另外几家放货时白白卡在选店那一步。
+        self.pickup_stores = _store_list(self.cfg.get("pickup_stores"),
+                                         self.cfg.get("pickup_store_name"))
         # 已经加进购物袋了就不能盲目重试加购，否则会重复下单
         self.added_to_bag = False
         self.order_placed = False
@@ -141,9 +190,17 @@ class AutoBuy:
         self.clear_bag = bool(self.cfg.get("clear_bag_before_add", True))
         self.place_order = bool(self.cfg.get("place_order", True))
         self.payment_method = (self.cfg.get("payment_method") or "支付宝").strip()
+        self.installment_months = int(self.cfg.get("installment_months") or 0)
+        # 结账主机（secureN）。留空 = 每次自动探；探到后本进程记住，
+        # 抢购当天就不用在挨个试上浪费秒数了。
+        self.secure_host = (self.cfg.get("checkout_host") or "").strip()
+        # 测试用：一路走到 Review 页就停，不点「立即下单」
+        self.stop_at_review = bool(self.cfg.get("stop_at_review", False))
         self.delivery = (self.cfg.get("delivery") or "pickup").strip()
         self.region = (self.cfg.get("region") or "cn").strip()
         self.id_last4 = str(self.cfg.get("id_last4") or "")
+        self.apple_id = str(self.cfg.get("apple_id") or "")
+        self.pwd = _apple_password(self.cfg, self.log)
         self.pickup_last_name = str(self.cfg.get("pickup_last_name") or "")
         self.pickup_first_name = str(self.cfg.get("pickup_first_name") or "")
         self.pickup_email = str(self.cfg.get("pickup_email") or "")
@@ -239,11 +296,30 @@ class AutoBuy:
                 pass
         return state
 
-    def fire(self) -> BuyResult:
-        """放货瞬间调用：直接用预热好的页面加购并进结账。"""
+    def store_candidates(self, in_stock: list[str] | None = None) -> list[str]:
+        """这一单该按什么顺序试门店。
+
+        真有货的排前面——配置里的偏好顺序只在「都有货」时才有意义，
+        而放货那一刻通常只有一两家有。白名单为空 = 有货的都能下。
+        """
+        allow = self.pickup_stores
+        hot = [s.strip() for s in (in_stock or []) if s and s.strip()]
+        if not allow:
+            return hot
+        if not hot:
+            return list(allow)
+        first = [s for s in allow if any(s in h or h in s for h in hot)]
+        rest = [s for s in allow if s not in first]
+        return first + rest
+
+    def fire(self, in_stock: list[str] | None = None) -> BuyResult:
+        """放货瞬间调用：直接用预热好的页面加购并进结账。
+
+        in_stock 是监控刚查到「有货」的门店名，用来决定去哪家取。
+        """
         if not self.warmed or self._page is None or self._page.is_closed():
             raise AutoBuyUnavailable("页面没预热好")
-        return self._drive(self._ctx, self._page, None, dry_run=False)
+        return self._drive(self._ctx, self._page, None, dry_run=False, in_stock=in_stock)
 
     def rehearse(self, url: str) -> BuyResult:
         """排练：走到「加入购物袋」前一步就停，不改动购物袋。
@@ -253,13 +329,13 @@ class AutoBuy:
         """
         return self._run(url, dry_run=True)
 
-    def buy(self, url: str) -> BuyResult:
+    def buy(self, url: str, in_stock: list[str] | None = None) -> BuyResult:
         """真跑：加购 → 创建待付款订单。不会代你付款。"""
-        return self._run(url, dry_run=False)
+        return self._run(url, dry_run=False, in_stock=in_stock)
 
     # ---------- 内部 ----------
 
-    def _run(self, url: str, dry_run: bool) -> BuyResult:
+    def _run(self, url: str, dry_run: bool, in_stock: list[str] | None = None) -> BuyResult:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as e:
@@ -275,7 +351,7 @@ class AutoBuy:
             # 挂到已有 Chrome 时开新标签页，不要抢占用户正在看的页面
             page = ctx.new_page() if attached else (ctx.pages[0] if ctx.pages else ctx.new_page())
             try:
-                return self._drive(ctx, page, url, dry_run)
+                return self._drive(ctx, page, url, dry_run, in_stock=in_stock)
             finally:
                 if attached:
                     # 别关别人的浏览器，只在排练时收掉自己开的标签页
@@ -326,10 +402,19 @@ class AutoBuy:
                 last = e
         raise AutoBuyUnavailable(f"浏览器启动失败：{last}")
 
-    def _drive(self, ctx, page, url: str | None, dry_run: bool) -> BuyResult:
+    def _drive(self, ctx, page, url: str | None, dry_run: bool,
+               in_stock: list[str] | None = None) -> BuyResult:
         t0 = time.monotonic()
+        stores = self.store_candidates(in_stock)
+        if stores:
+            self.log(f"[自动下单] 取货门店优先级：{' > '.join(stores)}")
         if url is not None:
-            # url 为 None = 页面已预热好，直接省掉加载和选项这两步
+            # 顺序很要紧：**先清空购物袋，再打开产品页**。
+            # 反过来做（开着产品页、另开标签页去清袋、再回来加购）既多一个标签页，
+            # 也不是人的操作路径；而且清袋那一下会让产品页的会话状态过期。
+            if not dry_run and not self.added_to_bag and self.clear_bag:
+                self._clear_bag_now(page)
+
             page.goto(url, timeout=self.timeout * 2, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
             self._pick(page, "tradein", self.trade_in_text)
@@ -364,7 +449,7 @@ class AutoBuy:
 
         placer = OrderPlacer(
             region=self.region,
-            pickup_store=self.pickup_store_name,
+            pickup_stores=stores,
             payment=self.payment_method,
             delivery=self.delivery,
             id_last4=self.id_last4,
@@ -372,20 +457,37 @@ class AutoBuy:
             first_name=self.pickup_first_name,
             email=self.pickup_email,
             phone=self.pickup_phone,
+            installment_months=self.installment_months,
+            secure_host=self.secure_host,
+            stop_at_review=self.stop_at_review,
             timeout_ms=self.timeout,
             log=self.log,
         )
-        page = placer.enter(ctx, page)
+        # 跟着页面走：加购后按页面上的「结账」按钮，让 Apple 自己把你带到
+        # 它给这个会话分配的那台 secureN 上。自己拼地址跳转既容易跳错主机，
+        # 也是最典型的机器行为特征。直跳只在这条路走不通时兜底。
+        page = self._checkout_via_bag(ctx, page)
+        if "/shop/checkout" not in (page.url or "") and not _is_sign_in(page.url):
+            self.log("[自动下单] 页面上的结账按钮没走通，退回直跳结账地址")
+            page = placer.enter(ctx, page)
         if self._page is not None:
             self._page = page
-        self._settle(page)
+        # 登录页不用等它「稳定」，认出来就直接去登录，省掉那几秒
+        if not _is_sign_in(page.url):
+            self._settle(page)
 
         if _is_sign_in(page.url):
-            self.log(f"[自动下单] ⚠️ 被拦在登录页（{time.monotonic() - t0:.1f}s）")
-            return BuyResult(
-                False, "⚠️ 卡在登录页", page.url,
-                "商品已加入购物袋，但结账被登录墙拦住。"
-                "这个 Chrome 没登录 Apple ID——现在就去登录。")
+            self.log(f"[自动下单] 被拦在登录页（{time.monotonic() - t0:.1f}s），尝试自动登录")
+            ok, why = self._sign_in(page)
+            if not ok:
+                return BuyResult(
+                    False, "⚠️ 卡在登录页", page.url,
+                    f"商品已加入购物袋，但结账被登录墙拦住。{why}")
+            self.log(f"[自动下单] 登录完成（{time.monotonic() - t0:.1f}s）")
+            self._settle(page)
+            if "/shop/checkout" not in (page.url or ""):
+                # 登录后 Apple 未必自动回结账，按页面路径再走一次
+                page = self._checkout_via_bag(ctx, page)
 
         if "/shop/checkout" not in page.url:
             st = self.bag_state(page)
@@ -393,54 +495,210 @@ class AutoBuy:
                 return BuyResult(
                     False, "⚠️ 购物袋超出限购", page.url,
                     f"{st['limitMsg']}\n袋里有 {st.get('items')} 件，先清空再抢。")
-            # 直跳失败时退回旧路径：打开购物袋再点结账
-            page = self._checkout_via_bag(ctx, page)
-            if _is_sign_in(page.url):
-                return BuyResult(False, "⚠️ 卡在登录页", page.url,
-                                 "结账被登录墙拦住，先登录 Apple ID。")
-            if "/shop/checkout" not in page.url:
-                return BuyResult(False, "⚠️ 没能进入结账页", page.url,
-                                 f"加购后直跳失败（{time.monotonic() - t0:.1f}s），请手动接管。")
+            return BuyResult(False, "⚠️ 没能进入结账页", page.url,
+                             f"加购后没能走到结账页（{time.monotonic() - t0:.1f}s），请手动接管。")
 
         if not self.place_order:
-            pickup_note = self._choose_pickup(page)
+            pickup_note = self._choose_pickup(page, stores)
             return BuyResult(True, "已到结账页", page.url,
                              (pickup_note + "\n" if pickup_note else "")
                              + f"place_order=false，停在结账页。总耗时 {time.monotonic() - t0:.1f}s")
+
+        # 把探到的结账主机记回来，同一进程里后续几轮直接命中
+        if placer.secure_host:
+            self.secure_host = placer.secure_host
 
         ok, stage, detail, order_id = placer.place(page, t0)
         if ok:
             self.order_placed = True
         return BuyResult(ok, stage, page.url, detail, order_id=order_id)
 
-    def _checkout_via_bag(self, ctx, page):
-        """直跳结账失败时的退路：打开购物袋再点结账。"""
-        try:
-            origin = page.url.split("/shop/")[0]
-            page.goto(origin + "/shop/bag", timeout=self.timeout, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
-        except Exception:
-            pass
-        for sel in CHECKOUT_SELECTORS:
-            el = page.query_selector(sel)
-            if el and el.is_enabled():
-                return self._click_checkout(ctx, page, el)
-        return page
+    # ---------- 登录 ----------
 
-    def _empty_bag(self, page) -> int:
-        """清空购物袋，返回移除的件数。
+    def _sign_in(self, page) -> tuple[bool, str]:
+        """在登录页上完成登录。返回 (是否已登录, 说明)。
+
+        Apple 的登录框在 idmsa.apple.com 的 iframe 里，而且是**分步**的：
+        先填 Apple ID 点继续，密码框才出现。所以不能一上来就填密码。
+
+        信任设备上账号是被记住的，通常直接就是密码框（或账号框已填好），
+        这条快路走一步就到。account 那一步只是给「换了 profile / 记录被清掉」
+        兜底的。
+
+        双重认证这一步不碰——验证码在你手机上，脚本拿不到也不该拿。信任
+        设备一般不会问，但真问了就如实报出来，把浏览器留给你。
+        """
+        if not self.pwd:
+            return False, (f"没配密码。设环境变量 {PWD_ENV}，或者更省事："
+                           "在这个 Chrome 里手动登录一次，登录态会留在 profile 里。")
+
+        # 第一步：账号。密码框已经在了说明这步过了——信任设备上通常如此
+        if frame_for_id(page, ID_PWD, SIGNIN_WAIT["pwd"]) is None:
+            frame = frame_for_id(page, ID_ACCOUNT, SIGNIN_WAIT["account"])
+            if frame is None:
+                return False, "登录页上既没有账号框也没有密码框，页面结构可能变了"
+            remembered = read_field(frame, ID_ACCOUNT, frame=frame) or ""
+            if remembered:
+                # 页面记着账号，别覆盖它——直接点继续
+                self.log(f"[登录] 页面记着账号（{_mask(remembered)}），直接继续")
+            elif self.apple_id:
+                if not fill_field(page, ID_ACCOUNT, self.apple_id, log=self.log):
+                    return False, "Apple ID 没能填进去"
+            else:
+                return False, ("登录页要填 Apple ID，但页面没记住、config.json 里"
+                               "也没有 autobuy.apple_id")
+            click_id(page, BTN_SIGN_IN, settle=True, log=self.log)
+            if frame_for_id(page, ID_PWD, SIGNIN_WAIT["pwd_after_account"]) is None:
+                return False, (self._sign_in_blocked(page)
+                               or "填完 Apple ID 之后密码框没出现")
+
+        # 第二步：密码
+        if not fill_field(page, ID_PWD, self.pwd, log=self.log, secret=True):
+            return False, "密码没能填进去"
+        click_id(page, BTN_SIGN_IN, settle=True, log=self.log)
+        return self._await_sign_in(page)
+
+    def _await_sign_in(self, page, max_s: float = 25.0) -> tuple[bool, str]:
+        """等登录结果：离开登录页算成功；要验证码或报错就如实返回。"""
+        deadline = time.monotonic() + max_s
+        while time.monotonic() < deadline:
+            try:
+                url = page.url
+            except Exception:
+                return False, "登录标签页被关掉了"
+            if not _is_sign_in(url):
+                return True, ""
+            blocked = self._sign_in_blocked(page)
+            if blocked:
+                return False, blocked
+            page.wait_for_timeout(400)
+        return False, f"{max_s:.0f}s 内没离开登录页，请手动看一眼那个标签页"
+
+    def _sign_in_blocked(self, page) -> str:
+        """登录页上有没有「需要人来处理」的东西：验证码、报错。"""
+        js = """(pats) => {
+            const body = document.body ? (document.body.innerText || "") : "";
+            if (document.querySelector('input[id^="char"], input[autocomplete="one-time-code"]'))
+                return "需要双重认证验证码";
+            for (const p of pats) if (body.includes(p)) return p;
+            return "";
+        }"""
+        pats = ["双重认证", "验证码", "Apple ID 或密码不正确", "密码不正确",
+                "无法登录", "账户已被锁定", "出于安全原因"]
+        _, hit = eval_in_frames(page, js, pats)
+        if not hit:
+            return ""
+        if "验证" in hit:
+            return f"{hit} —— 验证码在你手机上，请在浏览器里输入，脚本不代劳"
+        return f"登录被拒：{hit}"
+
+    def _clear_bag_now(self, page) -> None:
+        """在**当前标签页**里打开购物袋并清空。失败不阻断，只是记一笔。
+
+        用当前页而不是另开一个：多开标签页既不像人的操作，也容易让后面
+        「加购 → 点结账」跟错页面。
+        """
+        base = REGIONS.get(self.region) or REGIONS["cn"]
+        try:
+            page.goto(f"{base}/shop/bag", timeout=self.timeout,
+                      wait_until="domcontentloaded")
+            page.wait_for_timeout(1800)
+            st = self.bag_state(page)
+            if st.get("items"):
+                n = self._empty_bag(page)
+                self.log(f"[自动下单] 加购前已清空购物袋（移除 {n} 件）")
+            else:
+                self.log("[自动下单] 购物袋本来就是空的")
+            self.bag_over_limit = self.bag_state(page).get("limitMsg") or ""
+        except Exception as e:
+            self.log(f"[自动下单] 清购物袋跳过：{type(e).__name__}: {str(e)[:60]}")
+
+    def _checkout_via_bag(self, ctx, page):
+        """走到结账页：打开购物袋 → 点「结账」。
+
+        **不点导航栏那个购物袋图标。** 它弹的是浮层，不是跳转：浮层要动画
+        几秒、期间整页发卡，而且它盖在页面上——这时候去找「结账」按钮，
+        很容易抓到浮层背后那个被遮住的，点下去要么没反应要么点错。
+
+        直接打开 /shop/bag 反而更接近人的操作结果：同一个页面、同一个
+        结账按钮，没有浮层这一层。这跟「别自己拼 secureN 地址」不冲突——
+        购物袋页是个正常的、用户看得见的地址，结账主机仍然由 Apple 决定。
+        """
+        base = REGIONS.get(self.region) or REGIONS["cn"]
+        try:
+            page.goto(f"{base}/shop/bag", timeout=self.timeout,
+                      wait_until="domcontentloaded")
+        except Exception as e:
+            self.log(f"[自动下单] 打开购物袋失败：{str(e)[:60]}")
+            return page
+
+        # 等页面真安静，而不是盲等 1200ms
+        wait_settled(page, log=self.log)
+
+        el = self._find_checkout_button(page)
+        if el is None:
+            self.log("[自动下单] 购物袋页上没找到可点的「结账」按钮")
+            return page
+        return self._click_checkout(ctx, page, el)
+
+    def _find_checkout_button(self, page):
+        """找购物袋页上那个**可见且可点**的结账按钮。
+
+        原来用 query_selector 直接取第一个匹配的，它不判可见性——浮层背后
+        或者折叠区域里的同名按钮照样会被取到，点了等于没点。
+        """
+        for sel in CHECKOUT_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                for i in range(min(loc.count(), 5)):
+                    one = loc.nth(i)
+                    if one.is_visible() and one.is_enabled():
+                        return one.element_handle()
+            except Exception:
+                continue
+        return None
+
+    def _empty_bag(self, page, passes: int = 5) -> int:
+        """清空购物袋，返回移除的件数。**清到真的空为止。**
 
         Apple 限购 iPhone 每人 2 台，袋里的存货会顶掉抢购名额，而且超限时
         点结账**既不跳转也不弹错**，只是静默卡住。所以加购前先清干净，
         比事后诊断可靠得多。
+
+        袋里通常不止一件，而且每移除一件整块都会重绘——重绘那一瞬间抓不到
+        「移除」按钮，光靠「点不动了就收工」会提前退出、留下残货。所以这里
+        每轮结束都用 bag_state 复核，没清干净就重新加载购物袋再来一轮。
         """
         removed = 0
-        for _ in range(10):  # 每次移除都会重绘，逐件来
+        for attempt in range(passes):
+            removed += self._remove_once(page)
+            st = self.bag_state(page)
+            if not st.get("items"):
+                return removed
+            if attempt < passes - 1:
+                self.log(f"[自动下单] 购物袋还剩 {st['items']} 件，重载后再清一轮")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=self.timeout)
+                    page.wait_for_timeout(1600)
+                except Exception:
+                    break
+        st = self.bag_state(page)
+        if st.get("items"):
+            self.log(f"[自动下单] ⚠️ 清了 {passes} 轮购物袋里还有 {st['items']} 件，"
+                     "请手动清空——超过限购会让结账静默卡住")
+        return removed
+
+    def _remove_once(self, page) -> int:
+        """把当前这一屏能点到的都移除掉，返回件数。"""
+        removed = 0
+        misses = 0
+        for _ in range(30):
             try:
                 clicked = page.evaluate(r"""() => {
-                    const cands = document.querySelectorAll(
-                        '[data-autom*="remove"], button, a');
-                    for (const el of cands) {
+                    for (const el of document.querySelectorAll(
+                            '[data-autom*="remove"], button, a')) {
+                        const r = el.getBoundingClientRect();
+                        if (!r.width || !r.height || el.offsetParent === null) continue;
                         const t = ((el.innerText || '') + ' ' +
                                    (el.getAttribute('aria-label') || ''));
                         if (/移除|删除/.test(t) && !/收藏|稍后/.test(t)) {
@@ -453,7 +711,13 @@ class AutoBuy:
             except Exception:
                 break
             if not clicked:
-                break
+                # 可能只是正在重绘，再等一拍；连续两次抓不到才算清完
+                misses += 1
+                if misses >= 2:
+                    break
+                page.wait_for_timeout(900)
+                continue
+            misses = 0
             removed += 1
             page.wait_for_timeout(1200)
         return removed
@@ -487,14 +751,16 @@ class AutoBuy:
     def _click_checkout(self, ctx, page, el):
         """点「结账」并切到真正承载结账流程的页面。
 
-        Apple 通常在**新标签页**打开 secure8.../shop/checkout。用
+        Apple 通常在**新标签页**打开 secureN.../shop/checkout。用
         expect_page 精确捕获这次新开的页面——早先按「不在旧列表里」判断，
         会被之前遗留的结账标签页干扰，白等到超时。
 
         没开新标签页就是本页跳转，回退到等本页 URL 变成结账页。
         """
         try:
-            with ctx.expect_page(timeout=15000) as info:
+            # 4s 足够：真要开新标签页，点完马上就开。原来给 15s，而被重定向到
+            # 登录页时是本页跳转、根本不开新标签，这 15 秒就是纯等超时。
+            with ctx.expect_page(timeout=4000) as info:
                 el.click()
             newpage = info.value
             try:
@@ -506,13 +772,15 @@ class AutoBuy:
         except Exception:
             pass  # 没有新标签页，按本页跳转处理
 
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
             try:
                 u = page.url
             except Exception:
                 u = ""
-            if "/shop/checkout" in u or _is_sign_in(u):
+            if _is_sign_in(u):
+                return page          # 登录页不用再 settle，直接交给上层去登录
+            if "/shop/checkout" in u:
                 break
             time.sleep(0.2)
         self._settle(page)
@@ -572,23 +840,25 @@ class AutoBuy:
             page.wait_for_timeout(300)
         return False, last
 
-    def _choose_pickup(self, page) -> str:
-        """尽力在结账页选中「到店取货」和指定门店。
+    def _choose_pickup(self, page, stores: list[str] | None = None) -> str:
+        """尽力在结账页选中「到店取货」和门店（按 stores 的顺序试）。
 
         **这一步没能在真实结账流程里验证过。** 门店选择只出现在登录后的
         结账流程里（secure.apple.com.cn），产品页和购物袋页都没有这个控件，
         所以我没法在不动你真实订单的前提下把选择器坐实。
 
         因此这里的原则是：
-          - 只在文本**精确包含**你配置的门店名时才点，绝不「兜底选第一家」
+          - 只在文本**精确包含**候选门店名时才点，绝不「兜底选第一家」
             ——选错门店比没选更糟。
           - 无论成功失败都返回一句话，由调用方推送给你。失败时明确说
             「请手动选」，绝不静默假装成功。
         """
-        if not self.pickup_store_name:
+        wants = stores if stores is not None else self.pickup_stores
+        wants = [w for w in wants if w]
+        if not wants:
             return ""
 
-        want = self.pickup_store_name
+        want = "/".join(wants)
         # 守卫：不在结账页就别点。购物袋页上也有「五角场」字样，
         # 在那儿乱点会报成功但什么都没选中。
         try:
@@ -601,7 +871,7 @@ class AutoBuy:
         picked, err = None, None
         for attempt in range(3):
             try:
-                picked = self._pickup_eval(page, want)
+                picked = self._pickup_eval(page, wants)
                 err = None
                 break
             except Exception as e:
@@ -614,40 +884,45 @@ class AutoBuy:
 
         page.wait_for_timeout(1200)
         if picked and picked.get("store"):
-            self.log(f"[自动下单] 已尝试选中取货门店「{want}」——**请在页面上再确认一眼**")
-            return f"已尝试选「到店取货 → {want}」，付款前请确认页面上确实是这家店"
+            got = picked["store"]
+            self.log(f"[自动下单] 已尝试选中取货门店「{got}」——**请在页面上再确认一眼**")
+            return f"已尝试选「到店取货 → {got}」，付款前请确认页面上确实是这家店"
         if picked and picked.get("switched"):
             self.log(f"[自动下单] 切到了取货，但没找到「{want}」——请手动选门店")
             return f"⚠️ 已切到取货，但没找到「{want}」，请手动选门店"
         self.log(f"[自动下单] 结账页没找到取货选项——请手动选「到店取货 → {want}」")
         return f"⚠️ 没找到取货选项，请手动选「到店取货 → {want}」"
 
-    def _pickup_eval(self, page, want: str) -> dict:
+    def _pickup_eval(self, page, wants: list[str]) -> dict:
+        """返回 {switched, store}。store 是选中的门店名，没选中就是空串。"""
         return page.evaluate(
-                """(want) => {
-                    const hit = (el) => {
-                        const t = (el.innerText || '') + ' ' +
-                                  (el.getAttribute('aria-label') || '');
-                        return t;
-                    };
+                """(wants) => {
+                    const hit = (el) => (el.innerText || '') + ' ' +
+                                        (el.getAttribute('aria-label') || '');
+                    const SEL = 'button,[role=radio],[role=button],label,input';
                     // 第一步：切到「到店取货」
                     let switched = false;
-                    for (const el of document.querySelectorAll(
-                            'button,[role=radio],[role=button],label,input')) {
-                        const t = hit(el);
-                        if (/到店取货|零售店取货|门店取货/.test(t)) {
+                    for (const el of document.querySelectorAll(SEL)) {
+                        if (/我要取货|到店取货|零售店取货|门店取货/.test(hit(el))) {
                             el.click(); switched = true; break;
                         }
                     }
-                    // 第二步：在门店列表里精确匹配门店名
-                    let store = false;
-                    for (const el of document.querySelectorAll(
-                            'button,[role=radio],[role=button],label,input')) {
-                        if (hit(el).includes(want)) { el.click(); store = true; break; }
+                    // 第二步：按优先级挨个试。「Apple 五角场」这种全称优先于裸店名，
+                    // 因为门店列表里带着地址，裸「浦东」会命中别家店的「浦东新区」。
+                    let store = '';
+                    outer:
+                    for (const want of wants) {
+                        for (const needle of ['Apple ' + want, want]) {
+                            for (const el of document.querySelectorAll(SEL)) {
+                                if (hit(el).includes(needle)) {
+                                    el.click(); store = want; break outer;
+                                }
+                            }
+                        }
                     }
                     return {switched, store};
                 }""",
-            want,
+            wants,
         )
 
     def _pick(self, page, section: str, keyword: str) -> bool:

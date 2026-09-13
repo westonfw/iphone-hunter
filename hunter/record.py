@@ -109,7 +109,7 @@ def run(cfg: dict, root: Path, buy_url: str = "", log=_p) -> int:
         raise AutoBuyUnavailable("没装 playwright") from e
 
     log(f"记录写入 {out}（本次覆盖旧文件）")
-    log("请只在这个调试 Chrome 里操作。结账若弹出 secure8 新标签也会自动跟上。")
+    log("请只在这个调试 Chrome 里操作。结账若弹出 secureN 新标签也会自动跟上。")
     log("走：加购 → 自提 → 身份证后四位 → 付款方式 → 检查订单 → Review。不必付款。")
     log("做完后回来说一声。身份证/密码不记明文。\n")
 

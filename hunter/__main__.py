@@ -8,8 +8,9 @@ import sys
 from pathlib import Path
 
 from .apple import REGIONS, AppleClient, Blocked, NotLive, Stock
-from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, cdp_candidates,
-                      inspect_checkout, launch_debug_chrome, probe_cdp, windows_chrome)
+from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list,
+                      cdp_candidates, inspect_checkout, launch_debug_chrome, probe_cdp,
+                      windows_chrome)
 from .monitor import LaunchWatcher, StockWatcher
 from .notify import Broadcaster
 
@@ -239,7 +240,9 @@ def cmd_rehearse(args) -> int:
         print(f"  {r.detail}")
     if r.ok:
         print("\n下一步：确认那个 Chrome 里已经登录 Apple ID、收货地址、发票都在，")
-        print("并把 config.json 的 autobuy.payment_method 设成支付宝或微信。")
+        print("并把 config.json 的 autobuy.payment_method 设成扫码付的一种：")
+        print("  支付宝 / 微信支付 / 花呗分期 / 微信分付 / 招商银行 / 中国建设银行 / 工商银行")
+        print("  （银行分期还要设 installment_months，如 24。信用卡 Visa/Mastercard 会即时扣款，不支持。）")
         print("确认无误后把 autobuy.enabled 改成 true：命中后会点「现在下单」创建待付款订单，付款仍是你自己来。")
     return 0 if r.ok else 1
 
@@ -265,15 +268,21 @@ def cmd_buy(args) -> int:
     """真跑一次下单：加购 → 现在下单 → 停在待付款。不经过库存监控。"""
     cfg = load_config()
     ab = dict(cfg.get("autobuy") or {})
+    if args.stop_at_review:
+        ab["stop_at_review"] = True
     if not args.confirm:
         pay = ab.get("payment_method") or "支付宝"
-        store = ab.get("pickup_store_name") or "（未填，结账时请手动选）"
+        stores = _store_list(ab.get("pickup_stores"), ab.get("pickup_store_name"))
+        store = " > ".join(stores) if stores else "（未填，结账时请手动选）"
         last4 = ab.get("id_last4") or ""
         print("这会在你已登录的 Chrome 里走完整结账向导：")
         print("  自提 → 身份证后四位 → 付款方式 → 检查订单 → Review 确认下单")
-        print("会生成一笔待付款订单，不会代你付款；超时未付订单会被取消。")
+        if ab.get("stop_at_review"):
+            print("**本次只走到 Review 页就停，不会点「立即下单」，不产生订单。**")
+        else:
+            print("会生成一笔待付款订单，不会代你付款；超时未付订单会被取消。")
         print(f"  支付方式：{pay}")
-        print(f"  取货门店：{store}")
+        print(f"  取货门店（按优先级）：{store}")
         print(f"  身份证后四位：{'已填' if last4 else '未填（PickupContact 会卡住）'}")
         if not last4:
             print("\n先在 config.json 的 autobuy.id_last4 填身份证后 4 位（可含 X）。")
@@ -413,6 +422,8 @@ def main(argv=None) -> int:
     sb = sub.add_parser("buy", help="立刻加购并创建待付款订单（真会下单，需 --confirm）")
     sb.add_argument("--part", help="目标 part number，默认取监控列表第一个")
     sb.add_argument("--slug", help="机型页面标识")
+    sb.add_argument("--stop-at-review", action="store_true",
+                    help="只走到 Review 页就停，不点「立即下单」（测试整条链路用）")
     sb.add_argument("--confirm", action="store_true",
                     help="确认：会加购并点「现在下单」，生成待付款订单，付款仍由你自己完成")
     sb.set_defaults(func=cmd_buy)

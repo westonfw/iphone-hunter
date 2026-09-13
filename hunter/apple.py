@@ -17,10 +17,36 @@ from enum import Enum
 
 import requests
 
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
+# 一次只用一套完整的浏览器指纹：UA 得跟 sec-ch-ua / platform 对得上，
+# 只改 UA 而 client hints 还是旧的，反而比不发这些头更可疑。
+BROWSERS = [
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+        "ch_ua": '"Chromium";v="152", "Google Chrome";v="152", "Not?A_Brand";v="24"',
+        "platform": '"macOS"',
+    },
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+        "ch_ua": '"Chromium";v="151", "Google Chrome";v="151", "Not?A_Brand";v="24"',
+        "platform": '"Windows"',
+    },
+    {
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+              "(KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+        "ch_ua": "",   # Safari 不发 client hints，发了才是破绽
+        "platform": "",
+    },
+    {
+        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+        "ch_ua": '"Chromium";v="150", "Microsoft Edge";v="150", "Not?A_Brand";v="24"',
+        "platform": '"Windows"',
+    },
+]
+
+UA = BROWSERS[0]["ua"]   # 兼容老代码里直接引用 UA 的地方
 
 # 各区域站点根地址。key 就是 config 里的 region。
 REGIONS = {
@@ -64,7 +90,15 @@ class StorePickup:
 
 
 class Blocked(Exception):
-    """Apple 边缘节点把请求挡了（常见 541/503），需要退避重试。"""
+    """Apple 边缘节点把请求挡了（常见 541/503），需要退避重试。
+
+    retry_after 是对方 Retry-After 头里给的秒数，没给就是 0。它比我们自己
+    猜的退避时间权威，调用方应当优先照它睡。
+    """
+
+    def __init__(self, msg: str, retry_after: float = 0.0):
+        super().__init__(msg)
+        self.retry_after = retry_after
 
 
 class NotLive(Exception):
@@ -111,6 +145,28 @@ class SkuInfo:
         return f"{base}/shop/buy-iphone/{self.slug}/{self.part}"
 
 
+# 抓机型页是一次「导航」，不是 XHR；照 XHR 那组头发过去，头和请求类型对不上。
+_NAV_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,"
+              "image/webp,*/*;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "X-Requested-With": None,   # requests 里给 None 表示不发这个头
+}
+
+
+def _retry_after(resp) -> float:
+    """把 Retry-After 头解析成秒。对方明说了要等多久，就别自己猜。"""
+    raw = (resp.headers.get("Retry-After") or "").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0  # HTTP-date 形式的很少见，忽略即可
+
+
 class AppleClient:
     def __init__(self, region: str = "cn", timeout: int = 15, proxy: str | None = None):
         if region not in REGIONS:
@@ -118,24 +174,64 @@ class AppleClient:
         self.region = region
         self.base = REGIONS[region]
         self.timeout = timeout
-        self.s = requests.Session()
-        self.s.headers.update({
-            "User-Agent": UA,
+        self.proxy = proxy
+        self.requests_made = 0        # 供 Pacer 记账用
+        self.browser = random.choice(BROWSERS)
+        self.s: requests.Session = None  # type: ignore[assignment]
+        self._open_session()
+
+    # ---------- 会话 ----------
+
+    def _open_session(self) -> None:
+        s = requests.Session()
+        b = self.browser
+        # 真浏览器发的是一整组头。只带 UA 而缺 sec-fetch-* / Accept-Encoding，
+        # 在 Akamai 眼里跟写着「我是脚本」差不多。
+        headers = {
+            "User-Agent": b["ua"],
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
             "Referer": f"{self.base}/shop/buy-iphone",
-        })
-        if proxy:
-            self.s.proxies.update({"http": proxy, "https": proxy})
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+        }
+        if b["ch_ua"]:
+            headers["sec-ch-ua"] = b["ch_ua"]
+            headers["sec-ch-ua-mobile"] = "?0"
+            headers["sec-ch-ua-platform"] = b["platform"]
+        s.headers.update(headers)
+        if self.proxy:
+            s.proxies.update({"http": self.proxy, "https": self.proxy})
+        if self.s is not None:
+            self.s.close()
+        self.s = s
+
+    def renew_session(self, new_identity: bool = True) -> str:
+        """丢掉当前会话重开一个。被拦之后调用。
+
+        平时不轮换：同一个 IP 上老换 UA、老丢 cookie，本身就是异常信号。
+        只有在已经被标记之后，换一套身份才是净收益。
+        """
+        if new_identity:
+            others = [b for b in BROWSERS if b is not self.browser]
+            self.browser = random.choice(others or BROWSERS)
+        self._open_session()
+        return self.browser["ua"].split(") ", 1)[-1]
 
     # ---------- 底层 ----------
 
     def _get(self, path: str, params: dict | None = None, want_json: bool = True,
-             missing_means_not_live: bool = False):
+             missing_means_not_live: bool = False, headers: dict | None = None):
         url = path if path.startswith("http") else f"{self.base}{path}"
-        r = self.s.get(url, params=params, timeout=self.timeout, allow_redirects=True)
+        self.requests_made += 1
+        r = self.s.get(url, params=params, timeout=self.timeout, allow_redirects=True,
+                       headers=headers)
         if r.status_code in (403, 429, 503, 541):
-            raise Blocked(f"HTTP {r.status_code} @ {url}")
+            raise Blocked(f"HTTP {r.status_code} @ {url}", _retry_after(r))
         if r.status_code == 404:
             # 机型页 404 = 还没上线，是预期内的；其他 404 才算错误
             if missing_means_not_live:
@@ -245,7 +341,8 @@ class AppleClient:
 
         页面还没上线时 Apple 会 301 回 iPhone 落地页，这里当作 NotLive 抛出。
         """
-        r = self._get(f"/shop/buy-iphone/{slug}", want_json=False, missing_means_not_live=True)
+        r = self._get(f"/shop/buy-iphone/{slug}", want_json=False, missing_means_not_live=True,
+                      headers=_NAV_HEADERS)
         html = r.text
         if f"/shop/buy-iphone/{slug}" not in r.url:
             raise NotLive(f"{slug} 还没上线（跳转到 {r.url}）")
@@ -287,7 +384,3 @@ class AppleClient:
         u = f"{self.base}/shop/buy-iphone/{slug}"
         return f"{u}/{part}" if part else u
 
-
-def sleep_with_jitter(base: float, jitter: float = 0.3) -> None:
-    """带抖动的等待，避免固定频率请求被识别成机器人。"""
-    time.sleep(max(1.0, base * (1 + random.uniform(-jitter, jitter))))

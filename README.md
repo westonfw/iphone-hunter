@@ -136,8 +136,8 @@ Part number 由官网实时目录解析，不在代码里写死。运行上面�
 不需要自动下单、只想「直营店可提货就叫我」的话，直接用 `watch`，别用 `run.sh`（那个会连带跑 `launch` 盯上架）。`watch` 仍会在终端打印能否下单和预计发货时间，但不会为这些状态发送通知。
 
 ```bash
-python3 -m hunter watch            # 常规，poll_interval = 20s
-python3 -m hunter watch --sprint   # 开卖前 10 分钟，sprint_interval = 5s
+python3 -m hunter watch            # 常规，自适应节奏（见「怎么不被 block」）
+python3 -m hunter watch --sprint   # 开卖前 10 分钟，全速 5s 一轮
 ```
 
 `config.json` 里保证这几项，`watch` 就是纯监控形态：
@@ -166,6 +166,65 @@ python3 -m hunter check --location 200000
 
 ---
 
+## 怎么不被 block（跑得久比跑得快重要）
+
+固定间隔是最好认的机器特征。原来 20s 一轮 + ±30% 抖动，看着"随机"，但把请求时刻画成一条时间轴，它仍然是一轮一格的，统计上一眼就能挑出来——而且一整天下来累计请求量摆在那儿。**决定你能盯多久的不是间隔，是每小时总请求数。**
+
+现在换成四件事叠起来：
+
+| 手段 | 做什么 | 为什么 |
+|---|---|---|
+| **泊松间隔** | 间隔服从平移指数分布，均值等于目标间隔 | 无记忆性，形状跟人的点击流一致，抽不出周期 |
+| **每小时预算** | 令牌桶硬限总请求数，超了就自动拉长间隔 | 这才是真正决定「能盯多久」的量 |
+| **AIMD 退避** | 被拦一次速率减半，之后每成功一轮加回 1/4 | 见下 |
+| **冷热时段** | 只在会放货的时段全速，其余时段降速 5 倍 | 把有限的配额花在有用的时候 |
+
+### AIMD：为什么不能一成功就满速冲回去
+
+老逻辑 `fail_streak` 一次成功就清零，于是「被拦 → 退避 → 立刻满速 → 再被拦」来回震荡，每震荡一次就在对方那边多记一笔，越撞越黑。
+
+改成 TCP 的拥塞控制：**乘性减、加性增**。被拦一次间隔翻倍，之后每成功一轮只把倍率减 0.25——从被拦一次恢复到满速要 4 轮，被拦三次要 28 轮。慢，但这正是重点：它会自己收敛到对方能接受的那个速率上待着，而不是反复试探。
+
+对方返回 `Retry-After` 时照它睡，那比我们自己猜的权威。另外每次被拦都会换一套完整的浏览器身份（UA + 匹配的 client hints + 全新 cookie）重开会话——被标记之后拿同一个会话接着打，只会一路 541。
+
+> 平时**不**轮换身份：同一个 IP 上老换 UA、老丢 cookie，本身就是异常信号。只在已经被标记之后换才是净收益。
+
+### 砍掉一半请求
+
+`availability-message` 只用来在终端打印「能不能下单 / 几天发货」，**提醒和自动下单完全由 `pickup-message` 触发**。每轮都打它等于把预算白花一半，所以默认 6 轮才打一次（`pacing.availability_every`）。门店监控关掉时它会自动恢复每轮查询，因为那时它是唯一的信息来源。
+
+配上「同 `request_group` 的 SKU 合并成一个请求」，盯 12 个配置的稳态成本是**每轮 1.17 个请求**。
+
+### 配置
+
+```jsonc
+"pacing": {
+  "base_interval": 30,            // 热时段目标平均间隔（秒）
+  "sprint_interval": 5,           // --sprint 时的目标间隔
+  "min_interval": 4,              // 下限，再急也不会比这更快
+  "max_interval": 900,            // 上限，退避退到头就是 15 分钟
+  "budget_per_hour": 150,         // 每小时请求硬上限 ← 想盯更久就调小这个
+  "sprint_budget_per_hour": 900,  // 冲刺是短跑，配额放宽
+  "burst": 20,                    // 允许攒出多长的突发
+  "hot_windows": ["01:00-03:00", "06:00-09:00",   // 全速时段，支持跨零点
+                  "15:00-18:00", "20:00-22:00"],
+  "cold_multiplier": 5,           // 热时段之外降速几倍
+  "recover_step": 0.25,           // 每成功一轮，退避倍率减多少
+  "availability_every": 6         // 每几轮查一次发货状态，0 = 关掉
+}
+```
+
+几条经验：
+
+- **想盯得更久，先调小 `budget_per_hour`，别去调大 `base_interval`。** 预算是硬约束，间隔只是目标值；预算不够时 Pacer 会自动把间隔拉长，反过来不行。
+- `hot_windows` 留空 = 全天等速，此时纯靠预算兜底。默认那四段（凌晨 1–3 点、早 6–9 点、下午 3–6 点、晚 8–10 点）是实际盯下来的补货规律，按你自己观察到的改。
+- 开卖当天用 `--sprint`：无视冷热时段、配额放宽到 900/小时。它是给「你人就守在旁边的那十分钟」用的，不要拿它跑通宵。
+- 退出时会打印这次一共发了多少请求、被拦几次，用它来校准预算。
+
+老的 `poll_interval` / `jitter` 还认，但只在没配 `pacing` 时当默认间隔用。
+
+---
+
 ## 命令
 
 | 命令 | 用途 |
@@ -180,7 +239,7 @@ python3 -m hunter check --location 200000
 | `inspect-checkout` | 只读查看结账页的配送方式控件 |
 | `test` | 发一条测试通知 |
 
-`launch` / `watch` 支持 `--sprint`（用 `sprint_interval` 而不是 `poll_interval`）。全局 `--region` 可切区域（`cn` `hk` `tw` `us` `jp` `sg`）。
+`launch` / `watch` 支持 `--sprint`（全速短跑，无视冷热时段，配额也放宽）。全局 `--region` 可切区域（`cn` `hk` `tw` `us` `jp` `sg`）。
 
 ---
 
@@ -189,8 +248,8 @@ python3 -m hunter check --location 200000
 | 字段 | 说明 |
 |---|---|
 | `region` | 区域，默认 `cn` |
-| `poll_interval` / `sprint_interval` | 常规 / 冲刺轮询间隔（秒），默认 20 / 5 |
-| `jitter` | 间隔抖动比例，默认 0.3 |
+| `pacing.*` | 请求节奏，见[怎么不被 block](#怎么不被-block跑得久比跑得快重要) |
+| `poll_interval` / `sprint_interval` | 老字段，只在没配 `pacing` 时当默认间隔用 |
 | `open_browser_on_hit` | 命中时自动开浏览器（`autobuy` 开启时不用） |
 | `launch_watch.slugs` | `launch` 默认盯的机型 |
 | `watch[].request_group` | 可选请求分组；同组 SKU 合并查询，不同组分开查询 |
@@ -198,6 +257,7 @@ python3 -m hunter check --location 200000
 | `pickup.stores` | 只盯这几家门店（如 `["R581"]`），留空 = 附近全部 |
 | `autobuy.enabled` | 命中时是否自动走到结账页，默认 `false`（**先跑 `rehearse`**） |
 | `autobuy.warm` | 是否预热产品页，默认 `true`。**这是慢网下最有效的一招** |
+| `autobuy.pickup_stores` | 可接受的取货门店名（如 `["五角场","浦东"]`）。放货那一刻真有货的会自动排到最前，留空 = 有货的都能下。老字段 `pickup_store_name` 仍兼容 |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
 | `autobuy.pickup_store_name` | 结账时尝试选的取货门店名，如 `"五角场"` |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |
@@ -237,9 +297,9 @@ retail/pickup-message     →  北京 9 家店全部「今天可取货」
 
 一次请求可带多个 `parts.N`，Apple 会对每家门店返回全部型号的状态——**盯 10 个配置和盯 1 个，请求数一样**。
 
-#### 频率：没有明显限流
+#### 频率：短时间不限流，长时间会被掐
 
-`pickup-message` 连打 20 次（间隔约 1.2s）全部 200，平均 0.8s。`sprint_interval` 用 3–5 秒是安全的。工具遇到 403/429/503/541 会自动指数退避（最多退到 5 分钟）。
+`pickup-message` 连打 20 次（间隔约 1.2s）全部 200，平均 0.8s——**短跑没问题**。但按固定间隔连打几个小时就会开始收 541，那是 Akamai 按累计速率和请求指纹判的，不是按瞬时速率。怎么跑得久见下一节。
 
 ### 「走接口直接发包」为什么不行
 
@@ -433,7 +493,8 @@ iPhone 18 Pro 系列的官方时间：2026 年 9 月 12 日北京时间 20:00 �
 hunter/apple.py     Apple 接口客户端、三态库存、目录解析、直达链接
 hunter/autobuy.py   预热 + 半自动下单（挂你自己的 Chrome），停在付款页
 hunter/notify.py    各通知渠道 + 打开浏览器
-hunter/monitor.py   轮询循环、状态指纹、退避重试、状态落盘
+hunter/monitor.py   轮询循环、状态指纹、状态落盘
+hunter/pacing.py    请求节奏：泊松间隔、每小时预算、AIMD 退避、冷热时段
 hunter/__main__.py  命令行入口
 config.json         你的配置（已 gitignore）
 state.json          上一轮状态，避免重启后重复通知

@@ -14,9 +14,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .apple import AppleClient, Availability, Blocked, NotLive, Stock, StorePickup, sleep_with_jitter
+from .apple import AppleClient, Availability, Blocked, NotLive, Stock, StorePickup
 from .autobuy import AutoBuy, AutoBuyUnavailable
 from .notify import Broadcaster, open_in_browser
+from .pacing import build_pacer
 
 
 def _p(*a) -> None:
@@ -64,8 +65,8 @@ class BaseWatcher:
         self.bc = Broadcaster(cfg.get("notifiers"), log=log)
         self.state = State(root / "state.json")
         self.open_browser = bool(cfg.get("open_browser_on_hit", True))
-        self.jitter = float(cfg.get("jitter", 0.3))
-        self.fail_streak = 0
+        self.pacer = build_pacer(cfg, sprint=sprint, log=log)
+        self.round_cost = 1.0   # 上一轮花了几个请求，用来预估下一轮
 
         ab = dict(cfg.get("autobuy") or {})
         ab.setdefault("region", cfg.get("region", "cn"))
@@ -78,19 +79,15 @@ class BaseWatcher:
 
     @property
     def interval(self) -> float:
-        key = "sprint_interval" if self.sprint else "poll_interval"
-        return float(self.cfg.get(key, 5 if self.sprint else 20))
+        """当前这一刻的目标平均间隔（由 Pacer 算，会随冷热时段和退避状态变）。"""
+        return self.pacer.target()
 
     def wait(self) -> None:
-        # 被拦截后指数退避，最多退到 5 分钟，避免把自己彻底打进黑名单
-        if self.fail_streak:
-            backoff = min(300, self.interval * (2 ** min(self.fail_streak, 5)))
-            self.log(f"[{now()}] 连续 {self.fail_streak} 次失败，退避 {backoff:.0f}s")
-            sleep_with_jitter(backoff, self.jitter)
-        else:
-            sleep_with_jitter(self.interval, self.jitter)
+        self.pacer.sleep(self.round_cost)
 
-    def hit(self, title: str, body: str, url: str) -> None:
+    def hit(self, title: str, body: str, url: str,
+            in_stock: list[str] | None = None) -> None:
+        """命中。in_stock 是这一刻真有货的门店名，决定自动下单去哪家取。"""
         # 先推送——自动下单要花几十秒，不能让通知等它
         self.bc.send(title, body, url, critical=True)
 
@@ -99,7 +96,8 @@ class BaseWatcher:
             self.autobuy_done = True
             try:
                 # 页面预热过就直接开火，省掉加载产品页那 700KB
-                r = self.autobuy.fire() if self.autobuy.warmed else self.autobuy.buy(url)
+                r = (self.autobuy.fire(in_stock) if self.autobuy.warmed
+                     else self.autobuy.buy(url, in_stock))
                 extra = f"\n订单号 {r.order_id}" if r.order_id else ""
                 self.bc.send(
                     f"{'✅' if r.ok else '⚠️'} 自动下单：{r.stage}",
@@ -131,21 +129,38 @@ class BaseWatcher:
 
     def loop(self) -> None:
         mode = "冲刺" if self.sprint else "常规"
-        self.log(f"[{now()}] 启动（{mode}模式，间隔约 {self.interval:.0f}s，Ctrl+C 停止）")
+        pc = self.pacer
+        self.log(f"[{now()}] 启动（{mode}模式，间隔约 {pc.target():.0f}s，"
+                 f"预算 {pc.budget_per_hour:.0f} 次/小时，Ctrl+C 停止）")
+        if pc.hot_windows:
+            self.log(f"[{now()}] 热时段 {self._windows_text()}，其余时段降速 "
+                     f"{pc.cold_multiplier:g} 倍省配额")
         try:
             while True:
+                before = self.client.requests_made
                 try:
                     self.run()
-                    self.fail_streak = 0
+                    pc.on_ok()
                 except Blocked as e:
-                    self.fail_streak += 1
-                    self.log(f"[{now()}] 请求被拦截：{e}")
+                    pc.on_blocked(getattr(e, "retry_after", 0.0))
+                    # 被标记之后继续用同一个会话只会一路被拦，换一套身份重来
+                    who = self.client.renew_session()
+                    self.log(f"[{now()}] 请求被拦截：{e}（第 {pc.blocks} 次，"
+                             f"降速到约 {pc.target():.0f}s，已换会话 {who}）")
                 except Exception as e:
-                    self.fail_streak += 1
+                    pc.on_blocked()
                     self.log(f"[{now()}] 出错：{type(e).__name__}: {e}")
+                spent = max(1, self.client.requests_made - before)
+                pc.spend(spent)
+                self.round_cost = spent
                 self.wait()
         except KeyboardInterrupt:
-            self.log(f"\n[{now()}] 已停止")
+            self.log(f"\n[{now()}] 已停止（共发出 {self.client.requests_made} 个请求，"
+                     f"被拦 {pc.blocks} 次）")
+
+    def _windows_text(self) -> str:
+        return "、".join(f"{a // 60:02d}:{a % 60:02d}-{b // 60:02d}:{b % 60:02d}"
+                        for a, b in self.pacer.hot_windows)
 
 
 class LaunchWatcher(BaseWatcher):
@@ -210,6 +225,11 @@ class StockWatcher(BaseWatcher):
         self.slug_of = {i["part"]: i.get("model_slug", "") for i in self.items}
         self.note_of = {i["part"]: i.get("note", "") for i in self.items}
 
+        # availability-message 只用来打日志，提醒完全由 pickup-message 触发。
+        # 每轮都打它等于把请求预算白花一半，所以降频轮询。
+        self.avail_every = int((cfg.get("pacing") or {}).get("availability_every", 6))
+        self.round_no = 0
+
         pk = cfg.get("pickup") or {}
         self.pickup_on = bool(pk.get("enabled", True))
         self.location = str(pk.get("location", "")).strip()
@@ -237,17 +257,29 @@ class StockWatcher(BaseWatcher):
             self.warm_failed_at = time.monotonic()
             self.log(f"[预热] 失败（不影响监控）：{type(e).__name__}: {e}")
 
+    def _want_availability(self) -> bool:
+        """这一轮要不要顺带查一下发货状态。"""
+        if not self.pickup_on:
+            return True            # 门店监控关着的话，它就是唯一的信息来源
+        if self.avail_every <= 0:
+            return False           # 显式关掉
+        return (self.round_no - 1) % self.avail_every == 0   # 第一轮先打个底
+
     def run(self) -> None:
         self._ensure_warm()
+        self.round_no += 1
+        want_avail = self._want_availability()
         avail: dict[str, Availability] = {}
         pickup: dict[str, list[StorePickup]] = {}
         for parts in self.part_groups.values():
-            avail.update(self.client.availability(parts))
+            if want_avail:
+                avail.update(self.client.availability(parts))
             if self.pickup_on:
                 pickup.update(self.client.pickup(parts, location=self.location))
 
         for part in self.parts:
-            self._check_buyable(part, avail.get(part))
+            if want_avail:
+                self._check_buyable(part, avail.get(part))
             if self.pickup_on:
                 self._check_pickup(part, pickup.get(part) or [])
 
@@ -308,7 +340,10 @@ class StockWatcher(BaseWatcher):
             lines = [f"{s.store_name}（{s.city}）{s.quote}" for s in fresh[:8]]
             # 首轮就有货也要说，但标注清楚是「启动时就有」而不是「刚刚放货」
             prefix = "🏬 启动时已有货" if first_run else "🚨 刚放货"
-            self.hit(f"{prefix}：{label}", "\n".join(lines), self._buy_url(part))
+            # 把「刚放货的那几家」按顺序交给自动下单——写死一家的话，
+            # 另外三家放货时会卡在选店那一步。
+            self.hit(f"{prefix}：{label}", "\n".join(lines), self._buy_url(part),
+                     in_stock=[s.store_name for s in fresh])
         self.state.set(f"pickup:{part}", cur)
 
     def _buy_url(self, part: str) -> str:
