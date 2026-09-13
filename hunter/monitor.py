@@ -190,7 +190,7 @@ class LaunchWatcher(BaseWatcher):
 class StockWatcher(BaseWatcher):
     """盯已知 part number 的两件事：
 
-      1. 能不能下单 / 多久发货  —— sba/availability-message
+      1. 记录能不能下单 / 多久发货  —— sba/availability-message（仅日志，不提醒）
       2. 哪家直营店今天能取货    —— retail/pickup-message
 
     第 2 项才是开售后捡漏的关键，而且必须用 pickup-message：sba 那个接口
@@ -251,7 +251,7 @@ class StockWatcher(BaseWatcher):
             if self.pickup_on:
                 self._check_pickup(part, pickup.get(part) or [])
 
-    # ---------- 能不能下单 ----------
+    # ---------- 能不能下单（仅记录，不提醒） ----------
 
     def _check_buyable(self, part: str, av: Availability | None) -> None:
         label = self.note_of.get(part) or part
@@ -266,11 +266,7 @@ class StockWatcher(BaseWatcher):
         if prev == cur:
             return
 
-        url = self._buy_url(part)
-        if av.buyable and prev is not None and prev[0] is False:
-            self.hit(f"🚨 {label} 可以下单了", av.describe(), url)
-        elif prev is not None:
-            self.bc.send(f"{label} 状态变化", av.describe(), url, critical=False)
+        # 下单/配送状态只用于终端观察；提醒及自动下单只由直营店可提货触发。
         self.state.set(f"stock:{part}", cur)
 
     # ---------- 门店能不能取货 ----------
