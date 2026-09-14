@@ -108,3 +108,46 @@ class PickupSwitchTests(unittest.TestCase):
         from hunter.checkout import PICKUP_SWITCH
         exact = [t for t in self.REAL_BUTTONS if any(n in t for n in PICKUP_SWITCH)]
         self.assertEqual(["我要取货"], exact, "实际用的这组词必须唯一命中")
+
+
+class LocalizedColorTests(unittest.TestCase):
+    """页面内嵌的商品清单永远是英文（中文站也一样），中文色名只在配色图的 alt 里。
+    不做这一步，监控日志和推送里就全是 Star White / Glacier Blue。"""
+
+    COLORS = {"star-white": "星光白色", "night-sky": "夜空色", "glacier": "冰川蓝色",
+              "black": "黑色", "burgundy": "勃艮第酒红色"}
+
+    def test_replaces_two_word_color(self):
+        from hunter.apple import AppleClient
+        self.assertEqual("iPhone Duo 256GB 星光白色",
+                         AppleClient._localize("iPhone Duo 256GB Star White", self.COLORS))
+
+    def test_matches_on_first_word_when_slug_is_shorter(self):
+        """「Glacier Blue」的 slug 是 glacier，不是 glacier-blue。"""
+        from hunter.apple import AppleClient
+        self.assertEqual("iPhone 18 Pro 256GB 冰川蓝色",
+                         AppleClient._localize("iPhone 18 Pro 256GB Glacier Blue",
+                                               self.COLORS))
+
+    def test_single_word_color(self):
+        from hunter.apple import AppleClient
+        self.assertEqual("iPhone 18 Pro Max 1TB 黑色",
+                         AppleClient._localize("iPhone 18 Pro Max 1TB Black", self.COLORS))
+
+    def test_unknown_color_stays_english(self):
+        """对不上就原样返回——宁可英文，也别瞎猜一个中文名出来。"""
+        from hunter.apple import AppleClient
+        self.assertEqual("iPhone 17 256GB Lavender",
+                         AppleClient._localize("iPhone 17 256GB Lavender", self.COLORS))
+
+    def test_no_colors_found_is_a_noop(self):
+        from hunter.apple import AppleClient
+        self.assertEqual("iPhone Duo 256GB Star White",
+                         AppleClient._localize("iPhone Duo 256GB Star White", {}))
+
+    def test_extracts_pairs_from_page_markup(self):
+        from hunter.apple import AppleClient
+        html = ('"imageName":"iphone-duo-finish-select-star-white-202609_AV2",'
+                '"originalImageName":"x","alt":"星光白色 iPhone Duo，呈折叠状态"')
+        self.assertEqual({"star-white": "星光白色"},
+                         AppleClient._localized_colors(html))

@@ -378,6 +378,40 @@ class AppleClient:
 
     # ---------- 目录 ----------
 
+    #: 页面里「颜色 slug → 本地化色名」的桥。
+    #:
+    #: 内嵌的商品清单（"name":"iPhone Duo 256GB Star White"）**永远是英文**，
+    #: 中文站也一样。中文色名在配色图的 alt 里：
+    #:   "imageName":"iphone-duo-finish-select-star-white-202609_AV2",
+    #:   "originalImageName":"…","alt":"星光白色 iPhone Duo，呈折叠状态…"
+    #: 靠 finish-select-<slug> 把两边对起来。
+    _COLOR_IMG = re.compile(
+        r'finish-select-([a-z0-9-]+?)-\d{6}[^"]*","originalImageName":"[^"]*",'
+        r'"alt":"([^"]{1,40}?)[ \u00a0]'
+    )
+
+    @staticmethod
+    def _localized_colors(html: str) -> dict:
+        out: dict = {}
+        for slug, alt in AppleClient._COLOR_IMG.findall(html):
+            out.setdefault(slug, alt)
+        return out
+
+    @staticmethod
+    def _localize(name: str, colors: dict) -> str:
+        """把英文名里的颜色换成中文。对不上就原样返回——宁可英文，也别瞎猜。"""
+        if not name or not colors:
+            return name
+        # 颜色是名字末尾那几个词。「Glacier Blue」的 slug 是 glacier，不是
+        # glacier-blue，所以要从长到短试。
+        words = name.split()
+        for take in range(min(3, len(words)), 0, -1):
+            tail = words[-take:]
+            for cand in ("-".join(w.lower() for w in tail), tail[0].lower()):
+                if cand in colors:
+                    return " ".join(words[:-take] + [colors[cand]])
+        return name
+
     def catalog(self, slug: str) -> list[SkuInfo]:
         """从机型购买页抓出全部配置的 part number / 名称 / 价格。
 
@@ -389,6 +423,7 @@ class AppleClient:
         if f"/shop/buy-iphone/{slug}" not in r.url:
             raise NotLive(f"{slug} 还没上线（跳转到 {r.url}）")
 
+        colors = self._localized_colors(html)
         skus: dict[str, SkuInfo] = {}
         # 页面里内嵌的商品清单：{"sku":"MJT74","partNumber":"MJT74CH/A","price":{"fullPrice":9999.00},...,"name":"iPhone 18 Pro 256GB Black"}
         pattern = re.compile(
@@ -400,7 +435,7 @@ class AppleClient:
             part = m.group("part")
             skus[part] = SkuInfo(
                 part=part,
-                name=m.group("name"),
+                name=self._localize(m.group("name"), colors),
                 price=float(m.group("price")) if m.group("price") else None,
                 slug=slug,
             )

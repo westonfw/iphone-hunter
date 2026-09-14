@@ -729,6 +729,28 @@ cookie jar（零请求），做一个动作，再读一次，看到期时间戳�
 
 ### 页面层
 
+#### 坑 3.5：内嵌商品清单里的颜色**永远是英文**
+
+中文站也一样：
+
+```json
+{"sku":"MK2M4","partNumber":"MK2M4CH/A","name":"iPhone Duo 256GB Star White"}
+```
+
+中文色名在配色图的 `alt` 里，靠 `finish-select-<slug>` 跟商品对起来：
+
+```json
+"imageName":"iphone-duo-finish-select-star-white-202609_AV2",
+"originalImageName":"…","alt":"星光白色 iPhone Duo，呈折叠状态…"
+```
+
+不做这一步，`parts` 存进配置的 note、监控日志、Bark 推送里就全是
+`Star White` / `Glacier Blue`，半夜看一眼根本分不清是哪台。
+
+> **slug 不是简单把英文连字符化。** 「Glacier Blue」的 slug 是 `glacier`，
+> 不是 `glacier-blue`。所以要从长到短试：先整段颜色，再退到第一个词。
+> 对不上就保留英文——宁可英文，也别瞎猜一个中文名出来。
+
 #### 坑 4：SKU 深链只能带出颜色和容量
 
 `/shop/buy-iphone/iphone-18-pro/MJT74CH/A` 能直接落在选好配置的页面，但**「添加到购物袋」按钮是 `disabled` 的**——页面上「折抵换购」和「AppleCare+」两组单选不选，按钮永远点不了。
