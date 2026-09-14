@@ -203,8 +203,11 @@ class AutoBuy:
         # 另外几家放货时白白卡在选店那一步。
         self.pickup_stores = _store_list(self.cfg.get("pickup_stores"),
                                          self.cfg.get("pickup_store_name"))
-        # 已经加进购物袋了就不能盲目重试加购，否则会重复下单
-        self.added_to_bag = False
+        # 已经加进购物袋了就不能盲目重试加购，否则会重复下单。
+        #: 但光记「加过了」不够——必须记**加的是哪个 part**。监控盯着十几个配置，
+        #: A 色放货、加购后失败重试，下一轮命中的可能是 B 色；这时如果只看
+        #: 「加过了」就跳过清袋和加购，等于拿着 A 色去给 B 色结账，买错机器。
+        self.bagged_part = ""
         self.order_placed = False
         # 预热用的常驻会话
         self._pwctx = self._pw = self._ctx = self._page = None
@@ -525,6 +528,14 @@ class AutoBuy:
     def _drive(self, ctx, page, url: str | None, dry_run: bool,
                in_stock: list[str] | None = None) -> BuyResult:
         t0 = time.monotonic()
+        want_part = _part_of(url or "")
+        # 「袋里已经是这次要买的那台」才允许跳过清袋和加购。型号不同就得重来，
+        # 哪怕上一轮确实加购成功过。
+        bagged_ok = bool(self.bagged_part) and (
+            not want_part or self.bagged_part == want_part)
+        if self.bagged_part and want_part and self.bagged_part != want_part:
+            self.log(f"[自动下单] 袋里是上一轮的 {self.bagged_part}，这次要 {want_part}"
+                     f"——重新清袋加购")
         stores = self.store_candidates(in_stock)
         if stores:
             self.log(f"[自动下单] 取货门店优先级：{' > '.join(stores)}")
@@ -532,8 +543,26 @@ class AutoBuy:
             # 顺序很要紧：**先清空购物袋，再打开产品页**。
             # 反过来做（开着产品页、另开标签页去清袋、再回来加购）既多一个标签页，
             # 也不是人的操作路径；而且清袋那一下会让产品页的会话状态过期。
-            if not dry_run and not self.added_to_bag and self.clear_bag:
-                self._clear_bag_now(page)
+            if not dry_run and not bagged_ok and self.clear_bag:
+                # 先试接口清：一次 fetch + 每条一个 POST，不加载 259KB 购物袋页。
+                # 顺带得到「袋里是不是已经正好是目标型号」——这个判断读的是
+                # 服务端真实状态，比进程内的 bagged_part 可靠（后者会因为进程
+                # 重启或上一轮加的是别的颜色而失真）。
+                done = False
+                if self.fast_path:
+                    from .fastpath import prepare_bag
+                    r = prepare_bag(page, want_part=want_part,
+                                    want_origin=REGIONS.get(self.region) or "",
+                                    log=self.log)
+                    if r.get("ok"):
+                        done = True
+                        if r.get("kept"):
+                            bagged_ok = True
+                            self.bagged_part = want_part
+                    else:
+                        self.log(f"[快车道] 接口清空没成（{r.get('reason')}），改点页面")
+                if not done:
+                    self._clear_bag_now(page)
 
             page.goto(url, timeout=self.timeout * 2, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
@@ -541,12 +570,12 @@ class AutoBuy:
             self._pick(page, "applecare", self.applecare_text)
 
         # 已经超限就别再加了——加了也结不了账，只会让袋子更难收拾
-        if self.bag_over_limit and not dry_run and not self.added_to_bag:
+        if self.bag_over_limit and not dry_run and not bagged_ok:
             return BuyResult(
                 False, "⚠️ 购物袋已超限购，未加购", page.url,
                 f"{self.bag_over_limit}\n先把购物袋清空再抢，否则加多少都结不了账。")
 
-        if not self.added_to_bag:
+        if not bagged_ok:
             ok, why = self._wait_add_button(page)
             if not ok:
                 if why.startswith("SOLD_OUT:"):
@@ -563,15 +592,15 @@ class AutoBuy:
             return BuyResult(True, "排练通过（未加购）", page.url,
                              f"耗时 {el:.1f}s，选择器有效")
 
-        if not self.added_to_bag:
+        if not bagged_ok:
             # 用 locator 而不是先前抓到的句柄——locator 每次操作都会重新定位
             page.locator(SEL_ADD_TO_CART).first.click(timeout=self.timeout)
-            self.added_to_bag = True
+            self.bagged_part = want_part or "?"
             # 只等加购请求出门，不加载 700KB 购物袋页（等 URL 变化最坏会烧掉数秒）
             page.wait_for_timeout(600)
             self.log(f"[自动下单] 已加入购物袋（{time.monotonic() - t0:.1f}s），不加载购物袋页")
         else:
-            self.log("[自动下单] 购物袋里已有货，跳过加购，直接创建订单")
+            self.log(f"[自动下单] 购物袋里已经是 {self.bagged_part}，跳过加购，直接结账")
 
         placer = OrderPlacer(
             region=self.region,
@@ -600,7 +629,31 @@ class AutoBuy:
         # 它给这个会话分配的那台 secureN 上。自己拼地址跳转既容易跳错主机，
         # 也是最典型的机器行为特征。直跳只在这条路走不通时兜底。
         blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
-        page = self._checkout_via_bag(ctx, page)
+        # 先试从购物袋接口直接拿结账地址：省掉加载 259KB 购物袋页 + 渲染 + 找按钮
+        # 那 ~6s。拿不到就照常走点页面，不影响正确性。
+        if self.fast_path:
+            from .fastpath import CartMismatch, bag_to_checkout
+            direct = ""
+            try:
+                direct = bag_to_checkout(
+                    page, want_part=want_part, want_qty=1,
+                    want_origin=REGIONS.get(self.region) or "", log=self.log)
+            except CartMismatch as e:
+                # 正常路径上这里不该触发：上面已经按 part 决定过清袋和加购。
+                # 真触发了说明清袋或加购静默失败了，退回点页面那条路——它会
+                # 自己加载购物袋页，该报的限购/空袋问题由它来报。
+                self.log(f"[自动下单] ⚠️ {e} 退回点页面")
+            if direct:
+                try:
+                    page.goto(direct, timeout=self.timeout,
+                              wait_until="domcontentloaded")
+                except Exception as e:
+                    self.log(f"[快车道] 跳转结账地址失败：{type(e).__name__}，退回点页面")
+                    direct = ""
+            if not direct:
+                page = self._checkout_via_bag(ctx, page)
+        else:
+            page = self._checkout_via_bag(ctx, page)
         if "/shop/checkout" not in (page.url or "") and not _is_sign_in(page.url):
             self.log("[自动下单] 页面上的结账按钮没走通，退回直跳结账地址")
             page = placer.enter(ctx, page)

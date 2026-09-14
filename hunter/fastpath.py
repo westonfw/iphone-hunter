@@ -104,6 +104,253 @@ async ([path, query, body, stk, callId]) => {
 }
 """
 
+#: 直接从购物袋接口进结账，跳过加载 259KB 的购物袋页。
+#:
+#: 为什么值得：2026-09-14 实测，服务端侧这一段只要 ~2.2s
+#:   POST bagx/checkout_now  430ms → GET checkout/start 818ms → GET /shop/checkout 951ms
+#: 而走「加载购物袋页 → 等它安静 → 找按钮 → 点 → 等新标签」要 ~8s。
+#: 多出来的 ~6s 全是客户端渲染开销。
+#:
+#: 用的令牌是**购物袋作用域**的那个（43 字符，x-aos-model-page: cart），
+#: 跟结账页那个 27 字符的不是一回事，别混用。
+#:
+#: 真实请求体带着购物车条目 id（item-26bb3a43-…），每单都不同、没法写死，
+#: 所以这里发空体试——响应的 head.status/url 会明确告诉我们成没成，
+#: 不成就退回点页面，不需要猜。
+JS_BAG_TO_CHECKOUT = r"""
+async ([path, query, stk]) => {
+    const out = {stk: !!stk};
+    try {
+        const res = await fetch(location.origin + path + "?" + query, {
+            method: "POST",
+            credentials: "include",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "*/*",
+                "X-Requested-With": "Fetch",
+                "syntax": "graviton",
+                "modelVersion": "v2",
+                "x-aos-model-page": "cart",
+                "x-aos-stk": stk,
+            },
+            body: "",
+        });
+        out.status = res.status;
+        const text = await res.text();
+        try {
+            const j = JSON.parse(text);
+            out.head = (j.head && j.head.status) || null;
+            out.url = (j.head && j.head.data && j.head.data.url) || "";
+        } catch (e) { out.parse = text.slice(0, 80); }
+    } catch (e) { out.error = String(e).slice(0, 100); }
+    return out;
+}
+"""
+
+#: 购物袋作用域的令牌 + 件数。**两样都从同一份 HTML 里取**——反正为了令牌
+#: 已经把购物袋 HTML 拉下来了，件数是顺带的，不额外花一个请求。
+#:
+#: 为什么必须看件数：跳过购物袋页的同时也跳过了原来顺带做的体检。空袋子去调
+#: checkout_now 会怎样没人验证过，而 Apple 对 iPhone 限购 2 台、超限时点结账
+#: 是**静默卡死**（坑 6）。与其去试出来，不如先看一眼——反正不要钱。
+JS_CART_STATE = r"""
+async () => {
+    const parse = (html) => {
+        const t = html.match(/["']x-aos-stk["']\s*:\s*["']([^"']+)["']/i);
+        const c = html.match(/["']bagCount["']\s*:\s*(\d+)/i);
+        const cart = /["']x-aos-model-page["']\s*:\s*["']cart["']/i.test(html);
+        // 袋里到底装了什么：sku 就是 part number，用它复核型号
+        const skus = [...new Set((html.match(/["']sku["']\s*:\s*["']([^"']+)["']/gi) || [])
+            .map(m => (m.match(/["']sku["']\s*:\s*["']([^"']+)["']/i) || [])[1])
+            .filter(Boolean))];
+        // 只认 shoppingCart.items.* 下的条目：「稍后购买」是 bagSavedListItems.*，
+        // 那是用户自己存的东西，误删了不好交代。
+        const items = [...new Set((html.match(/shoppingCart\.items\.(item-[0-9a-f-]{8,})/g) || [])
+            .map(m => m.replace("shoppingCart.items.", "")))];
+        // 每条目的数量。只看 sku 集合会漏掉「两台同型号」——集合仍然只有一个元素。
+        const qty = (html.match(/["']quantity["']\s*:\s*"?(\d+)"?/gi) || [])
+            .map(m => parseInt((m.match(/(\d+)/) || [])[1], 10))
+            .filter(n => !isNaN(n));
+        return {stk: t ? t[1] : "", count: c ? parseInt(c[1], 10) : null,
+                cart, skus, items, qty, origin: location.origin};
+    };
+    const here = parse(document.documentElement.innerHTML);
+    if (here.stk && here.cart) return here;          // 已经在购物袋页上
+    try {
+        // 相对地址会跟着当前页的 origin 走。页面停在 secureN 上时，
+        // fetch("/shop/bag") 打的是 secureN，读回来是空的——调用方必须校验 origin。
+        const res = await fetch("/shop/bag", {credentials: "include"});
+        return {...parse(await res.text()), origin: location.origin};
+    } catch (e) {
+        return {stk: "", count: null, cart: false, origin: location.origin,
+                error: String(e).slice(0, 80)};
+    }
+}
+"""
+
+#: Apple 对 iPhone 限购 2 台。超了点结账不报错、只是静默不动（坑 6）。
+BAG_LIMIT = 2
+
+
+#: 删一条购物袋条目。空请求体，带购物袋作用域的令牌。
+JS_BAG_DELETE = r"""
+async ([itemKey, stk]) => {
+    try {
+        const res = await fetch(location.origin + "/shop/bagx?_a=delete&_m=" +
+                                encodeURIComponent("shoppingCart.items." + itemKey), {
+            method: "POST",
+            credentials: "include",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "*/*",
+                "X-Requested-With": "Fetch",
+                "syntax": "graviton",
+                "modelVersion": "v2",
+                "x-aos-model-page": "cart",
+                "x-aos-stk": stk,
+            },
+            body: "",
+        });
+        const text = await res.text();
+        let left = null;
+        const m = text.match(/["']bagCount["']\s*:\s*(\d+)/i);
+        if (m) left = parseInt(m[1], 10);
+        return {status: res.status, left: left};
+    } catch (e) { return {status: 0, error: String(e).slice(0, 90)}; }
+}
+"""
+
+
+def _origin_ok(st: dict, want_origin: str, log) -> bool:
+    """校验读到的状态确实来自主站。
+
+    2026-09-14 实测踩过：上一轮跑完页面停在 secure8 的结账页，这时
+    fetch("/shop/bag") 的相对地址跟着 location.origin 走、打到了 secure8，
+    读回来「购物袋是空的」——于是跳过清空、又加了一台，最后袋里两台。
+    """
+    got = str(st.get("origin") or "")
+    if not want_origin or not got or got.rstrip("/") == want_origin.rstrip("/"):
+        return True
+    log(f"[快车道] 当前页在 {got} 上，读到的购物袋不是主站的，不能当真")
+    return False
+
+
+def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> dict:
+    """确保购物袋里**只有**这次要买的那台。返回 {ok, kept, removed, reason}。
+
+    比「打开购物袋页 → 找移除按钮 → 逐个点」快得多：实测点页面那条路要 ~6s
+    （大头是加载 259KB 的页面 + 渲染），这里一次 fetch 拿状态、每条一个 POST。
+
+    `kept=True` 表示袋里已经正好是目标型号、什么都没动——**这才是「重复购买
+    同一配置可以跳过加购」该有的依据**：读服务端的真实状态，而不是记一个
+    进程内的布尔量（那个会因为进程重启、或者上一轮加的是别的颜色而失真）。
+    """
+    t0 = time.monotonic()
+    try:
+        st = page.evaluate(JS_CART_STATE) or {}
+    except Exception as e:
+        return {"ok": False, "reason": f"读购物袋状态失败：{type(e).__name__}"}
+    if not _origin_ok(st, want_origin, log):
+        return {"ok": False, "reason": "当前页不在主站上，读到的购物袋状态不可信"}
+    stk = str(st.get("stk") or "")
+    items = [str(x) for x in (st.get("items") or []) if x]
+    skus = [str(x).upper() for x in (st.get("skus") or []) if x]
+    qty = [int(n) for n in (st.get("qty") or []) if isinstance(n, int)]
+    want = (want_part or "").upper().strip()
+
+    if not items:
+        log("[快车道] 购物袋本来就是空的，直接加购")
+        return {"ok": True, "kept": False, "removed": 0}
+    # 「已经正好是目标」必须三个条件都满足：只有一条、型号对、**数量是 1**。
+    # 少了数量那条就会放过「同型号两台」——集合比对看不出来，实测中招过。
+    if want and len(items) == 1 and skus == [want] and qty[:1] == [1]:
+        log(f"[快车道] 购物袋里已经正好是 {want} × 1，跳过清空和加购")
+        return {"ok": True, "kept": True, "removed": 0}
+    if want and skus == [want] and (len(items) > 1 or qty[:1] != [1]):
+        log(f"[快车道] 购物袋里是 {want} 但有 {len(items)} 条 / 数量 {qty[:3]}"
+            f"——不是要的那一台，照样清空重加")
+    if not stk:
+        return {"ok": False, "reason": "读不到购物袋令牌，没法用接口清空"}
+
+    removed = 0
+    for key in items:
+        try:
+            r = page.evaluate(JS_BAG_DELETE, [key, stk]) or {}
+        except Exception as e:
+            return {"ok": False, "removed": removed,
+                    "reason": f"删 {key[:16]}… 失败：{type(e).__name__}"}
+        if r.get("status") != 200:
+            return {"ok": False, "removed": removed,
+                    "reason": f"删 {key[:16]}… 返回 {r.get('status')}"}
+        removed += 1
+    log(f"[快车道] 已清空购物袋（接口删了 {removed} 件，"
+        f"{(time.monotonic() - t0) * 1000:.0f}ms，没加载购物袋页）")
+    return {"ok": True, "kept": False, "removed": removed}
+
+
+def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
+                    want_origin: str = "", log=print) -> str:
+    """从购物袋接口直接拿到结账地址。拿不到返回空串，调用方退回点页面。
+
+    want_part 给了就**强制复核**袋里的型号，对不上抛 CartMismatch——
+    宁可这一单不下，也不能买错机器。
+    """
+    t0 = time.monotonic()
+    try:
+        st = page.evaluate(JS_CART_STATE) or {}
+    except Exception as e:
+        log(f"[快车道] 读购物袋状态失败：{type(e).__name__}")
+        return ""
+    stk, count = str(st.get("stk") or ""), st.get("count")
+    if not stk:
+        log("[快车道] 购物袋页里没读到令牌，退回点页面")
+        return ""
+    # 空袋子不能往下走：加购很可能压根没成，这时候进结账只会得到一个空订单
+    # 或者莫名其妙的跳转，而且掩盖了「加购失败」这个真正的问题。
+    if count == 0:
+        log("[快车道] ⚠️ 购物袋是空的——加购没成？不进结账，退回点页面去查")
+        return ""
+    if count is not None and count > BAG_LIMIT:
+        log(f"[快车道] ⚠️ 购物袋里有 {count} 件，超过限购 {BAG_LIMIT} 台"
+            f"——超限时点结账是静默卡死，先清空再抢")
+        return ""
+    if not _origin_ok(st, want_origin, log):
+        return ""
+    skus = [str(x).upper() for x in (st.get("skus") or []) if x]
+    qty = [int(n) for n in (st.get("qty") or []) if isinstance(n, int)]
+    want = (want_part or "").upper().strip()
+    total = sum(qty) if qty else (count or 0)
+    if want and want_qty and total and total != want_qty:
+        raise CartMismatch(
+            f"购物袋里共 {total} 台（条目 {count}，数量 {qty[:3]}），这次只要 {want_qty} 台。"
+            f"多半是清空没成、又加了一台。")
+    if want and skus and set(skus) != {want}:
+        raise CartMismatch(
+            f"购物袋里是 {'、'.join(skus)}，这次要买的是 {want}。"
+            f"清空购物袋那一步可能没成，或者加购加错了型号。")
+    if want and not skus:
+        log(f"[快车道] ⚠️ 购物袋 HTML 里读不到 sku，没法复核型号，退回点页面")
+        return ""
+    if count:
+        log(f"[快车道] 购物袋 {count} 件 · {'、'.join(skus) or '?'}，型号已复核")
+    try:
+        r = page.evaluate(JS_BAG_TO_CHECKOUT,
+                          ["/shop/bagx/checkout_now",
+                           encode([("_a", "checkout"), ("_m", "shoppingCart.actions")]),
+                           stk]) or {}
+    except Exception as e:
+        log(f"[快车道] 购物袋接口调用失败：{type(e).__name__}")
+        return ""
+    url = str(r.get("url") or "")
+    dt = (time.monotonic() - t0) * 1000
+    if r.get("status") == 200 and "/shop/checkout" in url:
+        log(f"[快车道] 直接从购物袋接口进结账（{dt:.0f}ms，没加载购物袋页）")
+        return url
+    log(f"[快车道] 购物袋接口没给出结账地址（{dt:.0f}ms，"
+        f"status={r.get('status')} head={r.get('head')} url={url[:60] or '无'}），退回点页面")
+    return ""
+
+
 #: 从结账页 HTML 里读 x-aos-stk。
 #:
 #: 别照 <meta> / <input> 去找——那两处**都没有**（实测零命中）。键名也是
@@ -135,6 +382,15 @@ def encode(pairs: list[tuple[str, str]]) -> str:
 
 class Blocked(Exception):
     """被边缘节点拦了。不重试、不换路径——见模块开头的风险提示。"""
+
+
+class CartMismatch(Exception):
+    """购物袋里装的不是这次要买的东西。
+
+    **这比慢几秒严重得多**：清袋静默失败、或者加购加错型号时，件数一样是 1，
+    只数件数根本发现不了，然后就一路下单买错机器。原来的流程靠「先清袋再加购」
+    来保证型号正确，但**加购之后没有任何地方复核过**——这个异常就是那道复核。
+    """
 
 
 class Stalled(Exception):

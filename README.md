@@ -580,6 +580,41 @@ selfPickupContact.nationalIdSelf.d.nationalIdSelf     len=0   ← 只有这个�
 > 模型把当前值放在 `d` 下、上一次的值放在 `was` 下。取值**只能认 `d`**，
 > 认错了会把旧值发回去。
 
+#### 坑 C：购物袋也有接口，但相对地址会打错主机
+
+清空和进结账都不用加载那个 259KB 的购物袋页：
+
+```
+POST /shop/bagx?_a=delete&_m=shoppingCart.items.item-<uuid>   空体，删一条
+POST /shop/bagx/checkout_now?_a=checkout&_m=shoppingCart.actions  空体，进结账
+```
+
+都用**购物袋作用域**的令牌（43 字符，`x-aos-model-page: cart`），跟结账页那个
+27 字符的不通用。条目 uuid 从购物袋 HTML 里取，只认 `shoppingCart.items.*`——
+`bagSavedListItems.*` 是用户的「稍后购买」，误删不好交代。
+
+> **相对地址会跟着当前页的 origin 走。** 2026-09-14 实测栽过：上一轮跑完页面
+> 停在 `secure8.../shop/checkout`，这时 `fetch("/shop/bag")` 打的是 **secure8**，
+> 读回来「购物袋是空的」——于是跳过清空、又加了一台，最后袋里两台。
+> 所以 JS 要回报 `location.origin`，Python 侧校验它确实是主站；**读数不可信时
+> 什么都不做**，而不是按错误读数去决策。
+>
+> 这个 bug 只在「从残留的 secureN 页面起跑」时出现，实盘走预热不会撞到——
+> 最坏的一类 bug：测试里才出现，真出问题时反而没人信。
+
+#### 坑 D：比对型号不等于比对数量
+
+「袋里已经是目标型号就跳过加购」这个优化，判断条件写成比对 sku 集合是不够的：
+**两台同型号时集合仍然只有一个元素**，照样放行，于是又加一台变成两台。
+
+条件必须是三个都满足：**只有一条 + 型号对 + 数量是 1**（数量在
+`itemQuantity.d.quantity`，同一条目也可能是 2）。进结账前还要再校验一次总台数。
+
+顺带修了同一族的另一个洞：`added_to_bag` 是个布尔量，只记「加过了」。监控盯着
+十几个配置时，A 色放货加购后失败重试、下一轮命中 B 色，这时清袋和加购都会被
+跳过，等于拿 A 色去给 B 色结账。改成记 `bagged_part`（加的是哪个 part），
+型号不同就重新清袋加购。
+
 #### 三个必须注意的坑
 
 **0. `selectStore` 只认门店编号（R581），不认名字（五角场）。** 喂名字**不会报错**，

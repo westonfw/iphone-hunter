@@ -349,3 +349,311 @@ class PlaceOrderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BagToCheckoutTests(unittest.TestCase):
+    """跳过加载购物袋页直接进结账。服务端侧这一段只要 ~2.2s，
+    而「加载 259KB 购物袋页 → 等安静 → 找按钮 → 点」要 ~8s。
+    请求体带着每单不同的购物车条目 id，没法写死，所以发空体试——
+    响应会明确说成没成，不成就退回点页面，不用猜。"""
+
+    class Page:
+        def __init__(self, stk, result):
+            self.result, self.calls = result, 0
+            # 购物袋状态：令牌 + 件数 + 型号，都从同一份 HTML 里取
+            self.state = ({"stk": stk, "count": 1, "cart": True, "skus": ["MG6W4CH/A"],
+                           "qty": [1], "origin": "https://www.apple.com.cn"}
+                          if stk else {"stk": "", "count": None, "cart": False,
+                                       "skus": [], "qty": [],
+                                       "origin": "https://www.apple.com.cn"})
+
+        def evaluate(self, js, arg=None):
+            self.calls += 1
+            return self.result if arg is not None else self.state
+
+    def test_returns_checkout_url_on_success(self):
+        from hunter.fastpath import bag_to_checkout
+        p = self.Page("CARTTOKEN", {"status": 200, "head": 302,
+                                    "url": "https://secure8.www.apple.com.cn/shop/checkout/start?x=1"})
+        self.assertIn("/shop/checkout", bag_to_checkout(p, log=lambda *a: None))
+
+    def test_bails_when_cart_token_missing(self):
+        from hunter.fastpath import bag_to_checkout
+        p = self.Page("", None)
+        self.assertEqual("", bag_to_checkout(p, log=lambda *a: None))
+        self.assertEqual(1, p.calls)          # 没令牌就别发请求
+
+    def test_bails_when_no_checkout_url_returned(self):
+        from hunter.fastpath import bag_to_checkout
+        p = self.Page("CARTTOKEN", {"status": 200, "head": 200, "url": ""})
+        self.assertEqual("", bag_to_checkout(p, log=lambda *a: None))
+
+    def test_bails_when_url_is_not_checkout(self):
+        """别把随便一个跳转当成功——退回点页面是安全的，跳错地方不是。"""
+        from hunter.fastpath import bag_to_checkout
+        p = self.Page("CARTTOKEN", {"status": 200, "head": 302,
+                                    "url": "https://www.apple.com.cn/shop/bag"})
+        self.assertEqual("", bag_to_checkout(p, log=lambda *a: None))
+
+    def test_survives_evaluate_errors(self):
+        from hunter.fastpath import bag_to_checkout
+
+        class Boom:
+            def evaluate(self, js, arg=None):
+                raise RuntimeError("context destroyed")
+        self.assertEqual("", bag_to_checkout(Boom(), log=lambda *a: None))
+
+
+class CartVerifyTests(unittest.TestCase):
+    """只数件数保证不了型号。清袋静默失败时件数一样是 1，然后就买错机器了——
+    原来的流程靠「先清袋再加购」保证型号，但加购之后从没复核过。"""
+
+    class Page:
+        def __init__(self, state, result=None):
+            self.state, self.result = state, result
+            self.posted = False
+
+        def evaluate(self, js, arg=None):
+            if arg is None:
+                return self.state
+            self.posted = True
+            return self.result or {"status": 200, "head": 302,
+                                   "url": "https://secure8.www.apple.com.cn/shop/checkout"}
+
+    @staticmethod
+    def state(count, skus, stk="CARTTOKEN", qty=None):
+        return {"stk": stk, "count": count, "cart": True, "skus": skus,
+                "qty": qty if qty is not None else [1] * max(count, 0),
+                "origin": "https://www.apple.com.cn"}
+
+    def _run(self, st, want):
+        from hunter.fastpath import bag_to_checkout
+        p = self.Page(st)
+        return bag_to_checkout(p, want_part=want, log=lambda *a: None), p
+
+    def test_passes_when_cart_holds_exactly_the_target(self):
+        url, p = self._run(self.state(1, ["MG6W4CH/A"]), "MG6W4CH/A")
+        self.assertIn("/shop/checkout", url)
+        self.assertTrue(p.posted)
+
+    def test_rejects_wrong_model_even_when_count_looks_right(self):
+        from hunter.fastpath import CartMismatch
+        with self.assertRaises(CartMismatch) as cm:
+            self._run(self.state(1, ["MG704CH/A"]), "MG6W4CH/A")
+        self.assertIn("MG704CH/A", str(cm.exception))
+        self.assertIn("MG6W4CH/A", str(cm.exception))
+
+    def test_rejects_extra_item_alongside_target(self):
+        """袋里多一台别的，件数 2 仍在限购内，但订单就不是你要的了。"""
+        from hunter.fastpath import CartMismatch
+        with self.assertRaises(CartMismatch):
+            self._run(self.state(2, ["MG6W4CH/A", "MJY64CH/A"]), "MG6W4CH/A")
+
+    def test_case_insensitive_match(self):
+        url, _ = self._run(self.state(1, ["mg6w4ch/a"]), "MG6W4CH/A")
+        self.assertIn("/shop/checkout", url)
+
+    def test_refuses_when_empty(self):
+        url, p = self._run(self.state(0, []), "MG6W4CH/A")
+        self.assertEqual("", url)
+        self.assertFalse(p.posted)          # 空袋子不发请求
+
+    def test_refuses_when_over_purchase_limit(self):
+        url, p = self._run(self.state(3, ["MG6W4CH/A"]), "")
+        self.assertEqual("", url)
+        self.assertFalse(p.posted)
+
+    def test_refuses_when_sku_unreadable(self):
+        """读不出型号就别赌——退回点页面是安全的。"""
+        url, p = self._run(self.state(1, []), "MG6W4CH/A")
+        self.assertEqual("", url)
+        self.assertFalse(p.posted)
+
+    def test_no_want_part_skips_model_check(self):
+        url, _ = self._run(self.state(1, ["ANYTHING/A"]), "")
+        self.assertIn("/shop/checkout", url)
+
+
+class BaggedPartTests(unittest.TestCase):
+    """只记「加过了」不够，必须记**加的是哪个 part**。
+
+    监控盯着十几个配置：A 色放货、加购后失败重试，下一轮命中的可能是 B 色。
+    这时如果只看「加过了」就跳过清袋和加购，等于拿 A 色去给 B 色结账。
+    """
+
+    @staticmethod
+    def _ab(bagged):
+        from hunter.autobuy import AutoBuy
+        ab = AutoBuy.__new__(AutoBuy)
+        ab.bagged_part = bagged
+        return ab
+
+    @staticmethod
+    def _bagged_ok(ab, want):
+        # 跟 _drive 里那个判断保持一致
+        return bool(ab.bagged_part) and (not want or ab.bagged_part == want)
+
+    def test_same_part_skips_readd(self):
+        self.assertTrue(self._bagged_ok(self._ab("MG6W4CH/A"), "MG6W4CH/A"))
+
+    def test_different_part_forces_clear_and_readd(self):
+        """这就是会买错颜色的那条路。"""
+        self.assertFalse(self._bagged_ok(self._ab("MG704CH/A"), "MG6W4CH/A"))
+
+    def test_empty_bag_forces_add(self):
+        self.assertFalse(self._bagged_ok(self._ab(""), "MG6W4CH/A"))
+
+    def test_unknown_target_trusts_existing_bag(self):
+        """拿不到目标 part（比如没传 url）时不强行重来，保持原行为。"""
+        self.assertTrue(self._bagged_ok(self._ab("MG6W4CH/A"), ""))
+
+
+class PrepareBagTests(unittest.TestCase):
+    """用接口清购物袋，别打开购物袋页。
+
+    「袋里已经正好是目标型号就跳过加购」这个优化**不会因此失效**——恰恰相反：
+    判断依据从进程内的布尔量换成了服务端的真实状态，进程重启、上一轮加的是
+    别的颜色，都骗不过它。
+    """
+
+    class Page:
+        def __init__(self, state, delete=None):
+            self.state = state
+            self.delete = delete or {"status": 200, "left": 0}
+            self.deleted = []
+
+        def evaluate(self, js, arg=None):
+            if arg is None:
+                return self.state
+            self.deleted.append(arg[0])
+            return self.delete
+
+    @staticmethod
+    def st(items, skus, stk="CARTTOKEN", count=None, qty=None):
+        return {"stk": stk, "cart": True, "items": items, "skus": skus,
+                "count": count if count is not None else len(items),
+                "qty": qty if qty is not None else [1] * len(items),
+                "origin": "https://www.apple.com.cn"}
+
+    def _run(self, page, want="MG6W4CH/A"):
+        from hunter.fastpath import prepare_bag
+        return prepare_bag(page, want_part=want, log=lambda *a: None)
+
+    def test_two_of_the_same_model_is_not_kept(self):
+        """实测中招：袋里两台同型号，sku 集合仍然只有一个元素，光比集合放行了。"""
+        p = self.Page(self.st(["item-a", "item-b"], ["MG6W4CH/A"], count=2))
+        r = self._run(p)
+        self.assertFalse(r["kept"])
+        self.assertEqual(["item-a", "item-b"], p.deleted)
+
+    def test_single_line_with_quantity_two_is_not_kept(self):
+        """一条目、数量 2 也是两台。"""
+        p = self.Page(self.st(["item-a"], ["MG6W4CH/A"], count=2, qty=[2]))
+        r = self._run(p)
+        self.assertFalse(r["kept"])
+        self.assertEqual(["item-a"], p.deleted)
+
+    def test_refuses_when_page_is_on_another_origin(self):
+        """页面停在 secureN 上时，fetch('/shop/bag') 打的是 secureN，读回来是空的——
+        照这个结果跳过清空，就会又加一台变成两台。实测中招过。"""
+        st = self.st(["item-a"], ["MG704CH/A"])
+        st["origin"] = "https://secure8.www.apple.com.cn"
+        p = self.Page(st)
+        from hunter.fastpath import prepare_bag
+        r = prepare_bag(p, want_part="MG6W4CH/A",
+                        want_origin="https://www.apple.com.cn", log=lambda *a: None)
+        self.assertFalse(r["ok"])
+        self.assertEqual([], p.deleted)          # 不可信就什么都别删
+
+    def test_keeps_bag_when_it_already_holds_exactly_the_target(self):
+        p = self.Page(self.st(["item-a"], ["MG6W4CH/A"]))
+        r = self._run(p)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["kept"])
+        self.assertEqual([], p.deleted)          # 一条都没删
+
+    def test_clears_when_bag_holds_a_different_model(self):
+        p = self.Page(self.st(["item-a"], ["MG704CH/A"]))
+        r = self._run(p)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["kept"])
+        self.assertEqual(["item-a"], p.deleted)
+
+    def test_clears_every_item_when_several_present(self):
+        p = self.Page(self.st(["item-a", "item-b"], ["MG6W4CH/A", "MJY64CH/A"]))
+        r = self._run(p)
+        self.assertEqual(2, r["removed"])
+        self.assertEqual(["item-a", "item-b"], p.deleted)
+
+    def test_empty_bag_is_a_noop(self):
+        p = self.Page(self.st([], []))
+        r = self._run(p)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["kept"])
+        self.assertEqual([], p.deleted)
+
+    def test_reports_failure_so_caller_falls_back_to_clicking(self):
+        p = self.Page(self.st(["item-a"], ["MG704CH/A"]),
+                      delete={"status": 500})
+        r = self._run(p)
+        self.assertFalse(r["ok"])
+        self.assertIn("500", r["reason"])
+
+    def test_refuses_without_cart_token(self):
+        p = self.Page(self.st(["item-a"], ["MG704CH/A"], stk=""))
+        r = self._run(p)
+        self.assertFalse(r["ok"])
+        self.assertEqual([], p.deleted)
+
+
+class CartQuantityTests(unittest.TestCase):
+    """进结账前必须校验**总台数**，不能只比型号。
+    实测中招：清空没成、又加了一台，袋里两台同型号，sku 集合仍然只有一个元素。"""
+
+    class Page:
+        def __init__(self, state):
+            self.state, self.posted = state, False
+
+        def evaluate(self, js, arg=None):
+            if arg is None:
+                return self.state
+            self.posted = True
+            return {"status": 200, "head": 302,
+                    "url": "https://secure8.www.apple.com.cn/shop/checkout"}
+
+    @staticmethod
+    def st(count, skus, qty):
+        return {"stk": "T", "cart": True, "count": count, "skus": skus, "qty": qty,
+                "items": [f"item-{i}" for i in range(count)],
+                "origin": "https://www.apple.com.cn"}
+
+    def _run(self, page, qty_want=1):
+        from hunter.fastpath import bag_to_checkout
+        return bag_to_checkout(page, want_part="MG6W4CH/A", want_qty=qty_want,
+                               want_origin="https://www.apple.com.cn",
+                               log=lambda *a: None)
+
+    def test_one_unit_passes(self):
+        p = self.Page(self.st(1, ["MG6W4CH/A"], [1]))
+        self.assertIn("/shop/checkout", self._run(p))
+
+    def test_two_of_same_model_is_rejected(self):
+        from hunter.fastpath import CartMismatch
+        p = self.Page(self.st(2, ["MG6W4CH/A"], [1, 1]))
+        with self.assertRaises(CartMismatch) as cm:
+            self._run(p)
+        self.assertIn("2 台", str(cm.exception))
+        self.assertFalse(p.posted)          # 不带着两台去结账
+
+    def test_single_line_quantity_two_is_rejected(self):
+        from hunter.fastpath import CartMismatch
+        p = self.Page(self.st(1, ["MG6W4CH/A"], [2]))
+        with self.assertRaises(CartMismatch):
+            self._run(p)
+
+    def test_wrong_origin_falls_back_without_posting(self):
+        st = self.st(1, ["MG6W4CH/A"], [1])
+        st["origin"] = "https://secure8.www.apple.com.cn"
+        p = self.Page(st)
+        self.assertEqual("", self._run(p))
+        self.assertFalse(p.posted)
