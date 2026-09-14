@@ -543,31 +543,45 @@ class AutoBuy:
             # 顺序很要紧：**先清空购物袋，再打开产品页**。
             # 反过来做（开着产品页、另开标签页去清袋、再回来加购）既多一个标签页，
             # 也不是人的操作路径；而且清袋那一下会让产品页的会话状态过期。
-            if not dry_run and not bagged_ok and self.clear_bag:
-                # 先试接口清：一次 fetch + 每条一个 POST，不加载 259KB 购物袋页。
-                # 顺带得到「袋里是不是已经正好是目标型号」——这个判断读的是
-                # 服务端真实状态，比进程内的 bagged_part 可靠（后者会因为进程
-                # 重启或上一轮加的是别的颜色而失真）。
-                done = False
-                if self.fast_path:
-                    from .fastpath import prepare_bag
-                    r = prepare_bag(page, want_part=want_part,
-                                    want_origin=REGIONS.get(self.region) or "",
-                                    log=self.log)
-                    if r.get("ok"):
-                        done = True
-                        if r.get("kept"):
-                            bagged_ok = True
-                            self.bagged_part = want_part
-                    else:
-                        self.log(f"[快车道] 接口清空没成（{r.get('reason')}），改点页面")
-                if not done:
-                    self._clear_bag_now(page)
+            #
+            # 但走接口清空是个例外，而且必须这么排：`_run` 给过来的是一个**全新
+            # 的空白标签**，在 about:blank 上发 fetch("/shop/bag") 只会失败，
+            # 然后被当成「袋子是空的」——实测就是这样跳过清空、又加一台，
+            # 最后袋里两台。所以接口清空要等产品页加载完（有了主站 origin）再做。
+            api_cleared = False
+            if not dry_run and not bagged_ok and self.clear_bag and not self.fast_path:
+                self._clear_bag_now(page)
 
             page.goto(url, timeout=self.timeout * 2, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
-            self._pick(page, "tradein", self.trade_in_text)
-            self._pick(page, "applecare", self.applecare_text)
+
+            if not dry_run and not bagged_ok and self.clear_bag and self.fast_path:
+                from .fastpath import prepare_bag
+                r = prepare_bag(page, want_part=want_part,
+                                want_origin=REGIONS.get(self.region) or "",
+                                log=self.log)
+                if not r.get("ok"):
+                    self.log(f"[快车道] 接口清空没成（{r.get('reason')}），改点页面")
+                    self._clear_bag_now(page)
+                    page.goto(url, timeout=self.timeout * 2,
+                              wait_until="domcontentloaded")
+                    page.wait_for_timeout(2500)
+                elif r.get("kept"):
+                    bagged_ok = True
+                    self.bagged_part = want_part
+                elif r.get("removed"):
+                    # 真删了东西才需要重开产品页：删购物袋会动服务端的会话状态，
+                    # 而加购要的 atbtoken 是这页 JS 现算的，别拿过期的去点。
+                    api_cleared = True
+                    page.goto(url, timeout=self.timeout * 2,
+                              wait_until="domcontentloaded")
+                    page.wait_for_timeout(2500)
+
+            if not bagged_ok:
+                self._pick(page, "tradein", self.trade_in_text)
+                self._pick(page, "applecare", self.applecare_text)
+            if api_cleared:
+                self.log("[快车道] 清空后已重开产品页，必选项重新选过")
 
         # 已经超限就别再加了——加了也结不了账，只会让袋子更难收拾
         if self.bag_over_limit and not dry_run and not bagged_ok:
