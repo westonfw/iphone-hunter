@@ -70,6 +70,12 @@
     "pickup_district": "杨浦区"
   },
   "watch": [],
+  "quiet_hours": {
+    "enabled": false,
+    "windows": [
+      "00:00-06:00"
+    ]
+  },
   "notifiers": {
     "bark": {
       "enabled": false,

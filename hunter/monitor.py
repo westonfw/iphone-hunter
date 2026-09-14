@@ -81,7 +81,7 @@ class BaseWatcher:
             timeout=int(cfg.get("timeout", 15)),
             proxy=cfg.get("proxy") or None,
         )
-        self.bc = Broadcaster(cfg.get("notifiers"), log=log)
+        self.bc = Broadcaster.from_config(cfg, log=log)
         self.state = State(root / "state.json")
         self.open_browser = bool(cfg.get("open_browser_on_hit", True))
         self.pacer = build_pacer(cfg, sprint=sprint, log=log)
@@ -170,6 +170,8 @@ class BaseWatcher:
             f"{what}\n{how}，请在约 30 分钟内扫码支付，超时订单会被取消。\n"
             f"点这条打开结账页。",
             r.url, critical=True,
+            # 睡觉时段里唯一叫醒你的一条：三十分钟不付钱，订单就没了
+            wake=True,
         )
         self.log(f"[{now()}] 💳 待付款订单 {r.order_id} —— 去付款（约 30 分钟）")
 

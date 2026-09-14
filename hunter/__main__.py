@@ -354,12 +354,14 @@ def cmd_inspect(args) -> int:
 def cmd_test(args) -> int:
     cfg = load_config()
     client = AppleClient(cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
-    bc = Broadcaster(cfg.get("notifiers"))
+    bc = Broadcaster.from_config(cfg)
     bc.send(
         "🚨 iphone-hunter 测试通知",
         "这是一条测试。真到抢购时，通知长这样，点开直接进购买页。",
         client.base + "/shop/buy-iphone",
         critical=True,
+        # 测试通知必须发出去：半夜测试收不到会让人以为渠道配错了，回头去乱改配置
+        wake=True,
     )
     print("\n已发送。手机/桌面没收到就去 config.json 检查对应渠道的 enabled 和密钥。")
     return 0
@@ -381,7 +383,7 @@ def cmd_session(args) -> int:
 
     notifier = None
     if args.notify:
-        notifier = Broadcaster(cfg.get("notifiers") or {})
+        notifier = Broadcaster.from_config(cfg)
 
     probe = SessionProbe(
         ab.get("cdp_url", ""),

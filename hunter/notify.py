@@ -10,9 +10,12 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from urllib.parse import urlparse
 
 import requests
+
+from .pacing import in_window, parse_window
 
 TIMEOUT = 8
 
@@ -58,6 +61,50 @@ def _part_from_path(segs: list[str]) -> str:
 
 def _p(*a) -> None:
     print(*a, flush=True)
+
+
+class QuietHours:
+    """睡觉时段：这段时间里只放行**需要你动手**的消息，其余一律只记终端。
+
+    只有「订单已创建、等着你扫码付款」这一条会把人叫醒（`wake=True`）。命中、
+    下单进度、失败重试这些半夜发出来也做不了什么——一旦被吵醒几次，人就会
+    直接把通知整个关掉，真该付款时反而没人应。
+
+    时段格式跟 `pacing.hot_windows` 一样，支持跨零点（`23:30-08:00`）。
+    时段外完全不生效，该怎么推还怎么推。
+    """
+
+    def __init__(self, windows=None, enabled: bool = True, calendar=datetime.now):
+        self.windows = list(windows or [])
+        # 没有时段 = 没开静音。别让一个空 windows 的 enabled:true 把全天都静音了
+        self.enabled = bool(enabled) and bool(self.windows)
+        self.calendar = calendar
+
+    @classmethod
+    def from_config(cls, cfg, log=_p) -> "QuietHours":
+        """从 config.json 的 `quiet_hours` 装一个出来。解析不了的时段跳过并告警。"""
+        cfg = cfg if isinstance(cfg, dict) else {}
+        raw = cfg.get("windows") or []
+        if isinstance(raw, str):      # 只配一段时写成字符串也认
+            raw = [raw]
+        windows = []
+        for text in raw:
+            try:
+                windows.append(parse_window(str(text)))
+            except ValueError as e:
+                log(f"[通知] 忽略无法解析的睡觉时段：{e}")
+        # 没写 enabled 视为开：手动填了 windows 就是想让它生效
+        return cls(windows, enabled=cfg.get("enabled", True))
+
+    def muted(self) -> bool:
+        if not self.enabled:
+            return False
+        t = self.calendar()
+        return any(in_window(t.hour * 60 + t.minute, w) for w in self.windows)
+
+    def describe(self) -> str:
+        return "、".join(f"{a // 60:02d}:{a % 60:02d}-{b // 60:02d}:{b % 60:02d}"
+                        for a, b in self.windows)
 
 
 class Notifier:
@@ -224,8 +271,9 @@ REGISTRY = {c.name: c for c in (Bark, ServerChan, Telegram, WeCom, Webhook, Desk
 
 
 class Broadcaster:
-    def __init__(self, cfg: dict, log=_p):
+    def __init__(self, cfg: dict, log=_p, quiet: QuietHours | None = None):
         self.log = log
+        self.quiet = quiet or QuietHours()
         self.channels: list[Notifier] = []
         for name, sub in (cfg or {}).items():
             if not isinstance(sub, dict) or not sub.get("enabled"):
@@ -237,9 +285,26 @@ class Broadcaster:
             self.channels.append(cls(sub))
         if not self.channels:
             self.log("[通知] 没有启用任何渠道，只会打印到终端")
+        if self.quiet.enabled:
+            self.log(f"[通知] 睡觉时段 {self.quiet.describe()}，"
+                     f"这段时间只推送待付款提醒，其余只打印到终端")
 
-    def send(self, title: str, body: str, url: str = "", critical: bool = False) -> None:
-        self.log(f"\n{'!' if critical else '*'} {title}\n  {body}" + (f"\n  {url}" if url else ""))
+    @classmethod
+    def from_config(cls, cfg: dict, log=_p) -> "Broadcaster":
+        """从整份 config 装配：渠道取 `notifiers`，睡觉时段取 `quiet_hours`。"""
+        cfg = cfg or {}
+        return cls(cfg.get("notifiers"), log=log,
+                   quiet=QuietHours.from_config(cfg.get("quiet_hours"), log=log))
+
+    def send(self, title: str, body: str, url: str = "", critical: bool = False,
+             wake: bool = False) -> None:
+        """wake=True 的消息无视睡觉时段——留给「订单等你付款」这种必须动手的。"""
+        muted = not wake and self.quiet.muted()
+        self.log(f"\n{'!' if critical else '*'} {title}\n  {body}"
+                 + (f"\n  {url}" if url else "")
+                 + ("\n  （睡觉时段，只记终端不推送）" if muted else ""))
+        if muted:
+            return
         for ch in self.channels:
             try:
                 ch.send(title, body, url, critical)
