@@ -6,3 +6,6 @@ __pycache__/
 .venv/
 .browser-profile/
 logs/
+
+# HAR 里有 cookie / 身份证 / 手机号明文，绝不能进仓库
+*.har

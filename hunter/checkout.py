@@ -179,6 +179,22 @@ BAG_CHECKOUT_TRIES = (
 
 CONTINUE_BTN = "rs-checkout-continue-button-bottom"
 
+#: 结账向导每轮轮询的间隔。原来是 400ms，而且**每轮开头都先睡**——包括第一轮，
+#: 那时还什么都没点，纯白等。向导有 4~5 步，光这一项就是 1s 上下。
+#: 压到 200ms 只是让「这一步已经翻页了」被更早发现，不改变任何点击逻辑。
+POLL_MS = 200
+
+#: 点完同一步之后最多等多久再考虑重点。这是**防重复提交**的闸，不是性能参数。
+#:
+#: 原来是 2.8s，凭感觉拍的。2026-09-14 实测：`checkoutx` 每步的 TTFB 是
+#: **7.5~10.5 秒**（纯服务端处理，排队和收包都只有 1ms），于是页面还没翻页
+#: 冷却就到期了——日志里「继续填写取货详情」连点 3 次、取货人那步连点 3 次，
+#: 等于把同一个动作重复提交给服务端。
+#:
+#: 按实测的上限留余量定到 12s。注意它只是上限不是下限：step key 一变
+#: （页面真翻页了）立刻往下走，所以正常路径不会因此变慢。
+STEP_COOLDOWN_S = 12.0
+
 ID_NATIONAL = "checkout.pickupContact.selfPickupContact.nationalIdSelf.nationalIdSelf"
 ID_LAST_NAME = "checkout.pickupContact.selfPickupContact.selfContact.address.lastName"
 ID_FIRST_NAME = "checkout.pickupContact.selfPickupContact.selfContact.address.firstName"
@@ -239,6 +255,12 @@ async ([paths]) => {
                 },
                 body: "",
             });
+            // 被边缘节点拦了就**立刻停**。剩下几个路径打的是同一族端点，
+            // 继续试只会让退避更深——Akamai 按累计速率判，不是按单个路径判。
+            if (res.status === 541 || res.status === 503 || res.status === 429) {
+                tried.push({path, status: res.status, blocked: true});
+                return {ok: false, goto: "", stk: !!stk, tried, blocked: res.status};
+            }
             const text = await res.text();
             let json = null;
             try { json = JSON.parse(text); } catch (e) { json = null; }
@@ -1088,16 +1110,180 @@ def card_would_charge(snap: dict, want: str) -> bool:
     return any(p in text for p in CARD_PAY)
 
 
+#: 登录态判据——**必须跑在渲染后的 DOM 上**。
+#:
+#: 试过而且不行的：fetch 回购物袋 HTML 再正则。购物袋是 React SPA，HTML 外壳里
+#: 没有任何账号状态，data-autom 账号钩子 / isLoggedIn / signIn 链接 /「退出登录」
+#: 四组正则全部零命中（2026-09-14 实测）。跟 shield cookie 那件事是同一个教训：
+#: **fetch 到的 HTML ≠ 跑完 JS 的页面。**
+JS_LOGIN_DOM = r"""
+() => {
+    const body = document.body ? (document.body.innerText || "") : "";
+    const hrefs = [...document.querySelectorAll('a[href]')]
+        .map(a => a.getAttribute('href') || "");
+    // 登录后账号入口是指向 secureN 的绝对地址；登出后会变成 signIn/idmsa
+    const acct = hrefs.find(h => /\/shop\/account\/home/i.test(h)) || "";
+    const signIn = hrefs.find(h => /signIn|idmsa\.apple/i.test(h)) || "";
+    const words = (body.match(/登录|Sign In/g) || []).length;
+    const m = acct.match(/^https:\/\/(secure\d+)\./i);
+    return {
+        acctLink: acct.slice(0, 60),
+        signInLink: signIn.slice(0, 60),
+        signInWords: words,
+        secureHost: m ? m[1] : "",
+        rendered: body.length,
+    };
+}
+"""
+
+
+def login_state(page) -> dict:
+    """读当前**已渲染**页面的登录态。返回 {signed_in, secure_host, evidence}。
+
+    判据取「有账号入口」且「页面上没有登录字样」，两个都满足才算登录。单看一个
+    都会误判：账号入口可能只是还没渲染出来，而「登录」二字也可能出现在页脚的
+    帮助链接里。拿不准一律当没登录——多登一次只是慢几秒，漏登一次是抢不到。
+    """
+    try:
+        r = page.evaluate(JS_LOGIN_DOM) or {}
+    except Exception as e:
+        return {"signed_in": None, "secure_host": "",
+                "evidence": f"探测失败：{type(e).__name__}: {str(e)[:60]}"}
+    signed = bool(r.get("acctLink")) and not r.get("signInWords")
+    return {
+        "signed_in": signed,
+        "secure_host": r.get("secureHost") or "",
+        "evidence": (f"acct={r.get('acctLink') or '无'} "
+                     f"signIn={r.get('signInLink') or '无'} "
+                     f"登录字样={r.get('signInWords')} "
+                     f"渲染={r.get('rendered')}字"),
+    }
+
+
+#: Apple 找不到页面时会 302 到这里，而且它返回 **200**，不是 404 状态码——
+#: 光看 response.status 发现不了，必须看落地 URL。
+NOT_FOUND_PATH = "/shop/404"
+
+#: 结账向导自己发的那批 XHR。被拦时页面拿不到响应，会把你扔到 /shop/404，
+#: 于是一个**限流**问题看起来像「页面不存在」，方向全错。
+#: 2026-09-14 实测链路：
+#:   POST /shop/bagx/checkout_now            200
+#:   302  secure7/shop/checkout/start        302
+#:   GET  secure7/shop/checkout              200   结账页真的开了
+#:   GET  secure7/shop/checkoutx/fulfillment 541   ← 被 Akamai 拦
+#:   →    /shop/404                                前端把你踢到这
+CHECKOUTX_PATH = "/shop/checkoutx/"
+
+
+def goto_buy_page(page, url: str, tries: int = 3, log=None, timeout_ms: int = 45000) -> bool:
+    """打开购买页，落到 /shop/404 就重试。返回是否真的到了购买页。
+
+    为什么重试而不是直接报错：实测同一深链用干净客户端连打 5 次全 200，浏览器里
+    却偶发一次落到 /shop/404——边缘节点抖动，重试一次就好。但**不检查最危险**：
+    预热会对着 404 页报告「产品页已就绪」，等放货那一刻才发现加购按钮根本不存在。
+    跟 warm_alive 是同一类失败：日志一路正常，静默哑火。
+    """
+    for i in range(1, max(1, tries) + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.wait_for_timeout(600)
+        except Exception as e:
+            if log:
+                log(f"[购买页] 第 {i}/{tries} 次打开失败：{type(e).__name__}: {str(e)[:60]}")
+            continue
+        if NOT_FOUND_PATH not in (page.url or ""):
+            if i > 1 and log:
+                log(f"[购买页] 第 {i} 次重试成功")
+            return True
+        if log:
+            log(f"[购买页] ⚠️ 落到 404（第 {i}/{tries} 次），疑似边缘抖动，重试")
+        page.wait_for_timeout(900)
+    if log:
+        log(f"[购买页] ⚠️ 连续 {tries} 次都是 404，这次不是抖动：{url}")
+    return False
+
+
+class CheckoutBlocked(Exception):
+    """结账链路被边缘节点拦了（541/503），不是页面不存在。
+
+    必须跟「页面不存在」分开：前者要退避等待，后者重试或换地址。把它们混成
+    「没能进入结账页」会让人往完全错误的方向查——实际发生过。
+    """
+
+
+def watch_checkout_block(page, log=None, ctx=None) -> dict:
+    """盯结账 XHR 有没有被拦。返回一个会被就地更新的 dict。
+
+    **必须同时挂到 context 上**：点「结账」会开新标签（坑 7），被拦的那个
+    `checkoutx/fulfillment` 请求发生在新标签里。只挂当前页就什么都看不到——
+    而看不到的后果是把限流误报成「页面不存在」，正是这个函数要防的事。
+    """
+    state: dict = {"hits": [], "retry_after": 0.0}
+    seen: set = set()
+
+    def on_resp(r):
+        try:
+            if CHECKOUTX_PATH not in r.url:
+                return
+            if r.status in (541, 503, 429):
+                ra = 0.0
+                try:
+                    ra = float((r.headers or {}).get("retry-after") or 0)
+                except (TypeError, ValueError):
+                    ra = 0.0
+                state["hits"].append({"status": r.status, "url": r.url[:110],
+                                      "retry_after": ra})
+                state["retry_after"] = max(state["retry_after"], ra)
+                if log:
+                    log(f"[结账] ⚠️ 被拦 {r.status}：{r.url.split('?')[0][-60:]}"
+                        + (f"（Retry-After {ra:.0f}s）" if ra else ""))
+        except Exception:
+            pass
+
+    def hook(p) -> None:
+        if p is None or id(p) in seen:
+            return
+        seen.add(id(p))
+        try:
+            p.on("response", on_resp)
+        except Exception:
+            pass
+
+    hook(page)
+    if ctx is not None:
+        try:
+            for p in list(ctx.pages):
+                hook(p)
+            ctx.on("page", hook)      # 结账开的新标签也要接住
+        except Exception:
+            pass
+    return state
+
+
 class OrderPlacer:
+    #: 门店编号长这样：R581。名字（五角场）喂给 selectStore 服务端不认，
+    #: 而且不报错、只是静默选不中——所以宁可不走快车道，也不拿名字去赌。
+    STORE_NO = re.compile(r"^R\d{2,5}$", re.I)
+
     def __init__(self, *, region: str = "cn", pickup_stores: list[str] | None = None,
+                 store_numbers: list[str] | None = None,
                  payment: str = "支付宝", delivery: str = "pickup",
                  id_last4: str = "", last_name: str = "", first_name: str = "",
                  email: str = "", phone: str = "", installment_months: int = 0,
                  secure_host: str = "", stop_at_review: bool = False,
+                 fast_path: bool = False, place_order: bool = True,
+                 pickup_city: str = "上海",
+                 pickup_state: str = "上海", pickup_district: str = "杨浦区",
                  timeout_ms: int = 30000, log=print):
         self.region = region
         # 可接受的取货门店，按优先级排。监控命中时会把「真有货的那几家」放在前面。
         self.pickup_stores = [x.strip() for x in (pickup_stores or []) if x and x.strip()]
+        # 只留真正长得像编号的，顺序去重
+        self.store_numbers: list[str] = []
+        for x in (store_numbers or []):
+            x = (x or "").strip().upper()
+            if self.STORE_NO.match(x) and x not in self.store_numbers:
+                self.store_numbers.append(x)
         self.payment = (payment or "支付宝").strip() or "支付宝"
         self.delivery = delivery if delivery in ("pickup", "shipping") else "pickup"
         self.id_last4 = re.sub(r"\s+", "", id_last4 or "").upper()
@@ -1110,11 +1296,31 @@ class OrderPlacer:
         self.secure_host = (secure_host or "").strip()
         #: 走到 Review 页就停，不点「立即下单」。测试整条链路时用。
         self.stop_at_review = bool(stop_at_review)
+        #: 用 6 个同源 POST 代替点页面走完向导（见 fastpath.py）。
+        #: 失败会自动退回点页面的老路，所以打开它不会让情况变糟。
+        self.fast_path = bool(fast_path)
+        #: 快车道走到 Review 后要不要直接提交。提交只创建待付款订单，
+        #: 付款始终由人完成；信用卡路径在 fastpath 里还有一道硬拒。
+        self.place_order_flag = bool(place_order)
+        self.pickup_city = pickup_city
+        self.pickup_state = pickup_state
+        self.pickup_district = pickup_district
+        #: 快车道是否已经把订单创建出来了。place() 靠它决定还要不要再点页面——
+        #: 漏判会导致重复点「立即下单」，那比慢几秒严重得多。
+        self.fast_ordered = False
         self.timeout_ms = timeout_ms
         self.log = log
+        #: watch_checkout_block() 返回的那个 dict，由 enter() 挂上。
+        #: 被拦之后所有「再试一个」的分支都要看它——换地址解决不了限流。
+        self.blocked: dict = {}
 
     def enter(self, ctx, page) -> Any:
+        self.blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
         xhr = try_bag_checkout_xhr(page)
+        if xhr.get("blocked"):
+            self.log(f"[下单] ⚠️ 结账接口被拦（{xhr['blocked']}），不再试其它路径")
+            self.blocked.setdefault("hits", []).append(
+                {"status": xhr["blocked"], "url": "bagx", "retry_after": 0.0})
         if xhr.get("stk"):
             self.log("[下单] 页面里读到了 x-aos-stk，已用同源请求试结账")
         else:
@@ -1133,6 +1339,12 @@ class OrderPlacer:
 
         last = page
         for i, url in enumerate(cands, 1):
+            if self.blocked and self.blocked.get("hits"):
+                # 被限流时换主机是没用的：拦截在边缘层，对所有 secureN 一视同仁。
+                # 继续把剩下几个候选撞一遍，只会把退避撞得更深。
+                self.log(f"[下单] ⚠️ 已被边缘节点拦截，停止尝试剩余 "
+                         f"{len(cands) - i + 1} 个结账地址——换主机解决不了限流")
+                break
             self.log(f"[下单] 直跳结账（{i}/{len(cands)}，不加载购物袋页）：{url}")
             landed = self._goto_checkout(ctx, page, url)
             if is_sign_in(getattr(landed, "url", "")):
@@ -1168,17 +1380,92 @@ class OrderPlacer:
                 self.log(f"[下单] 跳转失败：{str(e)[:70]}")
             return page
 
+    def _try_fast_path(self, page) -> bool:
+        """先试发包走完向导。成功返回 True（页面已刷到 Review）。
+
+        失败一律返回 False 让调用方退回点页面——快车道是**优化**不是依赖，
+        任何一步对不上都不该让整单挂掉。
+        """
+        from .fastpath import FastCheckout
+        if not self.store_numbers:
+            self.log("[快车道] 没有门店编号（配置里给的是名字？），跳过，走点页面的老路")
+            return False
+        fc = FastCheckout(
+            store=self.store_numbers[0],
+            id_last4=self.id_last4, last_name=self.last_name,
+            first_name=self.first_name,
+            city=self.pickup_city, state=self.pickup_state,
+            district=self.pickup_district,
+            payment_label=self.payment, installment_months=self.installment_months,
+            # stop_at_review 是硬闸门：它打开时快车道走到 Review 就停，
+            # 跟点页面那条路的行为保持一致，不能出现「点页面会停、发包却下单」。
+            place_order=self.place_order_flag and not self.stop_at_review,
+            log=self.log)
+        ok, stage, detail = fc.run(page)
+        self.log(f"[快车道] {stage}：{detail}")
+        self.fast_ordered = bool(
+            ok and fc.order_url and not FastCheckout.order_rejected(fc.order_url))
+        if not ok:
+            # 快车道可能已经推进过服务端状态，而页面 DOM 还停在原来那一步。
+            # 不刷新就退回点页面，等于对着一个状态错位的页面点——实测会变成
+            # 「反复点同一个继续按钮、URL 一直是 Fulfillment-init」的死循环。
+            self._reload_checkout(page)
+            return False
+        if self.fast_ordered:
+            return True          # 订单已创建，后面不用再点页面
+        # 六步只改了服务端状态，页面还停在第一步——刷到 Review 让后面的流程接手
+        try:
+            host = secure_host_of(page.url) or self.secure_host
+            base = f"https://{host}" if host else REGIONS.get(self.region, REGIONS["cn"])
+            page.goto(f"{base}/shop/checkout?_s=Review",
+                      timeout=self.timeout_ms, wait_until="domcontentloaded")
+            page.wait_for_timeout(800)
+        except Exception as e:
+            self.log(f"[快车道] 刷到 Review 页失败：{type(e).__name__}，退回点页面")
+            return False
+        return "review" == step_key(page.url) or "Review" in (page.url or "")
+
+    def _reload_checkout(self, page) -> None:
+        """把结账页重新加载一遍，让 DOM 跟服务端状态对齐。"""
+        try:
+            host = secure_host_of(page.url) or self.secure_host
+            base = f"https://{host}" if host else REGIONS.get(self.region, REGIONS["cn"])
+            page.goto(f"{base}/shop/checkout", timeout=self.timeout_ms,
+                      wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+            self.log("[下单] 已重新加载结账页，让页面和服务端状态对齐")
+        except Exception as e:
+            self.log(f"[下单] 重新加载结账页失败：{type(e).__name__}: {str(e)[:60]}")
+
     def place(self, page, t0: float) -> tuple[bool, str, str, str]:
+        if self.fast_path:
+            try:
+                if self._try_fast_path(page):
+                    if self.fast_ordered:
+                        # 订单已经创建，别再让点页面那条路去点一次「立即下单」
+                        return self._ok(t0, snapshot(page).get("order") or "")
+                    self.log(f"[快车道] 已到 Review（{time.monotonic() - t0:.1f}s）")
+            except Exception as e:
+                self.log(f"[快车道] 异常，退回点页面：{type(e).__name__}: {str(e)[:70]}")
         deadline = time.monotonic() + max(180.0, self.timeout_ms / 1000 * 4)
         last = "还在结账向导里"
         last_key = None
         acted_at = 0.0
+        #: 同一步连续点了多少次还没翻页。点不动就是点不动，空转到 180s 超时
+        #: 只会让人盯着日志干等，还可能把同一个动作重复提交给服务端。
+        stuck = 0
+        #: 冷却提到 12s 之后，5 次就是 60s 的空转，太久。真点不动 3 次足够判定。
+        STUCK_LIMIT = 3
 
+        first = True
         while time.monotonic() < deadline:
-            try:
-                page.wait_for_timeout(400)
-            except Exception:
-                pass
+            # 第一轮不睡：进到这里时页面已经是结账向导了，白等 400ms 没有意义
+            if not first:
+                try:
+                    page.wait_for_timeout(POLL_MS)
+                except Exception:
+                    pass
+            first = False
             snap = snapshot(page)
             key = snap.get("key") or ""
 
@@ -1188,7 +1475,8 @@ class OrderPlacer:
                 return self._ok(t0, snap.get("order") or "")
 
             # 刚点过这一步，等 URL 切到下一步，避免连点
-            if key == last_key and acted_at and time.monotonic() - acted_at < 2.8:
+            if key == last_key and acted_at and \
+                    time.monotonic() - acted_at < STEP_COOLDOWN_S:
                 continue
 
             if key in ("fulfillment", ""):
@@ -1217,6 +1505,12 @@ class OrderPlacer:
             else:
                 last = self._step_unknown(page, snap, key)
 
+            stuck = stuck + 1 if key == last_key else 0
+            if stuck >= STUCK_LIMIT:
+                return False, "⚠️ 卡在同一步点不动", (
+                    f"同一步连点 {stuck} 次仍然没翻页（{last}，_s="
+                    f"{snap.get('step') or key or '?'}）。页面和服务端状态很可能对不上，"
+                    f"请手动接管这个结账页。"), ""
             last_key = key
             acted_at = time.monotonic()
             self.log(f"[下单] {last}  （_s={snap.get('step') or key or '?'}）")

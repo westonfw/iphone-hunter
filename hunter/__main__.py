@@ -13,6 +13,7 @@ from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list
                       windows_chrome)
 from .logbook import setup as setup_logbook
 from .monitor import LaunchWatcher, StockWatcher
+from .session import SessionProbe, parse_duration
 from .notify import Broadcaster
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -271,6 +272,11 @@ def cmd_buy(args) -> int:
     ab = dict(cfg.get("autobuy") or {})
     if args.stop_at_review:
         ab["stop_at_review"] = True
+    # 拿来做 A/B：同一条链路分别用发包和点页面各跑一次，才知道快车道到底快不快。
+    if args.no_fast_path:
+        ab["fast_path"] = False
+    if args.store:
+        ab["pickup_store_numbers"] = [args.store.upper()]
     if not args.confirm:
         pay = ab.get("payment_method") or "支付宝"
         stores = _store_list(ab.get("pickup_stores"), ab.get("pickup_store_name"))
@@ -359,15 +365,122 @@ def cmd_test(args) -> int:
     return 0
 
 
+def cmd_session(args) -> int:
+    """长时间记录会话状态，回答「挂着到底能挂多久、靠什么续」。"""
+    cfg = load_config()
+    ab = cfg.get("autobuy") or {}
+
+    from .logbook import DailyFile, current
+    lb = current()
+    sink = None
+    if lb is not None:
+        jar = DailyFile(lb.dir, "session-probe", ".samples.jsonl")
+        def sink(rec, _jar=jar):
+            _jar.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        print(f"[探针] 采样落盘：{jar.path_for()}")
+
+    notifier = None
+    if args.notify:
+        notifier = Broadcaster(cfg.get("notifiers") or {})
+
+    probe = SessionProbe(
+        ab.get("cdp_url", ""),
+        int(args.port or ab.get("cdp_port", DEFAULT_CDP_PORT)),
+        every=parse_duration(args.every, 300.0),
+        act=args.act,
+        login_every=parse_duration(args.login_every, 0.0) if args.login_every else 0.0,
+        hours=float(args.hours or 0),
+        notifier=notifier,
+        sink=sink,
+    )
+    return probe.run()
+
+
+def cmd_fastpath(args) -> int:
+    """在已经打开的结账页上跑一遍六步发包，停在 Review。**不下单。**"""
+    from .fastpath import FastCheckout
+    cfg = load_config()
+    ab = cfg.get("autobuy") or {}
+    pk = cfg.get("pickup") or {}
+    stores = [s for s in (ab.get("pickup_store_numbers") or pk.get("stores") or [])
+              if str(s).upper().startswith("R")]
+    if not stores:
+        raise SystemExit("配置里没有门店编号（形如 R581）。填 pickup.stores 或 "
+                         "autobuy.pickup_store_numbers。名字（五角场）不行——"
+                         "selectStore 只认编号。")
+    store = (args.store or stores[0]).upper()
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise SystemExit("没装 playwright。用虚拟环境跑：.venv/bin/python -m hunter ...")
+
+    for url in cdp_candidates(ab.get("cdp_url", ""), int(ab.get("cdp_port", DEFAULT_CDP_PORT))):
+        if probe_cdp(url):
+            break
+    else:
+        raise SystemExit("没找到开着调试端口的 Chrome。先跑：hunter connect --launch")
+
+    with sync_playwright() as pw:
+        ctx = pw.chromium.connect_over_cdp(url).contexts[0]
+        pages = [p for p in ctx.pages if "/shop/checkout" in (p.url or "")]
+        if not pages:
+            raise SystemExit("没有打开着的结账页。先在浏览器里走到结账第一步"
+                             "（购物袋 → 结账），再跑这个命令。")
+        page = pages[0]
+        print(f"结账页：{page.url[:90]}")
+        print(f"门店 {store} / 付款 {ab.get('payment_method')} "
+              f"{ab.get('installment_months')} 期\n")
+        fc = FastCheckout(
+            store=store,
+            id_last4=str(ab.get("id_last4") or ""),
+            last_name=str(ab.get("pickup_last_name") or ""),
+            first_name=str(ab.get("pickup_first_name") or ""),
+            city=args.city or str(ab.get("pickup_city") or "上海"),
+            state=args.state or str(ab.get("pickup_state") or "上海"),
+            district=args.district or str(ab.get("pickup_district") or "杨浦区"),
+            payment_label=str(ab.get("payment_method") or "招商银行"),
+            installment_months=int(ab.get("installment_months") or 24),
+            # 默认只走到 Review。真要下单必须显式 --confirm——这条命令是拿来
+            # 验链路的，别让人手一滑就创建了真实订单。
+            place_order=bool(args.confirm),
+        )
+        if not args.confirm:
+            print("（只走到 Review，不下单。要真下单加 --confirm）\n")
+        ok, stage, detail = fc.run(page)
+        print(f"\n{'✅' if ok else '❌'} {stage}\n   {detail}")
+        if ok and not args.confirm:
+            print("\n浏览器里刷一下就能看到 Review 页。")
+        return 0 if ok else 1
+
+
+def cmd_har(args) -> int:
+    """解析 Chrome 导出的 HAR，输出结账请求清单（只看字段名和长度）。"""
+    from .harscan import scan
+    return scan(Path(args.path))
+
+
 def cmd_record(args) -> int:
     """挂到已登录 Chrome，记录结账点击和步骤 URL。"""
     from .record import run as record_run
     cfg = load_config()
     watch = cfg.get("watch") or []
     url = ""
-    if watch:
+    part = (getattr(args, "part", "") or "").strip()
+    slug = (getattr(args, "slug", "") or "").strip()
+    # 人已经在结账流程中间时，跳转会把他导航走、白白丢掉当前会话。
+    # --attach 就是「别动页面，只挂钩子，从这里开始录」。
+    if getattr(args, "attach", False):
+        part = slug = ""
+        watch = []
+    if part or watch:
         client = AppleClient(args.region or cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
-        url = client.buy_url(watch[0].get("model_slug", ""), watch[0]["part"])
+        if part:
+            # 录制经常要拿一个**有货的**型号来走，而监控列表第一条往往正是
+            # 那个抢不到的。写死 watch[0] 等于逼你改配置才能录一次。
+            url = client.buy_url(slug or (watch[0].get("model_slug", "") if watch else ""), part)
+        else:
+            url = client.buy_url(watch[0].get("model_slug", ""), watch[0]["part"])
     try:
         return record_run(cfg, ROOT, buy_url=url)
     except AutoBuyUnavailable as e:
@@ -423,6 +536,10 @@ def main(argv=None) -> int:
     sb = sub.add_parser("buy", help="立刻加购并创建待付款订单（真会下单，需 --confirm）")
     sb.add_argument("--part", help="目标 part number，默认取监控列表第一个")
     sb.add_argument("--slug", help="机型页面标识")
+    sb.add_argument("--no-fast-path", action="store_true",
+                    help="本次不走发包快车道，改点页面（用来对比两条路的耗时）")
+    sb.add_argument("--store", default="",
+                    help="本次指定取货门店编号，如 R359；不给就用配置里的优先级")
     sb.add_argument("--stop-at-review", action="store_true",
                     help="只走到 Review 页就停，不点「立即下单」（测试整条链路用）")
     sb.add_argument("--confirm", action="store_true",
@@ -435,7 +552,37 @@ def main(argv=None) -> int:
     st = sub.add_parser("test", help="发一条测试通知，验证渠道配置")
     st.set_defaults(func=cmd_test)
 
+    sp2 = sub.add_parser("session-probe",
+                         help="长时间记录登录/会话状态，测它到底能挂多久")
+    sp2.add_argument("--every", default="5m", help="采样间隔，如 30s/5m/1h（默认 5m，零请求）")
+    sp2.add_argument("--act", default="none", choices=["none", "xhr", "nav"],
+                     help="每次采样后的保活动作：none=纯观测 / xhr=发个接口请求 / nav=真实导航跑JS")
+    sp2.add_argument("--login-every", default="", help="多久探一次登录态，如 30m（要发请求，默认关）")
+    sp2.add_argument("--hours", type=float, default=0, help="跑多少小时后自动收工（默认不限）")
+    sp2.add_argument("--notify", action="store_true", help="登录态掉了就推送提醒")
+    sp2.add_argument("--port", type=int, default=0, help="CDP 端口")
+    sp2.set_defaults(func=cmd_session)
+
+    sf = sub.add_parser("fastpath",
+                        help="在已打开的结账页上跑六步发包，停在 Review（不下单）")
+    sf.add_argument("--store", default="", help="门店编号，如 R581；不给就用配置里第一个")
+    sf.add_argument("--city", default="", help="覆盖配置里的城市")
+    sf.add_argument("--state", default="", help="覆盖配置里的省/直辖市")
+    sf.add_argument("--district", default="", help="覆盖配置里的区（搜索门店用）")
+    sf.add_argument("--confirm", action="store_true",
+                    help="真的提交订单（创建待付款订单，仍需你自己扫码付款）；"
+                         "不给这个开关就只走到 Review")
+    sf.set_defaults(func=cmd_fastpath)
+
+    sh = sub.add_parser("har", help="解析 Chrome 导出的 HAR，看结账每一步发了什么")
+    sh.add_argument("path", help="HAR 文件路径")
+    sh.set_defaults(func=cmd_har)
+
     sr = sub.add_parser("record", help="挂到 Chrome 记录你的人工结账操作")
+    sr.add_argument("--part", default="", help="要录的 part number，如 MG6X4CH/A；不给就用监控列表第一条")
+    sr.add_argument("--slug", default="", help="机型 slug，如 iphone-17；不给就沿用监控列表里的")
+    sr.add_argument("--attach", action="store_true",
+                    help="只挂钩子不跳转——人已经在结账流程中间时用这个")
     sr.set_defaults(func=cmd_record)
 
     args = p.parse_args(argv)

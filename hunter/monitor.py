@@ -277,7 +277,7 @@ class StockWatcher(BaseWatcher):
         """
         if not (self.autobuy and self.warm_enabled) or self.autobuy_done:
             return
-        if self.autobuy.warmed:
+        if self.autobuy.warm_alive:
             return
         if time.monotonic() - self.warm_failed_at < 120:
             return  # 刚失败过，别每轮都重试

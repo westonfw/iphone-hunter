@@ -63,7 +63,11 @@
     "apple_id": "",
     "pickup_last_name": "",
     "pickup_first_name": "",
-    "pickup_phone": ""
+    "pickup_phone": "",
+    "fast_path": false,
+    "pickup_city": "上海",
+    "pickup_state": "上海",
+    "pickup_district": "杨浦区"
   },
   "watch": [],
   "notifiers": {

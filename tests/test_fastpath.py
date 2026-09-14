@@ -1,0 +1,310 @@
+import unittest
+
+from hunter.checkout import OrderPlacer
+from hunter.fastpath import BLOCK_CODES, Blocked, FastCheckout, encode, new_call_id
+
+
+class FakePage:
+    """按顺序吐出预设响应，并记下每次请求的参数。"""
+
+    def __init__(self, responses, html='"x-aos-stk":"TOKEN1234567890123456789"'):
+        self._r = list(responses)
+        self._html = html
+        self.calls = []
+
+    def evaluate(self, js, arg=None):
+        if arg is None:                       # JS_READ_STK
+            import re
+            m = re.search(r'["\']x-aos-stk["\']\s*:\s*["\']([^"\']+)', self._html)
+            return m.group(1) if m else ""
+        path, query, body, stk, call_id = arg
+        self.calls.append({"path": path, "query": query, "body": body,
+                           "stk": stk, "call_id": call_id})
+        return self._r.pop(0) if self._r else {"status": 200, "json": {}}
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+def resp(section, extra=None):
+    """造一个真实形状的响应：body.checkout 里带着该步应当产出的那一节。
+    少了这一节就算「没推进」——这是 200 之外的硬判据。"""
+    node = {"d": {}}
+    if extra:
+        node.update(extra)
+    return {"status": 200, "json": {"head": {"status": 200},
+                                    "body": {"checkout": {section: node}}}}
+
+
+FUL = resp("fulfillment")                       # 第 1、2 步
+#: 第 3 步：Apple 按账号预填好姓名/邮箱/电话，身份证后四位留空由用户填
+CONTACT = resp("pickupContact", {"selfPickupContact": {
+    "selfContact": {"address": {
+        "d": {"lastName": "张", "firstName": "三", "emailAddress": "a@b.c"},
+        "was": {"lastName": "旧姓"}}},
+    "nationalIdSelf": {"d": {"nationalIdSelf": ""}}}})
+BANKS = resp("billing", {"options": [           # 第 4 步：带银行选项
+    {"labelImageAlt": "招商银行", "value": "installments0001321713"},
+    {"labelImageAlt": "中国建设银行", "value": "installments0009999999"},
+]})
+MONTHS = resp("billing", {"installmentOptions": {"selectInstallmentOption": 0, "options": [
+    {"value": 1, "label": "1 期"}, {"value": 12, "label": "12 期"},
+    {"value": 24, "label": "24 期"},
+]}})                                            # 第 5 步
+REVIEW = resp("review")                         # 第 6 步
+#: 一条完整的顺利路径
+HAPPY = [FUL, FUL, CONTACT, BANKS, MONTHS, REVIEW]
+OK = FUL
+
+
+def placer(**kw):
+    base = {"store": "R581", "id_last4": "0000", "last_name": "张",
+            "first_name": "三", "log": lambda *a: None}
+    base.update(kw)
+    return FastCheckout(**base)
+
+
+class HelperTests(unittest.TestCase):
+    def test_call_id_shape_matches_the_real_one(self):
+        """实测形如 m072unh8yy-mu0u0tf3。服务端不校验内容，但形状要对得上。"""
+        a, b = new_call_id(), new_call_id()
+        self.assertNotEqual(a, b)
+        head, _, tail = a.partition("-")
+        self.assertEqual(10, len(head))
+        self.assertTrue(tail)
+
+    def test_encode_keeps_empty_values(self):
+        """verificationToken / selectBank 实测就是空值，不能被丢掉。"""
+        self.assertEqual("a=&b=1", encode([("a", ""), ("b", "1")]))
+
+
+class OptionLookupTests(unittest.TestCase):
+    def test_finds_bank_by_logo_alt(self):
+        self.assertEqual("installments0001321713",
+                         placer().find_billing_option(BANKS["json"]))
+
+    def test_returns_empty_when_bank_absent(self):
+        p = placer(payment_label="花呗")
+        self.assertEqual("", p.find_billing_option(BANKS["json"]))
+
+    def test_finds_requested_installment(self):
+        self.assertEqual(24, placer().find_installment(MONTHS["json"], 24))
+
+    def test_falls_back_to_longest_when_requested_absent(self):
+        self.assertEqual(24, placer().find_installment(MONTHS["json"], 36))
+
+    def test_zero_when_no_options(self):
+        self.assertEqual(0, placer().find_installment({}, 24))
+
+
+class RunTests(unittest.TestCase):
+    def test_six_posts_in_order_and_stops_at_review(self):
+        page = FakePage(list(HAPPY))
+        ok, stage, detail = placer().run(page)
+        self.assertTrue(ok, stage)
+        self.assertEqual(6, len(page.calls))
+        actions = [c["query"] for c in page.calls]
+        self.assertIn("_a=selectFulfillmentLocationAction", actions[0])
+        self.assertIn("_a=continueFromBillingToReview", actions[5])
+        # 硬边界：任何一步都不能指向下单
+        for c in page.calls:
+            self.assertNotIn("placeOrder", c["query"] + c["body"])
+
+    def test_sends_store_number_and_id_last4(self):
+        page = FakePage(list(HAPPY))
+        placer().run(page)
+        self.assertIn("R581", page.calls[1]["body"])
+        self.assertIn("0000", page.calls[3]["body"])
+
+    def test_selected_bank_id_is_carried_into_last_two_steps(self):
+        """这个 id 随会话变，必须从第 4 步响应里抓，不能写死。"""
+        page = FakePage(list(HAPPY))
+        placer().run(page)
+        self.assertIn("installments0001321713", page.calls[4]["body"])
+        self.assertIn("installments0001321713", page.calls[5]["body"])
+        self.assertIn("selectInstallmentOption=24", page.calls[5]["body"])
+
+    def test_stops_immediately_when_blocked(self):
+        """被拦不重试、不换路径——越撞退避越深（README 坑 9）。"""
+        for code in BLOCK_CODES:
+            page = FakePage([FUL, {"status": code, "json": None}] + HAPPY[2:])
+            ok, stage, _ = placer().run(page)
+            self.assertFalse(ok)
+            self.assertIn("限流", stage)
+            self.assertEqual(2, len(page.calls))   # 第二步就停
+
+    def test_bails_out_when_token_missing(self):
+        page = FakePage([FUL], html="<html>没有令牌</html>")
+        ok, stage, _ = placer().run(page)
+        self.assertFalse(ok)
+        self.assertIn("x-aos-stk", stage)
+        self.assertEqual([], page.calls)           # 一个请求都没发
+
+    def test_bails_out_when_bank_not_offered(self):
+        empty = resp("billing")                    # 走到了 Billing，但没有银行选项
+        page = FakePage([FUL, FUL, CONTACT, empty, MONTHS, REVIEW])
+        ok, stage, detail = placer(payment_label="招商银行").run(page)
+        self.assertFalse(ok)
+        self.assertIn("付款方式", stage)
+        self.assertIn("一个都没有", detail)         # 诊断信息要说清楚
+        self.assertEqual(4, len(page.calls))       # 不往下走
+
+
+class StoreNumberGuardTests(unittest.TestCase):
+    """selectStore 只认编号。喂名字不会报错，只是静默选不中——
+    所以拿不到编号时宁可不走快车道。"""
+
+    def test_keeps_only_store_numbers(self):
+        o = OrderPlacer(store_numbers=["五角场", "R581", "r359", "R581", ""])
+        self.assertEqual(["R581", "R359"], o.store_numbers)
+
+    def test_names_alone_yield_nothing(self):
+        o = OrderPlacer(store_numbers=["五角场", "南京东路"])
+        self.assertEqual([], o.store_numbers)
+
+
+class StalledStepTests(unittest.TestCase):
+    """200 不等于这一步生效了。实测栽过：四步全 200，服务端却一直停在
+    Fulfillment，于是找不到付款选项，退回点页面又对着错位的 DOM 死点。"""
+
+    def test_detects_a_step_that_did_not_advance(self):
+        # 第 3 步本该产出 pickupContact，却还是 fulfillment
+        page = FakePage([FUL, FUL, FUL, BANKS, MONTHS, REVIEW])
+        ok, stage, detail = placer().run(page)
+        self.assertFalse(ok)
+        self.assertIn("没生效", stage)
+        self.assertIn("pickupContact", detail)
+        self.assertEqual(3, len(page.calls))        # 立刻停，不往下走
+
+    def test_detects_stall_at_billing(self):
+        page = FakePage([FUL, FUL, CONTACT, CONTACT, MONTHS, REVIEW])
+        ok, stage, detail = placer().run(page)
+        self.assertFalse(ok)
+        self.assertIn("billing", detail)
+        self.assertEqual(4, len(page.calls))
+
+    def test_detail_tells_caller_to_reload(self):
+        """状态可能已经被改过，调用方必须重新加载页面再接管。"""
+        page = FakePage([FUL, FUL, FUL, BANKS, MONTHS, REVIEW])
+        _, _, detail = placer().run(page)
+        self.assertIn("重新加载", detail)
+
+    def test_happy_path_passes_the_same_check(self):
+        page = FakePage(list(HAPPY))
+        ok, stage, _ = placer().run(page)
+        self.assertTrue(ok, stage)
+
+    def test_lists_available_payment_labels_on_mismatch(self):
+        """对不上时要把可选项打出来，否则下次还是只能猜。"""
+        page = FakePage([FUL, FUL, CONTACT, BANKS, MONTHS, REVIEW])
+        _, _, detail = placer(payment_label="花呗").run(page)
+        self.assertIn("招商银行", detail)
+        self.assertIn("中国建设银行", detail)
+
+
+class ContactHarvestTests(unittest.TestCase):
+    """取货人信息用 Apple 预填的那份，别让用户在 config 里重填一遍。
+    实测发空姓名过去，服务端返回 200 却停在原地——就是「200 不等于生效」的现场。"""
+
+    MODEL = {"x": {"d": {"lastName": "张", "firstName": "三"},
+                   "was": {"lastName": "旧姓", "firstName": "旧名"}},
+             "y": {"d": {"nationalIdSelf": ""}}}
+
+    def test_takes_current_value_not_previous(self):
+        self.assertEqual("张", FastCheckout._harvest(self.MODEL, "lastName"))
+        self.assertEqual("三", FastCheckout._harvest(self.MODEL, "firstName"))
+
+    def test_uses_prefilled_name_when_config_empty(self):
+        f = placer(last_name="", first_name="")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.MODEL)}
+        self.assertEqual("张", got["lastName"])
+        self.assertEqual("0000", got["nationalIdSelf"])   # 这个只能来自 config
+
+    def test_config_overrides_prefilled(self):
+        f = placer(last_name="李", first_name="四")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.MODEL)}
+        self.assertEqual("李", got["lastName"])
+
+    def test_stalls_with_clear_reason_when_name_unavailable(self):
+        """两边都没有姓名时，与其发一个注定失败的请求，不如直接说清楚。"""
+        bare = resp("pickupContact")          # 什么都没预填
+        page = FakePage([FUL, FUL, bare, BANKS, MONTHS, REVIEW])
+        ok, stage, detail = placer(last_name="", first_name="").run(page)
+        self.assertFalse(ok)
+        self.assertIn("lastName", detail)
+        self.assertEqual(3, len(page.calls))   # 第 4 步根本没发出去
+
+    def test_stalls_when_id_last4_missing(self):
+        page = FakePage([FUL, FUL, CONTACT, BANKS, MONTHS, REVIEW])
+        f = FastCheckout(store="R581", id_last4="", last_name="", first_name="",
+                         log=lambda *a: None)
+        ok, _, detail = f.run(page)
+        self.assertFalse(ok)
+        self.assertIn("id_last4", detail)
+
+
+class PlaceOrderTests(unittest.TestCase):
+    """提交订单可以（只创建待付款单），代人付款不行。
+    而且「成不成」只认硬证据——误报成功会让人以为抢到了，实际购物袋还在。"""
+
+    PLACED = {"status": 200, "json": {"head": {"status": 302, "data": {
+        "url": "/shop/checkout/status"}}}}
+
+    @staticmethod
+    def _status(url):
+        return {"status": 200, "json": {"head": {"status": 302, "data": {"url": url}}}}
+
+    def test_places_order_and_reports_success(self):
+        page = FakePage(HAPPY + [self.PLACED,
+                         self._status("https://secure6.www.apple.com.cn/shop/checkout/thankyou")])
+        ok, stage, detail = placer(place_order=True).run(page)
+        self.assertTrue(ok, stage)
+        self.assertIn("待付款", stage)
+        self.assertEqual(8, len(page.calls))
+        self.assertIn("_a=continueFromReviewToProcess", page.calls[6]["query"])
+        self.assertIn("_a=checkStatus", page.calls[7]["query"])
+
+    def test_reports_rejection_when_bounced_back_to_checkout(self):
+        """实测场景：六步全通，提交后被打回结账页。绝不能报成功。"""
+        page = FakePage(HAPPY + [self.PLACED,
+                         self._status("https://secure6.www.apple.com.cn/shop/checkout")])
+        ok, stage, detail = placer(place_order=True).run(page)
+        self.assertFalse(ok)
+        self.assertIn("驳回", stage)
+        self.assertIn("不再为本订单提供", detail)
+
+    def test_still_processing_is_not_success(self):
+        """轮询耗尽时最后拿到的还是 status 页——这必须算失败，不能算成功。"""
+        page = FakePage(HAPPY + [self.PLACED]
+                        + [self._status("/shop/checkout/status")] * 12)
+        ok, stage, _ = placer(place_order=True).run(page)
+        self.assertFalse(ok)
+        self.assertIn("驳回", stage)
+
+    def test_never_places_on_card_payment(self):
+        """信用卡点下单是即时扣款，等于代人付款——硬拒，不给配置绕过。"""
+        cards = resp("billing", {"options": [
+            {"labelImageAlt": "信用卡", "value": "card001"}]})
+        page = FakePage([FUL, FUL, CONTACT, cards, MONTHS, REVIEW, self.PLACED])
+        ok, stage, _ = placer(place_order=True, payment_label="信用卡").run(page)
+        self.assertEqual(6, len(page.calls))      # 六步走完，第七步没发
+        self.assertTrue(ok)                       # 到 Review 算成功
+        self.assertIn("Review", stage)
+
+    def test_does_not_place_when_disabled(self):
+        page = FakePage(list(HAPPY))
+        ok, _, _ = placer(place_order=False).run(page)
+        self.assertTrue(ok)
+        self.assertEqual(6, len(page.calls))
+
+    def test_order_rejected_only_trusts_hard_evidence(self):
+        F = FastCheckout
+        self.assertFalse(F.order_rejected(".../shop/checkout/thankyou"))
+        self.assertFalse(F.order_rejected("https://www.apple.com.cn/shop/order/list"))
+        for bad in ("https://secure6.www.apple.com.cn/shop/checkout",
+                    "/shop/checkout/status", "", "/shop/bag"):
+            self.assertTrue(F.order_rejected(bad), bad)
+
+
+if __name__ == "__main__":
+    unittest.main()

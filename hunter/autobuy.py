@@ -29,6 +29,7 @@ from .apple import REGIONS
 # fill_field 定义在 checkout.py：调用点在那边，而 checkout 不能反向
 # import autobuy（循环导入）。这里再导出一次，保持 autobuy 也能 import。
 from .checkout import (BTN_SIGN_IN, ID_ACCOUNT, ID_PWD, JS_FILL, OrderPlacer,
+                       goto_buy_page, login_state, watch_checkout_block,
                        click_id, eval_in_frames, fill_field, frame_for_id,
                        is_sign_in, read_field, wait_settled)
 
@@ -209,6 +210,10 @@ class AutoBuy:
         self._pwctx = self._pw = self._ctx = self._page = None
         self._attached = False
         self.warmed = False
+        #: 预热时验到的登录态。None = 还没验过。放货那一刻才发现没登录
+        #: 就来不及了——登录要 10~25s，撞上双重认证更是直接出局。
+        self.signed_in: bool | None = None
+        self.login_note = ""
         # 预热体检发现购物袋超限时置位：超限还继续加购只会让情况更糟
         self.bag_over_limit = ""
         # 加购前先清空购物袋。Apple 限购（iPhone 每人 2 台），袋里有存货
@@ -222,6 +227,15 @@ class AutoBuy:
         self.secure_host = (self.cfg.get("checkout_host") or "").strip()
         # 测试用：一路走到 Review 页就停，不点「立即下单」
         self.stop_at_review = bool(self.cfg.get("stop_at_review", False))
+        # 结账快车道：6 个同源 POST 代替点页面（fastpath.py）。失败自动退回点页面。
+        self.fast_path = bool(self.cfg.get("fast_path", False))
+        #: 快车道要的是门店**编号**（R581），而 pickup_stores 存的是名字（五角场）。
+        #: 这两者不能混：selectStore=五角场 服务端不认，而且不会报错、只是选不中。
+        #: 放货那一刻优先用监控报上来的「真有货的那几家」，它们本来就是编号。
+        self.pickup_store_numbers = _store_list(self.cfg.get("pickup_store_numbers"))
+        self.pickup_city = str(self.cfg.get("pickup_city") or "上海")
+        self.pickup_state = str(self.cfg.get("pickup_state") or "上海")
+        self.pickup_district = str(self.cfg.get("pickup_district") or "杨浦区")
         self.delivery = (self.cfg.get("delivery") or "pickup").strip()
         self.region = (self.cfg.get("region") or "cn").strip()
         self.id_last4 = str(self.cfg.get("id_last4") or "")
@@ -266,6 +280,70 @@ class AutoBuy:
         self._pwctx = self._pw = self._ctx = self._page = None
         self.warmed = False
 
+    @property
+    def warm_alive(self) -> bool:
+        """预热是否**真的**还能用。
+
+        光看 self.warmed 不够：它只在 stop() 里被清掉，所以你手滑关掉那个标签页
+        之后它仍是 True。捡漏要挂好几天，这事几乎必然发生——而代价是 _ensure_warm
+        直接返回、永远不再预热，等到真放货才在 fire() 里抛「页面没预热好」。
+        监控日志一路正常，下单静默哑火，最坏的一种失败。
+        """
+        if not self.warmed or self._page is None:
+            return False
+        try:
+            return not self._page.is_closed()
+        except Exception:
+            return False
+
+    def _preflight_login(self, page) -> str:
+        """开卖**之前**验登录，没登录就当场登掉。
+
+        这才是自动登录该待的位置。原来它只在 _drive 里被动触发——加购完、跳结账、
+        撞上登录墙才开始登，等于把 10~25s 塞进抢购的关键路径；真要是弹双重认证，
+        那一单就没了。挪到预热阶段，最坏情况也只是「现在提醒你去输个验证码」。
+        """
+        st = login_state(page)
+        if st["signed_in"] is None:
+            self.login_note = st["evidence"]
+            return "登录态没验出来"
+        if st["secure_host"] and not self.secure_host:
+            # 白捡的：账号入口的绝对地址就带着本会话分到的那台 secureN，
+            # 省掉抢购当天 checkout_candidates 挨个试的开销
+            self.secure_host = st["secure_host"]
+            self.log(f"[预热] 结账主机记为 {st['secure_host']}（从账号入口读到）")
+        if st["signed_in"]:
+            self.signed_in = True
+            self.login_note = ""
+            return "已登录"
+
+        self.signed_in = False
+        self.log("[预热] ⚠️ 没登录——现在就登，别等到放货那一刻")
+        try:
+            page.goto(f"{REGIONS[self.region]}/shop/account/home",
+                      timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+        except Exception as e:
+            self.login_note = f"跳登录页失败：{type(e).__name__}"
+            return "⚠️ 未登录且跳不到登录页"
+        if not _is_sign_in(page.url):
+            again = login_state(page)
+            if again["signed_in"]:
+                self.signed_in = True
+                return "已登录"
+            self.login_note = "账号页既不是登录页、也读不出登录态"
+            return "⚠️ 登录态不明"
+
+        ok, why = self._sign_in(page)
+        if ok:
+            self.signed_in = True
+            self.login_note = ""
+            self.log("[预热] 登录完成——这 10~25s 花在开卖前，不占抢购时间")
+            return "已登录（预热时补登）"
+        self.login_note = why
+        self.log(f"[预热] ⚠️ 自动登录没成功：{why}")
+        return f"⚠️ 未登录：{why}"
+
     def warm(self, url: str) -> str:
         """开卖前把产品页加载好、必选项选好，标签页一直留着。
 
@@ -279,7 +357,10 @@ class AutoBuy:
         self.start()
         if self._page is None or self._page.is_closed():
             self._page = self._ctx.new_page()
-        self._page.goto(url, timeout=self.timeout * 2, wait_until="domcontentloaded")
+        if not goto_buy_page(self._page, url, log=self.log, timeout_ms=self.timeout * 2):
+            # 预热到一个 404 页面比不预热更糟：fire() 会以为一切就绪
+            self.warmed = False
+            raise AutoBuyUnavailable(f"购买页打不开（连续落到 /shop/404）：{url}")
         self._page.wait_for_timeout(2500)
         self._pick(self._page, "tradein", self.trade_in_text)
         self._pick(self._page, "applecare", self.applecare_text)
@@ -298,6 +379,8 @@ class AutoBuy:
             chk.goto("https://www.apple.com.cn/shop/bag", timeout=self.timeout,
                      wait_until="domcontentloaded")
             chk.wait_for_timeout(1800)
+            # 登录预检要在体检之前：没登录的话购物袋读出来也不是你的
+            state += "；" + self._preflight_login(chk)
             st = self.bag_state(chk)
             self.bag_over_limit = st.get("limitMsg") or ""
             if st.get("items") and self.clear_bag:
@@ -493,6 +576,8 @@ class AutoBuy:
         placer = OrderPlacer(
             region=self.region,
             pickup_stores=stores,
+            store_numbers=[s for s in ((in_stock or []) + self.pickup_store_numbers)
+                           if s],
             payment=self.payment_method,
             delivery=self.delivery,
             id_last4=self.id_last4,
@@ -503,12 +588,18 @@ class AutoBuy:
             installment_months=self.installment_months,
             secure_host=self.secure_host,
             stop_at_review=self.stop_at_review,
+            fast_path=self.fast_path,
+            place_order=self.place_order,
+            pickup_city=self.pickup_city,
+            pickup_state=self.pickup_state,
+            pickup_district=self.pickup_district,
             timeout_ms=self.timeout,
             log=self.log,
         )
         # 跟着页面走：加购后按页面上的「结账」按钮，让 Apple 自己把你带到
         # 它给这个会话分配的那台 secureN 上。自己拼地址跳转既容易跳错主机，
         # 也是最典型的机器行为特征。直跳只在这条路走不通时兜底。
+        blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
         page = self._checkout_via_bag(ctx, page)
         if "/shop/checkout" not in (page.url or "") and not _is_sign_in(page.url):
             self.log("[自动下单] 页面上的结账按钮没走通，退回直跳结账地址")
@@ -538,6 +629,17 @@ class AutoBuy:
                 return BuyResult(
                     False, "⚠️ 购物袋超出限购", page.url,
                     f"{st['limitMsg']}\n袋里有 {st.get('items')} 件，先清空再抢。")
+            if blocked.get("hits"):
+                # 这条路径实际发生过，而且第一反应全走错了方向：结账页其实开了，
+                # 是它自己的 fulfillment XHR 被 541 拦掉，前端才把你扔到 /shop/404。
+                # 报「页面不存在」会让人去查 slug、查 part、查登录——全是白查。
+                ra = blocked.get("retry_after") or 0
+                return BuyResult(
+                    False, "⚠️ 结账被限流（不是页面不存在）", page.url,
+                    f"结账页加载正常，但它的 {len(blocked['hits'])} 个 XHR 被边缘节点拦了"
+                    f"（{blocked['hits'][0]['status']}），前端把你重定向到了 /shop/404。\n"
+                    f"这是限流不是封号，**别再重试**——Akamai 按累计速率判，"
+                    f"越撞退避越深。" + (f"对方要求等 {ra:.0f}s。" if ra else "先停手等它自己解。"))
             return BuyResult(False, "⚠️ 没能进入结账页", page.url,
                              f"加购后没能走到结账页（{time.monotonic() - t0:.1f}s），请手动接管。")
 
