@@ -109,3 +109,37 @@ class PaymentAlertTests(unittest.TestCase):
         (title, body, url), kw = self.fire()
         self.assertIn("招商银行", body)
         self.assertNotIn("期", body.split("\n")[1])
+
+
+class WatchEnabledTests(unittest.TestCase):
+    """watch 条目的 enabled 开关。盯着一堆用不上的型号既白烧请求预算，
+    又让日志刷满噪音，真正在等的那个反而看不见。"""
+
+    def test_skips_disabled_entries(self):
+        from hunter.monitor import watch_items
+        cfg = {"watch": [{"part": "A", "enabled": True},
+                         {"part": "B", "enabled": False},
+                         {"part": "C", "enabled": True}]}
+        self.assertEqual(["A", "C"], [i["part"] for i in watch_items(cfg)])
+
+    def test_missing_flag_means_enabled(self):
+        """老配置不写这个字段，不能因为加了开关就静默停掉别人的监控。"""
+        from hunter.monitor import watch_items
+        cfg = {"watch": [{"part": "A"}, {"part": "B", "enabled": False}]}
+        self.assertEqual(["A"], [i["part"] for i in watch_items(cfg)])
+
+    def test_only_enabled_false_can_switch_off(self):
+        """别把 0/""/None 之类也当成关闭——只认显式的 false。"""
+        from hunter.monitor import watch_items
+        cfg = {"watch": [{"part": "A", "enabled": 1}, {"part": "B", "enabled": "yes"}]}
+        self.assertEqual(["A", "B"], [i["part"] for i in watch_items(cfg)])
+
+    def test_can_ask_for_everything(self):
+        from hunter.monitor import watch_items
+        cfg = {"watch": [{"part": "A"}, {"part": "B", "enabled": False}]}
+        self.assertEqual(2, len(watch_items(cfg, only_enabled=False)))
+
+    def test_drops_entries_without_a_part(self):
+        from hunter.monitor import watch_items
+        cfg = {"watch": [{"note": "只是条注释"}, {"part": "A"}, "不是字典"]}
+        self.assertEqual(["A"], [i["part"] for i in watch_items(cfg)])

@@ -25,6 +25,25 @@ def _p(*a) -> None:
     print(*a, flush=True)
 
 
+def watch_items(cfg: dict, only_enabled: bool = True) -> list[dict]:
+    """取监控列表。
+
+    `enabled: false` 的条目会被跳过——盯着一堆用不上的型号，既白烧请求预算，
+    又让日志刷满噪音，真正在等的那个反而看不见。
+
+    **没有 enabled 字段视为启用**：老配置不写这个字段，不能因为加了开关就静默
+    停掉别人的监控。
+    """
+    out = []
+    for it in (cfg.get("watch") or []):
+        if not isinstance(it, dict) or not it.get("part"):
+            continue
+        if only_enabled and it.get("enabled", True) is False:
+            continue
+        out.append(it)
+    return out
+
+
 def now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
@@ -244,9 +263,16 @@ class StockWatcher(BaseWatcher):
 
     def __init__(self, cfg, root, sprint=False, log=_p):
         super().__init__(cfg, root, sprint, log)
-        self.items = cfg.get("watch") or []
+        self.items = watch_items(cfg)
         if not self.items:
-            raise SystemExit("config.json 里 watch 是空的，先跑 `parts <机型> --save` 填进去")
+            total = len(cfg.get("watch") or [])
+            raise SystemExit(
+                f"config.json 里没有启用的监控条目（共 {total} 条，全被 enabled:false 关掉了）"
+                if total else
+                "config.json 里 watch 是空的，先跑 `parts <机型> --save` 填进去")
+        off = len(cfg.get("watch") or []) - len(self.items)
+        if off:
+            self.log(f"[监控] {len(self.items)} 个配置在盯，{off} 个已用 enabled:false 关掉")
         self.parts = [i["part"] for i in self.items]
         self.part_groups: dict[str, list[str]] = {}
         for item in self.items:

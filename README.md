@@ -98,6 +98,24 @@ Bark 走 `level=critical`：**静音、勿扰、专注模式都拦不住，会�
 
 `slug` 就是购买页 URL 的最后一段（`apple.com.cn/shop/buy-iphone/<slug>`）。
 
+#### 暂时不盯某些型号：`enabled: false`
+
+```json
+"watch": [
+  { "part": "MJY64CH/A", "note": "iPhone 18 Pro Max 256GB 黑色",
+    "model_slug": "iphone-18-pro", "request_group": "iphone-18-pro-max",
+    "enabled": true },
+  { "part": "MK2N4CH/A", "note": "iPhone Duo 256GB Night Sky",
+    "model_slug": "iphone-duo", "request_group": "iphone-duo",
+    "enabled": false }
+]
+```
+
+留着配置但不盯它。盯一堆用不上的型号既白烧请求预算（`budget_per_hour` 是
+真正决定「能盯多久」的东西），又让日志刷满噪音，真正在等的那个反而看不见。
+
+**不写 `enabled` 视为启用**，老配置不受影响；只有显式的 `false` 才会关掉。
+
 #### iPhone 18 Pro 系列（中国大陆）
 
 根据 Apple 中国大陆官网 2026-09-10 公布的配置，iPhone 18 Pro 和 iPhone 18 Pro Max 共用购买页 slug `iphone-18-pro`。官网当前没有 `iphone-18` 购买页。两款机型都有黑色、银色、冰川蓝色和勃艮第酒红色，每款均为 256GB、512GB、1TB 和 2TB，合计 32 个 SKU。

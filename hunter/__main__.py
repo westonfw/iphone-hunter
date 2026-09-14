@@ -12,7 +12,7 @@ from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list
                       cdp_candidates, inspect_checkout, launch_debug_chrome, probe_cdp,
                       windows_chrome)
 from .logbook import setup as setup_logbook
-from .monitor import LaunchWatcher, StockWatcher
+from .monitor import LaunchWatcher, StockWatcher, watch_items
 from .session import SessionProbe, parse_duration
 from .notify import Broadcaster
 
@@ -120,7 +120,7 @@ def cmd_check(args) -> int:
 def cmd_stores(args) -> int:
     cfg = load_config()
     client = AppleClient(args.region or cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
-    watch = cfg.get("watch") or []
+    watch = watch_items(cfg) or (cfg.get("watch") or [])
     sample = args.part or (watch[0]["part"] if watch else None)
     if not sample:
         print("✗ 需要一个 part number 才能带出门店列表：加 --part，或先跑 `parts <机型> --save`")
@@ -207,7 +207,7 @@ def cmd_rehearse(args) -> int:
     """抢购前的彩排：验证选择器还有效，并把 Apple ID 登录态存进 profile。"""
     cfg = load_config()
     client = AppleClient(args.region or cfg.get("region", "cn"), proxy=cfg.get("proxy") or None)
-    watch = cfg.get("watch") or []
+    watch = watch_items(cfg) or (cfg.get("watch") or [])
     if args.part:
         part, slug = args.part, (args.slug or "")
         if not slug:
@@ -250,7 +250,7 @@ def cmd_rehearse(args) -> int:
 
 
 def _target_from_args(args, cfg):
-    watch = cfg.get("watch") or []
+    watch = watch_items(cfg) or (cfg.get("watch") or [])
     if args.part:
         part, slug = args.part, (args.slug or "")
         if not slug:
@@ -464,7 +464,7 @@ def cmd_record(args) -> int:
     """挂到已登录 Chrome，记录结账点击和步骤 URL。"""
     from .record import run as record_run
     cfg = load_config()
-    watch = cfg.get("watch") or []
+    watch = watch_items(cfg) or (cfg.get("watch") or [])
     url = ""
     part = (getattr(args, "part", "") or "").strip()
     slug = (getattr(args, "slug", "") or "").strip()
