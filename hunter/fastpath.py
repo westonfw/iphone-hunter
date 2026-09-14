@@ -169,7 +169,7 @@ class FastCheckout:
                  city: str = "上海", state: str = "上海", district: str = "杨浦区",
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
-                 log=print):
+                 stk_timeout_ms: int = 15000, log=print):
         self.store = (store or "").strip()
         self.id_last4 = (id_last4 or "").strip()
         self.last_name = (last_name or "").strip()
@@ -181,6 +181,8 @@ class FastCheckout:
         #: 走到 Review 之后要不要真的提交。提交只创建待付款订单，不扣款——
         #: 但仅限扫码通道，信用卡路径在 _may_place 里硬拒。
         self.place_order = bool(place_order)
+        #: 等 x-aos-stk 出现的上限。页面越慢这条路越值钱，所以别急着放弃。
+        self.stk_timeout_ms = int(stk_timeout_ms)
         self.log = log
         self.order_url = ""
         self.stk = ""
@@ -445,15 +447,39 @@ class FastCheckout:
 
     # ---------- 编排 ----------
 
+    def wait_for_stk(self, page, timeout_ms: int = 0) -> str:
+        """等结账页把 x-aos-stk 吐出来，拿到就返回。
+
+        **这是快车道相对点页面的真正优势所在。** 令牌写在服务端返回的 HTML
+        内联 JSON 里，`domcontentloaded` 就能读到——不需要等 React 把向导渲染
+        出来。点页面那条路必须等「继续」按钮真的画出来才能操作（on_checkout
+        最多等 9s），页面渲染越慢它越没辙；发包只要 HTML 到了就能干活。
+
+        所以这里要**轮询等**，不能读一次拿不到就放弃——那等于在页面最慢、
+        最需要这条路的时候主动退回到更慢的那条路上去。
+        """
+        deadline = time.monotonic() + (timeout_ms or self.stk_timeout_ms) / 1000
+        while True:
+            try:
+                tok = page.evaluate(JS_READ_STK) or ""
+            except Exception:
+                tok = ""          # 页面正在跳转，执行上下文没了，等下一轮
+            if tok:
+                return tok
+            if time.monotonic() >= deadline:
+                return ""
+            page.wait_for_timeout(200)
+
     def run(self, page) -> tuple[bool, str, str]:
         """跑完六步。返回 (是否到 Review, 阶段, 说明)。**不下单。**"""
         t0 = time.monotonic()
-        self.stk = page.evaluate(JS_READ_STK) or ""
+        self.stk = self.wait_for_stk(page)
         if not self.stk:
             return False, "⚠️ 读不到 x-aos-stk", (
                 "结账页里没找到令牌——可能不在结账页上，或者 Apple 改了内联 JSON 的写法。"
                 "退回点页面的老路。")
-        self.log(f"[快车道] 令牌就位（{len(self.stk)} 字符），开始六步")
+        self.log(f"[快车道] 令牌就位（{len(self.stk)} 字符，等了 "
+                 f"{(time.monotonic() - t0) * 1000:.0f}ms），开始六步")
 
         try:
             self.step1_pickup(page)

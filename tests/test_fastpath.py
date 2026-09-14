@@ -59,7 +59,8 @@ OK = FUL
 
 def placer(**kw):
     base = {"store": "R581", "id_last4": "0000", "last_name": "张",
-            "first_name": "三", "log": lambda *a: None}
+            "first_name": "三", "log": lambda *a: None,
+            "stk_timeout_ms": 50}          # 测试里别真等 15 秒
     base.update(kw)
     return FastCheckout(**base)
 
@@ -95,6 +96,46 @@ class OptionLookupTests(unittest.TestCase):
 
     def test_zero_when_no_options(self):
         self.assertEqual(0, placer().find_installment({}, 24))
+
+
+class WaitForTokenTests(unittest.TestCase):
+    """令牌写在服务端返回的 HTML 里，domcontentloaded 就有，不用等 React。
+    所以读不到时要**轮询等**——读一次就放弃，等于在页面最慢、最需要发包的
+    时候主动退回到更慢的点页面那条路。"""
+
+    class Slow:
+        """前 n 次读不到令牌，之后才有。"""
+
+        def __init__(self, n):
+            self.n, self.reads = n, 0
+
+        def evaluate(self, js, arg=None):
+            if arg is None:
+                self.reads += 1
+                return "TOKEN1234567890123456789" if self.reads > self.n else ""
+            return {"status": 200, "json": {}}
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+    def test_keeps_polling_until_token_shows_up(self):
+        p = self.Slow(3)
+        self.assertTrue(placer().wait_for_stk(p, timeout_ms=5000))
+        self.assertEqual(4, p.reads)
+
+    def test_survives_context_destroyed_while_navigating(self):
+        class Boom(self.Slow):
+            def evaluate(self, js, arg=None):
+                self.reads += 1
+                if self.reads < 3:
+                    raise RuntimeError("Execution context was destroyed")
+                return "TOKEN1234567890123456789"
+        p = Boom(0)
+        self.assertTrue(placer().wait_for_stk(p, timeout_ms=5000))
+
+    def test_gives_up_after_timeout(self):
+        p = self.Slow(10 ** 6)
+        self.assertEqual("", placer().wait_for_stk(p, timeout_ms=30))
 
 
 class RunTests(unittest.TestCase):
@@ -237,7 +278,7 @@ class ContactHarvestTests(unittest.TestCase):
     def test_stalls_when_id_last4_missing(self):
         page = FakePage([FUL, FUL, CONTACT, BANKS, MONTHS, REVIEW])
         f = FastCheckout(store="R581", id_last4="", last_name="", first_name="",
-                         log=lambda *a: None)
+                         stk_timeout_ms=50, log=lambda *a: None)
         ok, _, detail = f.run(page)
         self.assertFalse(ok)
         self.assertIn("id_last4", detail)
