@@ -33,7 +33,7 @@ class WarmedPartMismatchTests(unittest.TestCase):
         ab._ctx = object()
         ab._page = type("P", (), {"url": warmed_url, "is_closed": lambda s: False})()
         self.drove = []
-        ab._drive = lambda ctx, page, url, dry_run, in_stock=None: (
+        ab._drive = lambda ctx, page, url, dry_run, in_stock=None, in_stock_numbers=None: (
             self.drove.append(url) or BuyResult(True, "ok"))
         return ab
 

@@ -112,8 +112,15 @@ class BaseWatcher:
         self.pacer.sleep(self.round_cost)
 
     def hit(self, title: str, body: str, url: str,
-            in_stock: list[str] | None = None) -> None:
-        """命中。in_stock 是这一刻真有货的门店名，决定自动下单去哪家取。"""
+            in_stock: list[str] | None = None,
+            in_stock_numbers: list[str] | None = None) -> None:
+        """命中。
+
+        in_stock 是这一刻真有货的门店**名**（页面那条路按它排点击顺序），
+        in_stock_numbers 是同一批店的**编号**（快车道发包只认编号）。
+        两个都要给：只给名字的话，快车道会退回配置里的第一家门店去下单，
+        哪怕那家根本没货——2026-09-16 静安放货时踩的就是这个。
+        """
         # 先推送——自动下单要花几十秒，不能让通知等它
         self.bc.send(title, body, url, critical=True)
 
@@ -124,8 +131,9 @@ class BaseWatcher:
                 # 页面预热过就直接开火，省掉加载产品页那 700KB
                 # url 一定要传给 fire：预热页是列表里第一个型号，
                 # 放货的可能是任何一个，不核对就会买错颜色/容量
-                r = (self.autobuy.fire(url, in_stock) if self.autobuy.warmed
-                     else self.autobuy.buy(url, in_stock))
+                r = (self.autobuy.fire(url, in_stock, in_stock_numbers)
+                     if self.autobuy.warmed
+                     else self.autobuy.buy(url, in_stock, in_stock_numbers))
                 if r.ok and r.order_id:
                     self._notify_pay(r, title)
                 else:
@@ -423,7 +431,8 @@ class StockWatcher(BaseWatcher):
             # 把「刚放货的那几家」按顺序交给自动下单——写死一家的话，
             # 另外三家放货时会卡在选店那一步。
             self.hit(f"{prefix}：{label}", "\n".join(lines), self._buy_url(part),
-                     in_stock=[s.store_name for s in fresh])
+                     in_stock=[s.store_name for s in fresh],
+                     in_stock_numbers=[s.store_number for s in fresh])
         self.state.set(f"pickup:{part}", cur)
 
     def _buy_url(self, part: str) -> str:

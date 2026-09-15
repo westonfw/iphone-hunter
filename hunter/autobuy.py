@@ -422,16 +422,26 @@ class AutoBuy:
             return list(allow)
         first = [s for s in allow if any(s in h or h in s for h in hot)]
         rest = [s for s in allow if s not in first]
+        # 有货却不在白名单里 = 这一单大概率白跑：程序会去试几家没货的。
+        # 静默丢掉最坑人，所以明确吭一声，指到该改的那个配置键上。
+        dropped = [h for h in hot if not any(a in h or h in a for a in allow)]
+        if dropped:
+            self.log(f"[自动下单] ⚠️ {'、'.join(dropped)} 有货，但不在 "
+                     f"autobuy.pickup_stores 白名单（{'、'.join(allow)}）里，"
+                     f"本单不会去这几家——要么把它们加进去，要么把该键留空表示不限")
         return first + rest
 
-    def fire(self, url: str = "", in_stock: list[str] | None = None) -> BuyResult:
+    def fire(self, url: str = "", in_stock: list[str] | None = None,
+             in_stock_numbers: list[str] | None = None) -> BuyResult:
         """放货瞬间调用：用预热好的页面加购并进结账。
 
         url 是**这次真正命中的那个型号**的购买页，必须核对：预热页加载的是
         监控列表里的第一个型号，而放货的可能是任何一个——不核对就会出现
         「提示银色、袋里进黑色」。对不上就老实跳转，慢几秒也比买错强。
 
-        in_stock 是监控刚查到「有货」的门店名，用来决定去哪家取。
+        in_stock 是监控刚查到「有货」的门店**名**（用来排页面上的点击顺序），
+        in_stock_numbers 是同一批店的**编号**（快车道发包只认编号）。两个都要传：
+        少传编号的话，快车道会退回配置里的第一家，哪怕那家根本没货。
         """
         if not self.warmed or self._page is None or self._page.is_closed():
             raise AutoBuyUnavailable("页面没预热好")
@@ -440,9 +450,9 @@ class AutoBuy:
             self.log(f"[自动下单] 预热页是 {got or '未知'}，这次要买 {want}——"
                      "跳转到正确型号（放弃预热加速）")
             return self._drive(self._ctx, self._page, url, dry_run=False,
-                               in_stock=in_stock)
+                               in_stock=in_stock, in_stock_numbers=in_stock_numbers)
         return self._drive(self._ctx, self._page, None, dry_run=False,
-                           in_stock=in_stock)
+                           in_stock=in_stock, in_stock_numbers=in_stock_numbers)
 
     def rehearse(self, url: str) -> BuyResult:
         """排练：走到「加入购物袋」前一步就停，不改动购物袋。
@@ -452,13 +462,16 @@ class AutoBuy:
         """
         return self._run(url, dry_run=True)
 
-    def buy(self, url: str, in_stock: list[str] | None = None) -> BuyResult:
+    def buy(self, url: str, in_stock: list[str] | None = None,
+            in_stock_numbers: list[str] | None = None) -> BuyResult:
         """真跑：加购 → 创建待付款订单。不会代你付款。"""
-        return self._run(url, dry_run=False, in_stock=in_stock)
+        return self._run(url, dry_run=False, in_stock=in_stock,
+                         in_stock_numbers=in_stock_numbers)
 
     # ---------- 内部 ----------
 
-    def _run(self, url: str, dry_run: bool, in_stock: list[str] | None = None) -> BuyResult:
+    def _run(self, url: str, dry_run: bool, in_stock: list[str] | None = None,
+             in_stock_numbers: list[str] | None = None) -> BuyResult:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError as e:
@@ -474,7 +487,8 @@ class AutoBuy:
             # 挂到已有 Chrome 时开新标签页，不要抢占用户正在看的页面
             page = ctx.new_page() if attached else (ctx.pages[0] if ctx.pages else ctx.new_page())
             try:
-                return self._drive(ctx, page, url, dry_run, in_stock=in_stock)
+                return self._drive(ctx, page, url, dry_run, in_stock=in_stock,
+                                   in_stock_numbers=in_stock_numbers)
             finally:
                 if attached:
                     # 别关别人的浏览器，只在排练时收掉自己开的标签页
@@ -526,7 +540,8 @@ class AutoBuy:
         raise AutoBuyUnavailable(f"浏览器启动失败：{last}")
 
     def _drive(self, ctx, page, url: str | None, dry_run: bool,
-               in_stock: list[str] | None = None) -> BuyResult:
+               in_stock: list[str] | None = None,
+               in_stock_numbers: list[str] | None = None) -> BuyResult:
         t0 = time.monotonic()
         want_part = _part_of(url or "")
         # 「袋里已经是这次要买的那台」才允许跳过清袋和加购。型号不同就得重来，
@@ -619,8 +634,11 @@ class AutoBuy:
         placer = OrderPlacer(
             region=self.region,
             pickup_stores=stores,
-            store_numbers=[s for s in ((in_stock or []) + self.pickup_store_numbers)
-                           if s],
+            # 真有货的那几家**编号**排最前。原来这里传的是 in_stock（门店名），
+            # 而 OrderPlacer 用 R\d+ 过滤，名字会被整个丢掉——于是快车道永远
+            # 拿配置里的第一家（R581 五角场），哪怕有货的是静安。
+            store_numbers=[s for s in ((in_stock_numbers or [])
+                                       + self.pickup_store_numbers) if s],
             payment=self.payment_method,
             delivery=self.delivery,
             id_last4=self.id_last4,
