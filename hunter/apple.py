@@ -18,33 +18,47 @@ from enum import Enum
 import requests
 
 from .logbook import log_request
+from .pacing import Breaker
 
-# 一次只用一套完整的浏览器指纹：UA 得跟 sec-ch-ua / platform 对得上，
-# 只改 UA 而 client hints 还是旧的，反而比不发这些头更可疑。
+# 一套「身份」= TLS 握手 + HTTP/2 设置 + 请求头，三者必须同源。
+# curl_cffi 的 impersonate 会把这三样一起换掉；只改 UA 而 JA3 还是 python-requests
+# 的那串，在 Akamai 眼里等于举着牌子写「我是脚本」。装不上就退回 requests——
+# 功能不受影响，只是指纹是裸的。
+try:
+    from curl_cffi import requests as curl_requests
+    from curl_cffi.requests.exceptions import RequestException as CurlError
+except ImportError:                                    # pragma: no cover
+    curl_requests = None
+    CurlError = None
+
+#: 会被 Akamai 按端点单独限速的两个接口。熔断是按 path 分家的，所以要有名字。
+AVAIL_PATH = "/shop/sba/availability-message"
+PICKUP_PATH = "/shop/retail/pickup-message"
+
+#: 身份池。ua 只用来打日志——真正发出去的头由 curl_cffi 按 impersonate 生成，
+#: 它保证跟 TLS 指纹自洽（我们自己拼的 sec-ch-ua 做不到这一点）。
+#: 退回 requests 时才用 ch_ua / platform 手工拼。
 BROWSERS = [
     {
+        "impersonate": "chrome150",
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
-        "ch_ua": '"Chromium";v="152", "Google Chrome";v="152", "Not?A_Brand";v="24"',
+              "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+        "ch_ua": '"Chromium";v="150", "Google Chrome";v="150", "Not?A_Brand";v="24"',
         "platform": '"macOS"',
     },
     {
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
-        "ch_ua": '"Chromium";v="151", "Google Chrome";v="151", "Not?A_Brand";v="24"',
-        "platform": '"Windows"',
-    },
-    {
+        "impersonate": "safari184",
         "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-              "(KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+              "(KHTML, like Gecko) Version/18.4 Safari/605.1.15",
         "ch_ua": "",   # Safari 不发 client hints，发了才是破绽
         "platform": "",
     },
     {
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
-        "ch_ua": '"Chromium";v="150", "Microsoft Edge";v="150", "Not?A_Brand";v="24"',
-        "platform": '"Windows"',
+        "impersonate": "chrome146",
+        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "ch_ua": '"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="24"',
+        "platform": '"macOS"',
     },
 ]
 
@@ -101,6 +115,21 @@ class Blocked(Exception):
     def __init__(self, msg: str, retry_after: float = 0.0):
         super().__init__(msg)
         self.retry_after = retry_after
+        self.cooldown = 0.0   # 熔断器决定这个端点要静默多久，由 _get 填上
+
+
+class CoolingDown(Exception):
+    """这个端点正在熔断静默期里，这一次**一个包都不发**。
+
+    跟 Blocked 分开是有意的：Blocked 是「刚刚挨了一下」，要记账、要退避；
+    CoolingDown 是「我们自己决定先别碰」，调用方应当安静跳过这一项——
+    既不能当成故障去重试（重试就是给封禁续期），也**绝不能当成「查到了、没货」**。
+    """
+
+    def __init__(self, path: str, left: float):
+        super().__init__(f"{path} 熔断中，还要静默 {left:.0f}s")
+        self.path = path
+        self.left = left
 
 
 class NotLive(Exception):
@@ -170,6 +199,10 @@ def _ua_tag(ua: str) -> str:
     return tags[-1] if tags else "?"
 
 
+#: 两套底层客户端的网络异常基类不一样，catch 的时候得都算上。
+_NET_ERRORS = tuple(e for e in (requests.RequestException, CurlError) if e is not None)
+
+
 def _retry_after(resp) -> float:
     """把 Retry-After 头解析成秒。对方明说了要等多久，就别自己猜。"""
     raw = (resp.headers.get("Retry-After") or "").strip()
@@ -180,7 +213,8 @@ def _retry_after(resp) -> float:
 
 
 class AppleClient:
-    def __init__(self, region: str = "cn", timeout: int = 15, proxy: str | None = None):
+    def __init__(self, region: str = "cn", timeout: int = 15, proxy: str | None = None,
+                 breaker: dict | None = None):
         if region not in REGIONS:
             raise ValueError(f"不支持的 region: {region}，可选 {'/'.join(REGIONS)}")
         self.region = region
@@ -189,32 +223,57 @@ class AppleClient:
         self.proxy = proxy
         self.requests_made = 0        # 供 Pacer 记账用
         self.browser = random.choice(BROWSERS)
-        self.s: requests.Session = None  # type: ignore[assignment]
+        # 熔断按 path 分家：541 是端点级的（实测 pickup 被拦时 availability 照样
+        # 通），一个端点出事没有理由把另一个也停掉。
+        self._breaker_kw = dict(breaker or {})
+        self.breakers: dict[str, Breaker] = {}
+        self.s = None  # type: ignore[assignment]
         self._open_session()
+
+    # ---------- 熔断 ----------
+
+    def breaker(self, path: str) -> Breaker:
+        """取某个端点的熔断器（按 path 缓存，第一次用时才建）。"""
+        key = path.split("?", 1)[0]
+        if key.startswith("http"):
+            key = "/" + key.split("/", 3)[-1] if key.count("/") > 2 else key
+        br = self.breakers.get(key)
+        if br is None:
+            br = self.breakers[key] = Breaker(**self._breaker_kw)
+        return br
 
     # ---------- 会话 ----------
 
+    #: 这个请求是「页面里的 XHR」才该带的头。UA / sec-ch-ua / Accept-Encoding
+    #: 交给 curl_cffi 按 impersonate 生成——那几个必须跟 TLS 指纹同源，手拼必错。
+    XHR_HEADERS = {
+        "Accept": "application/json, text/plain, */*",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
     def _open_session(self) -> None:
-        s = requests.Session()
         b = self.browser
-        # 真浏览器发的是一整组头。只带 UA 而缺 sec-fetch-* / Accept-Encoding，
-        # 在 Akamai 眼里跟写着「我是脚本」差不多。
-        headers = {
-            "User-Agent": b["ua"],
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": f"{self.base}/shop/buy-iphone",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "X-Requested-With": "XMLHttpRequest",
-            "Connection": "keep-alive",
-        }
-        if b["ch_ua"]:
-            headers["sec-ch-ua"] = b["ch_ua"]
-            headers["sec-ch-ua-mobile"] = "?0"
-            headers["sec-ch-ua-platform"] = b["platform"]
+        headers = dict(self.XHR_HEADERS, Referer=f"{self.base}/shop/buy-iphone")
+        if curl_requests is not None:
+            # impersonate 一次把 TLS 握手（JA3）、HTTP/2 SETTINGS、头顺序和 UA
+            # 全换成真浏览器的。这才是 Akamai 真正在看的那几维。
+            s = curl_requests.Session(impersonate=b["impersonate"])
+        else:
+            s = requests.Session()
+            # 退路：指纹是 python-requests 的，只能把头尽量补齐
+            headers.update({
+                "User-Agent": b["ua"],
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            })
+            if b["ch_ua"]:
+                headers["sec-ch-ua"] = b["ch_ua"]
+                headers["sec-ch-ua-mobile"] = "?0"
+                headers["sec-ch-ua-platform"] = b["platform"]
         s.headers.update(headers)
         if self.proxy:
             s.proxies.update({"http": self.proxy, "https": self.proxy})
@@ -222,11 +281,16 @@ class AppleClient:
             self.s.close()
         self.s = s
 
-    def renew_session(self, new_identity: bool = True) -> str:
-        """丢掉当前会话重开一个。被拦之后调用。
+    def renew_session(self, new_identity: bool = False) -> str:
+        """丢掉当前会话重开一个。
 
-        平时不轮换：同一个 IP 上老换 UA、老丢 cookie，本身就是异常信号。
-        只有在已经被标记之后，换一套身份才是净收益。
+        **默认不换身份，被拦时也不换。** 2026-09-15 的日志把这件事证死了：
+        26 次 541 在 4 套 UA 上均匀分布（8/7/6/5 次），而 07:50 被拦的那套
+        （Version/18.6）07:58 原样再发就是 200——同 IP、同参数、同 UA。
+        判定的键是「出口 IP + 端点」，身份这一维根本不参与。
+
+        同一个 IP 上反复换指纹不但没用，本身还是个 bot 信号。换身份只有在
+        **同时换了出口 IP** 时才是净收益，所以要换得由调用方显式说。
         """
         if new_identity:
             others = [b for b in BROWSERS if b is not self.browser]
@@ -244,6 +308,12 @@ class AppleClient:
         被拦截的时刻和耗时正是事后校准预算时唯一有用的数据。
         """
         url = path if path.startswith("http") else f"{self.base}{path}"
+        br = self.breaker(path)
+        # 熔断优先于一切：静默期里连包都不发。探测本身就是在给封禁续期——
+        # 那天退到 900s 还爬不出来，就是被自己的 6 次探测续起来的。
+        if not br.ready():
+            raise CoolingDown(path.split("?", 1)[0], br.left())
+
         self.requests_made += 1
         rec: dict = {"n": self.requests_made, "url": url}
         if params:
@@ -252,7 +322,7 @@ class AppleClient:
         try:
             r = self.s.get(url, params=params, timeout=self.timeout, allow_redirects=True,
                            headers=headers)
-        except requests.RequestException as e:
+        except _NET_ERRORS as e:
             rec["ms"] = round((time.monotonic() - t0) * 1000)
             rec["error"] = f"{type(e).__name__}: {e}"[:300]
             log_request(**rec)
@@ -264,10 +334,18 @@ class AppleClient:
         if r.history:
             rec["final"] = r.url          # 被重定向了，落地在哪很关键（如跳回落地页）
         try:
-            return self._decode(r, url, want_json, missing_means_not_live)
+            out = self._decode(r, url, want_json, missing_means_not_live)
+        except Blocked as e:
+            e.cooldown = br.trip()
+            rec["error"] = f"{type(e).__name__}: {e}"[:300]
+            rec["cooldown"] = round(e.cooldown)
+            raise
         except Exception as e:
             rec["error"] = f"{type(e).__name__}: {e}"[:300]
             raise
+        else:
+            br.ok()   # 这个端点通了就立刻满速，封禁一过就没有理由再慢
+            return out
         finally:
             log_request(**rec)
 
@@ -295,7 +373,7 @@ class AppleClient:
         for i in range(0, len(parts), 20):
             chunk = parts[i:i + 20]
             params = {f"parts.{n}": p for n, p in enumerate(chunk)}
-            data = self._get("/shop/sba/availability-message", params)
+            data = self._get(AVAIL_PATH, params)
             for item in (data.get("body") or {}).get("content") or []:
                 dm = item.get("deliveryMessage") or {}
                 buy = dm.get("buyability") or {}
@@ -334,7 +412,7 @@ class AppleClient:
         else:
             raise ValueError("查门店取货必须给 location（邮编）或 store（门店编号）")
 
-        body = (self._get("/shop/retail/pickup-message", params).get("body") or {})
+        body = (self._get(PICKUP_PATH, params).get("body") or {})
 
         err = body.get("errorMessage")
         stores = body.get("stores")

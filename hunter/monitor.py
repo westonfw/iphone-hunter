@@ -14,10 +14,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .apple import AppleClient, Availability, Blocked, NotLive, Stock, StorePickup
+from .apple import (PICKUP_PATH, AppleClient, Availability, Blocked, CoolingDown,
+                    NotLive, Stock, StorePickup)
 from .autobuy import AutoBuy, AutoBuyUnavailable
 from .notify import Broadcaster, open_in_browser
-from .pacing import build_pacer
+from .pacing import breaker_settings, build_pacer
 
 
 def _p(*a) -> None:
@@ -80,6 +81,7 @@ class BaseWatcher:
             region=cfg.get("region", "cn"),
             timeout=int(cfg.get("timeout", 15)),
             proxy=cfg.get("proxy") or None,
+            breaker=breaker_settings(cfg),
         )
         self.bc = Broadcaster.from_config(cfg, log=log)
         self.state = State(root / "state.json")
@@ -194,10 +196,15 @@ class BaseWatcher:
                     pc.on_ok()
                 except Blocked as e:
                     pc.on_blocked(getattr(e, "retry_after", 0.0))
-                    # 被标记之后继续用同一个会话只会一路被拦，换一套身份重来
-                    who = self.client.renew_session()
+                    # 不换会话：判定的键是「出口 IP + 端点」，同 IP 换 UA 是无效
+                    # 动作，还多一个 bot 信号（详见 AppleClient.renew_session）。
+                    # 真正管用的是让这个端点安静一会儿，那由熔断器负责。
+                    cd = getattr(e, "cooldown", 0.0)
                     self.log(f"[{now()}] 请求被拦截：{e}（第 {pc.blocks} 次，"
-                             f"降速到约 {pc.target():.0f}s，已换会话 {who}）")
+                             f"该端点静默 {cd:.0f}s，巡检降到约 {pc.target():.0f}s）")
+                except CoolingDown as e:
+                    # 自己选择不发包，不是故障：既不记退避也不算成功，安静跳过。
+                    self.log(f"[{now()}] {e}，本轮跳过")
                 except Exception as e:
                     pc.on_blocked()
                     self.log(f"[{now()}] 出错：{type(e).__name__}: {e}")
@@ -326,19 +333,34 @@ class StockWatcher(BaseWatcher):
     def run(self) -> None:
         self._ensure_warm()
         self.round_no += 1
-        want_avail = self._want_availability()
+
+        # 门店接口在熔断静默期里的话，这一轮就别只是空转——availability 从没被
+        # 拦过（89 次请求 0 次 541），它是静默期内唯一还看得见的信息源。
+        pickup_ready = (not self.pickup_on
+                        or self.client.breaker(PICKUP_PATH).ready())
+        want_avail = self._want_availability() or not pickup_ready
+
         avail: dict[str, Availability] = {}
         pickup: dict[str, list[StorePickup]] = {}
+        cooling = ""
         for parts in self.part_groups.values():
             if want_avail:
                 avail.update(self.client.availability(parts))
             if self.pickup_on:
-                pickup.update(self.client.pickup(parts, location=self.location))
+                try:
+                    pickup.update(self.client.pickup(parts, location=self.location))
+                except CoolingDown as e:
+                    cooling = str(e)
+
+        if cooling:
+            self.log(f"[{now()}] {cooling}，本轮只看发货状态")
 
         for part in self.parts:
             if want_avail:
                 self._check_buyable(part, avail.get(part))
-            if self.pickup_on:
+            # 熔断时**绝不能**走 _check_pickup：那一步会把「没查」当成「没货」，
+            # 让程序看起来一切正常却永远不叫你。这一轮就当门店没查过，状态不动。
+            if self.pickup_on and not cooling:
                 self._check_pickup(part, pickup.get(part) or [])
 
     # ---------- 能不能下单（仅记录，不提醒） ----------

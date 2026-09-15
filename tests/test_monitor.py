@@ -2,7 +2,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from hunter.apple import Availability, Stock, StorePickup
+from hunter.apple import (PICKUP_PATH, Availability, CoolingDown, Stock,
+                          StorePickup)
+from hunter.pacing import Breaker
 from hunter.monitor import State, StockWatcher
 
 
@@ -143,3 +145,98 @@ class WatchEnabledTests(unittest.TestCase):
         from hunter.monitor import watch_items
         cfg = {"watch": [{"note": "只是条注释"}, {"part": "A"}, "不是字典"]}
         self.assertEqual(["A"], [i["part"] for i in watch_items(cfg)])
+
+
+class PickupCoolingDownTests(unittest.TestCase):
+    """门店接口熔断时，这一轮该做什么、更重要的是**不该**做什么。
+
+    背景见 pacing.Breaker：541 是端点级的，pickup 被拦时 availability 照常通。
+    所以静默期里不能整轮空转，但也绝不能把「没查」写成「没货」。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        w = StockWatcher.__new__(StockWatcher)
+        w.parts = ["PART"]
+        w.part_groups = {"g": ["PART"]}
+        w.note_of = {"PART": "测试机型"}
+        w.only_stores = []
+        w.state = State(Path(self.tmp.name) / "state.json")
+        w.logs = []
+        w.log = w.logs.append
+        w.pickup_on = True
+        w.location = "200000"
+        w.avail_every = 6
+        w.round_no = 0
+        w.autobuy = None
+        w.warm_enabled = False
+        w.autobuy_done = False
+        w._ensure_warm = lambda: None
+        self.checked = []
+        w._check_pickup = lambda part, stores: self.checked.append((part, stores))
+        self.buyable = []
+        w._check_buyable = lambda part, av: self.buyable.append((part, av))
+        self.w = w
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _client(self, cooling: bool):
+        br = Breaker(clock=lambda: 0.0)
+        if cooling:
+            br.trip()
+        outer = self
+
+        class ClientStub:
+            requests_made = 0
+
+            def breaker(self, path):
+                return br
+
+            def availability(self, parts):
+                outer.avail_calls = getattr(outer, "avail_calls", 0) + 1
+                return {p: Availability(part=p, buyable=True) for p in parts}
+
+            def pickup(self, parts, location="", store=""):
+                if cooling:
+                    raise CoolingDown(PICKUP_PATH, br.left())
+                return {p: [] for p in parts}
+
+        return ClientStub()
+
+    def test_cooling_down_never_looks_like_out_of_stock(self):
+        """熔断这一轮必须完全跳过门店判定。
+
+        走进 _check_pickup 就会拿空列表当成「查过了，都没货」，于是程序看起来
+        一切正常、状态也被写进 state.json，真放货时反而不叫你——这是这个项目
+        最不能犯的一类错。
+        """
+        self.w.client = self._client(cooling=True)
+
+        self.w.run()
+
+        self.assertEqual([], self.checked)
+        self.assertIsNone(self.w.state.get("pickup:PART"))
+        self.assertTrue(any("熔断中" in line for line in self.w.logs))
+
+    def test_cooling_down_falls_back_to_availability(self):
+        """静默期里 availability 要顶上，不能整轮空转。
+
+        它从没被拦过（同期 89 次请求 0 次 541），是这段时间唯一的信息源。
+        注意第 1 轮本来就会查 availability，所以这里要跑到第 2 轮才说明问题。
+        """
+        self.w.client = self._client(cooling=True)
+        self.w.run()
+        self.w.run()
+
+        self.assertEqual(2, self.avail_calls)
+        self.assertEqual(2, len(self.buyable))
+
+    def test_normal_round_still_skips_availability(self):
+        """没熔断时 availability 照旧降频，别把预算白花一半。"""
+        self.w.client = self._client(cooling=False)
+        self.w.run()      # 第 1 轮打个底
+        self.w.run()      # 第 2 轮只查门店
+
+        self.assertEqual(1, self.avail_calls)
+        self.assertEqual(2, len(self.checked))

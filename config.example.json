@@ -18,6 +18,9 @@
     ],
     "cold_multiplier": 5,
     "recover_step": 0.25,
+    "max_scale": 8,
+    "heal_after": 600,
+    "cooldowns": [90, 180, 300],
     "availability_every": 6
   },
   "timeout": 15,

@@ -10,6 +10,10 @@
 
 第 3 点是原来最缺的：老逻辑一次成功就把 fail_streak 清零、立刻满速冲回去，
 于是「拦截 → 退避 → 满速 → 再拦截」来回震荡，越撞越黑。
+
+第 5 件事后来才加：**Breaker**（按端点熔断）。AIMD 管的是「平时该多快」，
+它管的是「已经被拦了该怎么办」——答案不是慢，是**静默**，而且只静默出事的
+那个端点。理由见 Breaker 的文档。
 """
 
 from __future__ import annotations
@@ -72,6 +76,67 @@ class TokenBucket:
 
 
 @dataclass
+class Breaker:
+    """按端点熔断：被拦之后**彻底不碰**这个端点，而不是降速接着打。
+
+    为什么不是指数退避
+    ------------------
+    2026-09-15 的日志把这件事说死了：26 次 541 全部落在 `retail/pickup-message`
+    上（同期 `availability-message` 89 次请求一次没被拦），而其中 10 段不重启
+    也自己恢复了，恢复间隔中位数只有 79 秒、最短 24 秒。
+
+    但退避的语义是「间隔翻倍、照样打」——静默期里每一次探测都在给封禁续期。
+    那天唯一没自愈的一段正是被探了 6 次、一路退到 900s，26 分钟没爬出来；
+    同一时刻换个进程发一模一样的请求（同 IP、同参数、连 UA 都同）却是 200。
+
+    所以这里只有三挡固定静默期、封顶 5 分钟，而且静默期内**一个包都不发**。
+    连击档位靠 heal_after 自己过期，不靠成功次数去磨。
+    """
+
+    #: 第 1/2/3+ 次被拦分别静默多久。数据说 90s 就够绝大多数情况了。
+    cooldowns: tuple[float, ...] = (90.0, 180.0, 300.0)
+    #: 这么久没被拦，连击档位归零——再被拦是新的一次，不是上一轮的延续。
+    heal_after: float = 600.0
+    clock: object = time.monotonic
+
+    def __post_init__(self):
+        self.open_until = 0.0
+        self.tier = -1
+        self.last_block = 0.0
+        self.trips = 0
+
+    def left(self) -> float:
+        """还要静默几秒。0 表示现在可以发。"""
+        return max(0.0, self.open_until - self.clock())
+
+    def ready(self) -> bool:
+        return self.left() <= 0.0
+
+    def trip(self) -> float:
+        """这个端点被拦了。返回这次要静默多久。"""
+        t = self.clock()
+        # 用 trips 而不是 last_block 的真假来判断「之前拦过没有」——单调时钟
+        # 从 0 起步时 last_block 正好是 0.0，拿它当标志会静默失效。
+        if self.trips and t - self.last_block > self.heal_after:
+            self.tier = -1          # 上次被拦已经很久了，不算连击
+        self.tier = min(self.tier + 1, len(self.cooldowns) - 1)
+        self.last_block = t
+        self.trips += 1
+        self.open_until = t + self.cooldowns[self.tier]
+        return self.cooldowns[self.tier]
+
+    def ok(self) -> None:
+        """这个端点通了。
+
+        立刻恢复满速，不做渐进恢复：封禁是端点级的，它一通就说明已经过期，
+        再慢慢爬只是白白错过放货。连击档位另算——它只由时间清零。
+        """
+        self.open_until = 0.0
+        if self.trips and self.clock() - self.last_block > self.heal_after:
+            self.tier = -1
+
+
+@dataclass
 class Pacer:
     """一轮监控之间该睡多久，由它说了算。"""
 
@@ -84,6 +149,12 @@ class Pacer:
     cold_multiplier: float = 5.0
     recover_step: float = 0.25   # 每成功一轮，拥塞倍率减多少
     block_factor: float = 2.0    # 每被拦一次，拥塞倍率乘多少
+    #: 拥塞倍率的硬上限。原来只受 max_interval/base_interval 约束（=30），
+    #: 撞穿之后 30s 的巡检变成 900s，等于放货那一刻程序是聋的。真正的等待
+    #: 交给 Breaker 去做，Pacer 只需要「明显慢一点」，8 倍足够。
+    max_scale: float = 8.0
+    #: 这么久没被拦就把倍率直接归 1，不再一轮一轮磨。见 on_ok。
+    heal_after: float = 600.0
     clock: object = time.monotonic
     sleeper: object = time.sleep
     calendar: object = datetime.now
@@ -94,17 +165,31 @@ class Pacer:
         self.blocks = 0
         self.bucket = TokenBucket(self.budget_per_hour, self.burst, self.clock)
         self.retry_after = 0.0
-        self._max_scale = max(1.0, self.max_interval / max(self.base_interval, 0.1))
+        self.last_block_at = 0.0
+        self._max_scale = max(1.0, min(self.max_interval / max(self.base_interval, 0.1),
+                                       self.max_scale))
 
     # ---------- 反馈 ----------
 
     def on_ok(self) -> None:
-        """成功一轮：加性恢复。不清零，慢慢爬回去。"""
+        """成功一轮：加性恢复，外加一条时间兜底。
+
+        光靠 recover_step 每轮减 0.25 是不够的：从上限（原来是 ×30）爬回满速要
+        116 个成功轮次，一轮又被退避拉长到几百秒——实际就是**一天都回不来**。
+        这正是「关掉重开就好了」的全部真相：重启唯一做的事就是把这个倍率归 1。
+
+        所以加一条：超过 heal_after 没再被拦，说明上一次封禁早过期了，直接满速。
+        """
+        if (self.scale > 1.0 and self.blocks
+                and self.clock() - self.last_block_at > self.heal_after):
+            self.scale = 1.0
+            return
         self.scale = max(1.0, self.scale - self.recover_step)
 
     def on_blocked(self, retry_after: float = 0.0) -> None:
         """被拦一轮：乘性退让。"""
         self.blocks += 1
+        self.last_block_at = self.clock()
         self.scale = min(self._max_scale, self.scale * self.block_factor)
         self.retry_after = max(self.retry_after, retry_after)
 
@@ -192,6 +277,23 @@ def build_pacer(cfg: dict, sprint: bool = False, log=print, **kw) -> Pacer:
         hot_windows=[] if sprint else windows,   # 冲刺时无视冷热，你人就在旁边等
         cold_multiplier=float(pc.get("cold_multiplier", 5)),
         recover_step=float(pc.get("recover_step", 0.25)),
+        max_scale=float(pc.get("max_scale", 8)),
+        heal_after=float(pc.get("heal_after", 600)),
         log=log,
         **kw,
     )
+
+
+def breaker_settings(cfg: dict) -> dict:
+    """从 config.json 的 pacing 段里取熔断参数，交给 AppleClient 建 Breaker。"""
+    pc = dict(cfg.get("pacing") or {})
+    cd = pc.get("cooldowns")
+    kw: dict = {}
+    if cd:
+        try:
+            kw["cooldowns"] = tuple(float(x) for x in cd) or Breaker.cooldowns
+        except (TypeError, ValueError):
+            pass
+    if pc.get("heal_after") is not None:
+        kw["heal_after"] = float(pc["heal_after"])
+    return kw
