@@ -729,6 +729,15 @@ class FastCheckout:
     def run(self, page) -> tuple[bool, str, str]:
         """跑完六步。返回 (是否到 Review, 阶段, 说明)。**不下单。**"""
         t0 = time.monotonic()
+        # 后台标签页会被 Chrome 降网络优先级、还会挨 timer 节流。抢购这几十秒
+        # 全花在等服务端上，没理由让浏览器自己再给它打个折。
+        #
+        # 注意：这不是 2026-09-15 那次「每步被垫到 10 秒」的解药——那个是出口
+        # IP 的问题（见 README），切到前台一样 10 秒。留着只是因为它本来就该做。
+        try:
+            page.bring_to_front()
+        except Exception as e:
+            self.log(f"[快车道] 切前台失败（不影响后续）：{type(e).__name__}: {e}")
         self.stk = self.wait_for_stk(page)
         if not self.stk:
             return False, "⚠️ 读不到 x-aos-stk", (

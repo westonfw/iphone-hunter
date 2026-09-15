@@ -289,6 +289,79 @@ python3 -m hunter check --location 200000
 
 ---
 
+### 下单一直失败？先排除这三件，顺序别反
+
+2026-09-15 为了查「有货却下不了单」，从熔断、指纹、提前站队一路查到路由表，
+最后真正的原因是**账号**。把排查顺序记在这里，省得下次再走一遍：
+
+**1. 先确认账号能下单（最容易被跳过，却最可能是答案）**
+
+判据很硬：**同一台电脑、同一个 IP、同一个型号、同一家店、同一种付款方式，
+换一个 Apple ID 就能下单**。当天的对照实验：
+
+| | 老账号 | 新账号 |
+|---|---|---|
+| `selectFulfillmentLocation` / `selectStore` / `selectBillingOption` | `RETAIL` / `R581` / `installments0001321713` | **完全相同** |
+| `checkStatus` 最终去处 | `/shop/checkout`（打回） | `/shop/checkout/thankyou` ✅ |
+
+老账号此前有一笔「下单成功 → 没付款 → 被取消」的 iPhone 订单。对应
+[销售政策](https://www.apple.com.cn/shop/open/salespolicies)里那句「我们可能会限制
+单个订单或**相关联订单**购买同类型产品的数量」。
+
+> **被打回时页面上那句「你所选择的『送货与取货』选项已不再为本订单提供」不能当真。**
+> `placeOrder` 因为**任何**原因失败，都会把你踢回向导第一步（送货与取货），
+> 于是长得都一样。当天它把排查带偏了大半天：库存在提交前一刻还是
+> `availableNowForAllLines=True`，根本不是没货。
+
+**2. 再确认出口 IP 不是机房**
+
+结账域名 `secureN.www.apple.com.cn` 解析到 **Apple 美国（17.0.0.0/8，AS714）**，
+而 `www.apple.com.cn` 是国内 CDN（金山云）。**这两个在按目的地分流的策略路由里
+会走两条不同的线**——监控从家宽出去，结账却可能绕道境外代理。
+
+当时结账那条线落在 Linode 加州机房（ASN 属于 Akamai 自己的云），症状是
+**checkoutx 每一步被垫到约 10 秒**：
+
+```
+            真人(正常IP)   我们(机房IP)
+selectFulfillmentLocation   874ms      9869ms
+continueFromPickupContactToBilling  765ms   10316ms
+selectBillingOptionAction   634ms     10060ms
+```
+
+拟合出来是 `max(真实耗时, ~10s)`；连续 11 次 `checkStatus` 方差只有 ±15ms（0.17%），
+没有服务端能这么稳——那是个定时器。Akamai Bot Manager 的处置动作里正好有
+**slow / delay / tarpit** 这一档：评分可疑但不确定时，放行但故意拖慢。
+
+修法是在策略路由里给 `17.0.0.0/8` 开直连。换 IP 后 10 秒地板当场消失。
+（Apple 中国的 secureN 没有真 AAAA 记录，不用管 ip6tables。）
+
+**3. 最后才轮到自动化痕迹——而且实测它不是问题**
+
+同一个新 IP 上，**受控 Chrome（CDP + Playwright）比全新隐私窗还快**
+（994ms vs 953→9568ms）。所以 `Runtime.enable` 那套 CDP 破绽在 Apple 这儿
+没有触发惩罚，rebrowser-patches 之类的方案不必做。
+
+> **别把 cookie 搬出浏览器。** 试过用 curl_cffi 带着浏览器 cookie 直发 checkoutx：
+> 取结账页 HTML 的 GET 能过，POST **立刻 541**。Akamai 把 checkoutx 的会话绑在
+> 浏览器上，光有 cookie 不够，它还要页面 JS 持续上报的传感器数据。
+> 所以快车道走页面 fetch 不是偷懒，是唯一能过的路。
+
+### 真实的时间账（账号正常时）
+
+| 阶段 | 秒 | 出处 |
+|---|---|---|
+| 发现 | 31 | 热时段相邻成功查询间隔的中位数 |
+| 准备 | 7 | **空购物袋**直接加购；袋里有别的型号要先清，得花 23s |
+| 结账八步 | 40 | 成功那单的实测 |
+| **合计** | **78** | 在架窗口约 140s |
+
+有余量，所以**不要再优化速度**。两条经验：
+
+- **购物袋平时留空。** 盯 N 个型号且没有偏好时，「提前备好一台」是负收益：
+  命中概率只有 1/N，没命中就要多付清袋的 11 秒。空袋对所有型号一视同仁。
+- **保持那个 Chrome 登录着。** 被弹到登录页再自动登录要花 16 秒，是纯浪费。
+
 ## 日志：终端 + 每个请求都落盘
 
 监控是挂通宵的活，终端 scrollback 留不住——而「凌晨三点被拦了几次、什么时候恢复的、
