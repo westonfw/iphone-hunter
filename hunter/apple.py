@@ -32,6 +32,10 @@ except ImportError:                                    # pragma: no cover
     CurlError = None
 
 #: 会被 Akamai 按端点单独限速的两个接口。熔断是按 path 分家的，所以要有名字。
+#: 一个请求里最多塞几个 parts.N。两个接口都按它切批——**不能截断**：
+#: 多出来的 part 被悄悄丢掉的话，程序看起来一切正常，却永远不会为它们叫你。
+MAX_PARTS_PER_QUERY = 20
+
 AVAIL_PATH = "/shop/sba/availability-message"
 PICKUP_PATH = "/shop/retail/pickup-message"
 
@@ -370,8 +374,8 @@ class AppleClient:
     def availability(self, parts: list[str]) -> dict[str, Availability]:
         """批量查询。Apple 单次接受多个 parts.N，这里按 20 个一批切分。"""
         out: dict[str, Availability] = {}
-        for i in range(0, len(parts), 20):
-            chunk = parts[i:i + 20]
+        for i in range(0, len(parts), MAX_PARTS_PER_QUERY):
+            chunk = parts[i:i + MAX_PARTS_PER_QUERY]
             params = {f"parts.{n}": p for n, p in enumerate(chunk)}
             data = self._get(AVAIL_PATH, params)
             for item in (data.get("body") or {}).get("content") or []:
@@ -387,7 +391,7 @@ class AppleClient:
                     delivery=(opts[0].get("displayName") if opts else "") or "",
                     raw=item,
                 )
-            if i + 20 < len(parts):
+            if i + MAX_PARTS_PER_QUERY < len(parts):
                 time.sleep(0.5)
         return out
 
@@ -403,14 +407,29 @@ class AppleClient:
         """
         if not parts:
             return {}
+        if not (store or location):
+            raise ValueError("查门店取货必须给 location（邮编）或 store（门店编号）")
+
+        # 按批切，**不截断**。原来是 parts[:20]，第 21 个往后会被悄悄丢掉：
+        # 它们既不报错也不会进结果，于是那几个型号放货时永远没人叫你——
+        # 正是这个项目最不能犯的那类错（跟「查询失败不能折叠成无货」同源）。
+        out: dict[str, list[StorePickup]] = {}
+        for i in range(0, len(parts), MAX_PARTS_PER_QUERY):
+            out.update(self._pickup_chunk(parts[i:i + MAX_PARTS_PER_QUERY],
+                                          location=location, store=store))
+            if i + MAX_PARTS_PER_QUERY < len(parts):
+                time.sleep(0.5)
+        return out
+
+    def _pickup_chunk(self, parts: list[str], location: str = "",
+                      store: str = "") -> dict[str, list[StorePickup]]:
+        """查一批（≤ MAX_PARTS_PER_QUERY 个）part 的门店取货状态。"""
         params: dict[str, str] = {"pl": "true", "mts.0": "regular"}
-        params.update({f"parts.{n}": p for n, p in enumerate(parts[:20])})
+        params.update({f"parts.{n}": p for n, p in enumerate(parts)})
         if store:
             params["store"] = store
-        elif location:
-            params["location"] = location
         else:
-            raise ValueError("查门店取货必须给 location（邮编）或 store（门店编号）")
+            params["location"] = location
 
         body = (self._get(PICKUP_PATH, params).get("body") or {})
 
