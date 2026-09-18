@@ -90,6 +90,10 @@ SLOT_WAIT_MS = 8000
 # 原来按 timeout_ms//4 算出来只有 7.5s，经常刚好差一点。
 STEP_WAIT_MS = 15000
 
+#: 只是「瞄一眼这个框是空是满」的上限。这几个框跟身份证后四位是一起渲染的，
+#: 到这时候早就在了；没在就说明这一版流程不问，不值得再等一个 STEP_WAIT_MS。
+FIELD_PEEK_MS = 1500
+
 # Apple 的结账页是手风琴式的：走到下一步之后，前面步骤的 DOM **不会被移除**，
 # 只是折叠起来。所以一切判断都必须看「可见」，不能看「存在」——否则翻页之后
 # 还会以为自己停在配送步骤，跑去点下一步的按钮。
@@ -1505,6 +1509,8 @@ class OrderPlacer:
             store=self.store_numbers[0],
             id_last4=self.id_last4, last_name=self.last_name,
             first_name=self.first_name,
+            # 只在账号没预填联系方式时才用得上，见 FastCheckout.contact_fields
+            email=self.email, phone=self.phone,
             city=self.pickup_city, state=self.pickup_state,
             district=self.pickup_district, pickup_time=self.pickup_time,
             payment_label=self.payment, installment_months=self.installment_months,
@@ -1836,14 +1842,15 @@ class OrderPlacer:
         elif state == "missing":
             self.log("[下单] 这一步没有身份证后四位字段，跳过")
 
-        if self.last_name:
-            fill_field(page, ID_LAST_NAME, self.last_name, log=self.log)
-        if self.first_name:
-            fill_field(page, ID_FIRST_NAME, self.first_name, log=self.log)
-        if self.email:
-            fill_field(page, ID_EMAIL, self.email, log=self.log)
-        if self.phone:
-            fill_field(page, ID_PHONE, self.phone, log=self.log)
+        # config 里的姓名/邮箱/手机只是**兜底**：账号已经带出来的那份才是 Apple
+        # 认的（取货还要跟证件对得上），页面上已经有值就别去顶掉它。
+        # 快车道那条路同样的规矩，见 FastCheckout.contact_fields。
+        for elem_id, val in ((ID_LAST_NAME, self.last_name),
+                             (ID_FIRST_NAME, self.first_name),
+                             (ID_EMAIL, self.email),
+                             (ID_PHONE, self.phone)):
+            if val and wait_for_field(page, elem_id, FIELD_PEEK_MS) == "empty":
+                fill_field(page, elem_id, val, log=self.log)
 
         hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "pickupcontact")
         if hit == MOVED_ON:

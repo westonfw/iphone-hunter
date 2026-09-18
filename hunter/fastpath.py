@@ -511,6 +511,7 @@ class FastCheckout:
     """
 
     def __init__(self, *, store: str, id_last4: str, last_name: str, first_name: str,
+                 email: str = "", phone: str = "",
                  city: str = "上海", state: str = "上海", district: str = "杨浦区",
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
@@ -519,6 +520,10 @@ class FastCheckout:
         self.id_last4 = (id_last4 or "").strip()
         self.last_name = (last_name or "").strip()
         self.first_name = (first_name or "").strip()
+        #: 联系方式的兜底值。多数账号 Apple 会预填，只有没预填的账号才用得上，
+        #: 见 contact_fields。
+        self.email = (email or "").strip()
+        self.phone = (phone or "").strip()
         self.city, self.state, self.district = city, state, district
         self.payment_label = (payment_label or "招商银行").strip()
         self.installment_months = int(installment_months or 0)
@@ -623,10 +628,15 @@ class FastCheckout:
         self.log("[快车道] 取货人信息："
                  + "、".join(f"{k}({len(v)}字)" for k, v in got.items() if v))
         missing = [k for k in ("lastName", "firstName", "nationalIdSelf") if not got.get(k)]
+        # 邮箱/手机只有「这一步问了、而且两边都空」时才算缺：没进 fields 的那些
+        # 是 Apple 已经预填好的，不该报缺。
+        missing += [k for k, _key, _cfg in self.CONTACT_FALLBACK
+                    if k in got and not got[k]]
         if missing:
             raise Stalled(
                 f"取货人信息缺 {', '.join(missing)}——Apple 没预填、config 里也没有。"
-                f"姓名通常由账号带出；身份证后四位必须填 autobuy.id_last4。")
+                f"在 autobuy 里补：姓名 pickup_last_name / pickup_first_name，"
+                f"身份证后四位 id_last4，邮箱/手机 pickup_email / pickup_phone。")
         return self._post(page, "/shop/checkoutx",
                           "continueFromPickupContactToBilling", _CONTACT, fields)
 
@@ -773,12 +783,24 @@ class FastCheckout:
         ("invoiceHeader", f"{_CONTACT}.eFapiaoSelector.ePersonalFapiao.invoiceHeader"),
     )
 
+    #: 联系方式：这两个字段**只在 Apple 没预填时才回传**。
+    #: 预填过的账号，模型里给的是打码值（test@gmail.com、••••••••••09），
+    #: 原样发回去等于把打码字符当成真值提交，校验不过；页面上的规则也一样
+    #: （b.<字段>.submit = 「值跟 d.was 不同才提交」），所以照抄它：
+    #: 服务端有值就一个字都不发，服务端为空才拿 config 里的填。
+    CONTACT_FALLBACK = (
+        ("emailAddress", f"{_SELF}.selfContact.address.emailAddress", "pickup_email"),
+        ("fullDaytimePhone", f"{_SELF}.selfContact.address.fullDaytimePhone",
+         "pickup_phone"),
+    )
+
     @staticmethod
-    def _harvest(node, field: str) -> str:
-        """从 pickupContact 模型里取某个字段的**当前值**。
+    def _find(node, field: str) -> str | None:
+        """从 pickupContact 模型里取某个字段的**当前值**；模型里没有就返回 None。
 
         模型把当前值放在 `d` 下、上一次的值放在 `was` 下，所以必须只认 `d`，
-        否则会把旧值发回去。
+        否则会把旧值发回去。「没有这个字段」和「有但是空」得分开：前者是这一版
+        流程根本不问（不该发），后者才是要拿 config 兜底的那种。
         """
         stack = [(node, "")]
         while stack:
@@ -792,26 +814,47 @@ class FastCheckout:
                     stack.append((v, p))
             elif isinstance(cur, list):
                 stack.extend((v, path) for v in cur)
-        return ""
+        return None
+
+    @classmethod
+    def _harvest(cls, node, field: str) -> str:
+        return cls._find(node, field) or ""
 
     def contact_fields(self, contact_model: dict) -> list[tuple[str, str]]:
         """拼第 4 步的请求体。
 
-        **姓名/邮箱/电话一律用 Apple 预填的那份**，不要求用户在 config 里重填一遍——
-        实测配置里为空时发空姓名过去，服务端校验不过、返回 200 却停在原地
-        （这正是「200 不等于生效」那个坑的现场）。config 里填了才覆盖。
-        身份证后四位是唯一账号不会预填的，必须由 config 提供。
+        姓名：**账号里的名字优先**，config 只在 Apple 没预填时兜底——取货要跟
+        证件对得上，账号带出来的那份才是 Apple 认的，不该被配置里的旧值顶掉。
+        两边都空时**不要发空姓名**，服务端校验不过、返回 200 却停在原地
+        （这正是「200 不等于生效」那个坑的现场），交给 step4 停住报缺。
+        身份证后四位账号永远不会预填，必须由 config 提供。
+
+        邮箱/手机是另一种情况：预填过的账号，模型里给的是打码值，只能不发。
+        所以模型里有这个字段、而且当前是空的时候，才补上 config 里的
+        pickup_email / pickup_phone——见 CONTACT_FALLBACK。
         """
-        override = {
-            "lastName": self.last_name,
-            "firstName": self.first_name,
+        #: 只能由我们给：身份证后四位账号永远不预填，发票类型是我们选的。
+        forced = {
             "nationalIdSelf": self.id_last4,
             "selectFapiao": self.fapiao,
         }
+        #: config 里的兜底值，只有账号没预填时才轮得到它。
+        spare = {
+            "lastName": self.last_name,
+            "firstName": self.first_name,
+        }
         out = []
         for field, key in self.CONTACT_FIELDS:
-            val = override.get(field) or self._harvest(contact_model, field)
+            val = (forced.get(field)
+                   or self._harvest(contact_model, field)
+                   or spare.get(field, ""))
             out.append((key, val))
+        fallback = {"emailAddress": self.email, "fullDaytimePhone": self.phone}
+        for field, key, _cfg in self.CONTACT_FALLBACK:
+            cur = self._find(contact_model, field)
+            if cur is None or cur:        # 这一步不问 / Apple 已经预填（可能是打码值）
+                continue
+            out.append((key, fallback[field]))
         return out
 
     # ---------- 下单 ----------

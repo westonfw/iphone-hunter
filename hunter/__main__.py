@@ -439,6 +439,8 @@ def cmd_fastpath(args) -> int:
             id_last4=str(ab.get("id_last4") or ""),
             last_name=str(ab.get("pickup_last_name") or ""),
             first_name=str(ab.get("pickup_first_name") or ""),
+            email=str(ab.get("pickup_email") or ""),
+            phone=str(ab.get("pickup_phone") or ""),
             city=args.city or str(ab.get("pickup_city") or "上海"),
             state=args.state or str(ab.get("pickup_state") or "上海"),
             district=args.district or str(ab.get("pickup_district") or "杨浦区"),

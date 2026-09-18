@@ -253,7 +253,7 @@ class StalledStepTests(unittest.TestCase):
 
 
 class ContactHarvestTests(unittest.TestCase):
-    """取货人信息用 Apple 预填的那份，别让用户在 config 里重填一遍。
+    """取货人信息优先用 Apple 预填的那份，config 里的只在账号没带出来时兜底。
     实测发空姓名过去，服务端返回 200 却停在原地——就是「200 不等于生效」的现场。"""
 
     MODEL = {"x": {"d": {"lastName": "张", "firstName": "三"},
@@ -270,10 +270,20 @@ class ContactHarvestTests(unittest.TestCase):
         self.assertEqual("张", got["lastName"])
         self.assertEqual("0000", got["nationalIdSelf"])   # 这个只能来自 config
 
-    def test_config_overrides_prefilled(self):
+    def test_prefilled_name_wins_over_config(self):
+        """账号带出来的名字才是 Apple 认的（取货要跟证件对得上），别拿配置顶掉。"""
         f = placer(last_name="李", first_name="四")
         got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.MODEL)}
+        self.assertEqual("张", got["lastName"])
+        self.assertEqual("三", got["firstName"])
+
+    def test_config_name_fills_in_when_account_has_none(self):
+        blank = {"x": {"d": {"lastName": "", "firstName": ""}},
+                 "y": {"d": {"nationalIdSelf": ""}}}
+        f = placer(last_name="李", first_name="四")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(blank)}
         self.assertEqual("李", got["lastName"])
+        self.assertEqual("四", got["firstName"])
 
     def test_stalls_with_clear_reason_when_name_unavailable(self):
         """两边都没有姓名时，与其发一个注定失败的请求，不如直接说清楚。"""
@@ -282,6 +292,49 @@ class ContactHarvestTests(unittest.TestCase):
         ok, stage, detail = placer(last_name="", first_name="").run(page)
         self.assertFalse(ok)
         self.assertIn("lastName", detail)
+        self.assertEqual(3, len(page.calls))   # 第 4 步根本没发出去
+
+    #: 有的账号 Apple 不预填邮箱/手机：字段在，值是空的
+    BLANK_CONTACT = {"x": {"d": {"lastName": "张", "firstName": "三",
+                                 "emailAddress": "", "fullDaytimePhone": ""}},
+                     "y": {"d": {"nationalIdSelf": ""}}}
+    #: 预填过的账号：模型里给的是打码值，原样发回去校验不过
+    MASKED_CONTACT = {"x": {"d": {"lastName": "张", "firstName": "三",
+                                  "emailAddress": "test@gmail.com",
+                                  "fullDaytimePhone": "••••••••••09"}},
+                      "y": {"d": {"nationalIdSelf": ""}}}
+
+    def test_fills_contact_from_config_when_server_blank(self):
+        f = placer(email="a@b.c", phone="13800000000")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.BLANK_CONTACT)}
+        self.assertEqual("a@b.c", got["emailAddress"])
+        self.assertEqual("13800000000", got["fullDaytimePhone"])
+
+    def test_never_resends_masked_contact(self):
+        """预填过就一个字都不发——打码值发回去等于提交一串圆点。"""
+        f = placer(email="a@b.c", phone="13800000000")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.MASKED_CONTACT)}
+        self.assertNotIn("emailAddress", got)
+        self.assertNotIn("fullDaytimePhone", got)
+
+    def test_skips_contact_when_step_does_not_ask(self):
+        """模型里根本没这个字段的流程，别平白多发两个字段。"""
+        f = placer(email="a@b.c", phone="13800000000")
+        got = {k.rsplit(".", 1)[-1]: v for k, v in f.contact_fields(self.MODEL)}
+        self.assertNotIn("emailAddress", got)
+        self.assertNotIn("fullDaytimePhone", got)
+
+    def test_stalls_when_contact_blank_on_both_sides(self):
+        blank = resp("pickupContact", {"selfPickupContact": {
+            "selfContact": {"address": {"d": {
+                "lastName": "张", "firstName": "三",
+                "emailAddress": "", "fullDaytimePhone": ""}}},
+            "nationalIdSelf": {"d": {"nationalIdSelf": ""}}}})
+        page = FakePage([FUL, FUL, blank, BANKS, MONTHS, REVIEW])
+        ok, _, detail = placer(email="", phone="").run(page)
+        self.assertFalse(ok)
+        self.assertIn("emailAddress", detail)
+        self.assertIn("pickup_email", detail)
         self.assertEqual(3, len(page.calls))   # 第 4 步根本没发出去
 
     def test_stalls_when_id_last4_missing(self):
