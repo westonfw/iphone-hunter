@@ -216,12 +216,13 @@ class Webhook(Notifier):
 
 
 class Desktop(Notifier):
-    """桌面通知。WSL 下走 Windows 的 toast，原生 Linux 走 notify-send。"""
+    """桌面通知。Windows（原生或 WSL）走 toast，原生 Linux 走 notify-send。"""
 
     name = "desktop"
 
     def send(self, title, body, url="", critical=False):
-        if _is_wsl() and shutil.which("powershell.exe"):
+        ps_exe = _powershell()
+        if ps_exe:
             text = (body + (f"\n{url}" if url else "")).replace("'", "")
             ps = (
                 "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
@@ -233,7 +234,7 @@ class Desktop(Notifier):
                 "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('iPhone Hunter')"
                 ".Show([Windows.UI.Notifications.ToastNotification]::new($t))"
             )
-            subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+            subprocess.run([ps_exe, "-NoProfile", "-Command", ps],
                            capture_output=True, timeout=15)
         elif shutil.which("notify-send"):
             args = ["notify-send"]
@@ -313,10 +314,13 @@ class Broadcaster:
 
 
 def open_in_browser(url: str, log=_p) -> None:
-    """把购买页直接推到用户面前。WSL 下用 Windows 默认浏览器打开。"""
+    """把购买页直接推到用户面前。Windows（原生或 WSL）用系统默认浏览器打开。"""
     if not url:
         return
     try:
+        if os.name == "nt":
+            os.startfile(url)          # type: ignore[attr-defined]  # 只有 Windows 有
+            return
         if _is_wsl():
             opener = shutil.which("wslview") or shutil.which("explorer.exe")
             if opener:
@@ -326,6 +330,20 @@ def open_in_browser(url: str, log=_p) -> None:
             subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
         log(f"[浏览器] 打开失败: {e}")
+
+
+def _powershell() -> str | None:
+    """能用来弹 toast 的 PowerShell，没有就返回 None。
+
+    原生 Windows 上叫 `powershell`、WSL 里得带 .exe 才找得到。这里**不认 pwsh**：
+    PowerShell 7 加载不了 toast 用的那套 WinRT 类型，挂了还是静默的，
+    还不如让调用方直接走不发通知这条路。
+    """
+    if os.name == "nt":
+        return shutil.which("powershell")
+    if _is_wsl():
+        return shutil.which("powershell.exe")
+    return None
 
 
 def _is_wsl() -> bool:

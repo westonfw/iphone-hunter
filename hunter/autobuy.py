@@ -25,6 +25,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import PY_CMD
 from .apple import REGIONS
 # fill_field 定义在 checkout.py：调用点在那边，而 checkout 不能反向
 # import autobuy（循环导入）。这里再导出一次，保持 autobuy 也能 import。
@@ -271,7 +272,7 @@ class AutoBuy:
             from playwright.sync_api import sync_playwright
         except ImportError as e:
             raise AutoBuyUnavailable(
-                "没装 playwright。用项目自带的虚拟环境跑：.venv/bin/python -m hunter ..."
+                f"没装 playwright。用项目自带的虚拟环境跑：{PY_CMD} -m hunter ..."
             ) from e
         self._pwctx = sync_playwright()
         self._pw = self._pwctx.__enter__()
@@ -487,7 +488,7 @@ class AutoBuy:
             from playwright.sync_api import sync_playwright
         except ImportError as e:
             raise AutoBuyUnavailable(
-                "没装 playwright。用项目自带的虚拟环境跑：.venv/bin/python -m hunter ..."
+                f"没装 playwright。用项目自带的虚拟环境跑：{PY_CMD} -m hunter ..."
             ) from e
 
         what = "排练" if dry_run else "抢购"
@@ -1279,7 +1280,14 @@ class AutoBuy:
 
 # ---------- 启动一个带调试端口的 Chrome ----------
 
+#: 两种机器都要认：原生 Windows 上是 C:\，WSL 里同一个 Chrome 挂在 /mnt/c。
+#: 只写 /mnt/c 那两条的话，在原生 Windows 上一条都命中不了，connect --launch
+#: 就只能报「既没找到 Windows Chrome 也没找到 Linux Chrome」。
+#: %LOCALAPPDATA% 那条是「只给当前用户装」的 Chrome，很常见。
 WIN_CHROME_PATHS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
     "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
     "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe",
 ]
@@ -1287,6 +1295,10 @@ WIN_CHROME_PATHS = [
 
 def windows_chrome() -> str | None:
     for p in WIN_CHROME_PATHS:
+        p = os.path.expandvars(p)
+        # 变量没展开（非 Windows 上没有 %LOCALAPPDATA%）就别去 stat 了
+        if "%" in p:
+            continue
         if Path(p).exists():
             return p
     return None
@@ -1294,6 +1306,10 @@ def windows_chrome() -> str | None:
 
 def windows_userprofile() -> str | None:
     """问 Windows 自己要用户目录，避免猜路径。"""
+    if os.name == "nt":
+        return os.environ.get("USERPROFILE") or None
+    # WSL：只能隔着 cmd.exe 问，而且得站在 Windows 盘上执行，否则 cmd 会先
+    # 抱怨 UNC 路径不支持。
     try:
         r = subprocess.run(["cmd.exe", "/c", "echo %USERPROFILE%"],
                            cwd="/mnt/c", capture_output=True, text=True, timeout=10)

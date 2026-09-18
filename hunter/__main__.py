@@ -7,6 +7,7 @@ import json
 import sys
 from pathlib import Path
 
+from . import PY_CMD
 from .apple import REGIONS, AppleClient, Blocked, NotLive, Stock
 from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list,
                       cdp_candidates, inspect_checkout, launch_debug_chrome, probe_cdp,
@@ -177,7 +178,7 @@ def cmd_connect(args) -> int:
     if found:
         print(f"\n✓ 可以挂上去。把 config.json 的 autobuy.cdp_url 设成 {found!r} 锁定这个地址，")
         print("  或者留空让它每次自动探测。接着跑：")
-        print("      .venv/bin/python -m hunter rehearse")
+        print(f"      {PY_CMD} -m hunter rehearse")
         return 0
 
     if args.launch:
@@ -186,12 +187,12 @@ def cmd_connect(args) -> int:
         if ok:
             print("\n浏览器已打开购物袋页。**现在在里面登录你的 Apple ID**（只需这一次），")
             print("顺便确认收货地址和付款方式都在。然后跑：")
-            print("      .venv/bin/python -m hunter rehearse")
+            print(f"      {PY_CMD} -m hunter rehearse")
         return 0 if ok else 1
 
     print("\n✗ 没找到开着调试端口的 Chrome。")
     print("\n最省事的办法——让工具替你开一个：\n")
-    print("      .venv/bin/python -m hunter connect --launch\n")
+    print(f"      {PY_CMD} -m hunter connect --launch\n")
     print("说明：Chrome 136 起，--remote-debugging-port 对**默认 profile 直接失效**")
     print("（防止攻击者挂上真实 profile 偷 cookie），所以你日常在用的那个 Chrome 挂不上去，")
     print("必须用一个独立 profile。--launch 会开一个独立 profile 的 Chrome 并停在购物袋页，")
@@ -415,7 +416,7 @@ def cmd_fastpath(args) -> int:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        raise SystemExit("没装 playwright。用虚拟环境跑：.venv/bin/python -m hunter ...")
+        raise SystemExit(f"没装 playwright。用虚拟环境跑：{PY_CMD} -m hunter ...")
 
     for url in cdp_candidates(ab.get("cdp_url", ""), int(ab.get("cdp_port", DEFAULT_CDP_PORT))):
         if probe_cdp(url):

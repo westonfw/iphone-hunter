@@ -48,6 +48,18 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 第一次跑任意命令会自动从 `config.example.json` 生成 `config.json`。
 
+#### Windows 上
+
+venv 的可执行文件在 `Scripts\` 而不是 `bin/`，把下面文档里所有 `.venv/bin/python` 换成 `.venv\Scripts\python`：
+
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m hunter test
+```
+
+Chrome 查找、桌面 toast、命中开浏览器这三处都认原生 Windows，`connect --launch` 直接可用。只有 `run.sh` 是 bash 脚本：要么用 Git Bash 跑，要么开两个窗口分别跑 `python -m hunter launch --sprint` 和 `python -m hunter watch --sprint`。
+
 ### 1. 配好通知
 
 编辑 `config.json` 的 `notifiers`。**强烈建议开 Bark**：iOS 上装 [Bark](https://apps.apple.com/cn/app/bark/id1403753865)，复制 App 首页的 key 填进去。

@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from . import PY_CMD
 from .autobuy import cdp_candidates, probe_cdp
 from .checkout import login_state
 
@@ -200,7 +201,7 @@ class SessionProbe:
         raise SystemExit(
             f"没找到开着调试端口的 Chrome（试过 "
             f"{'、'.join(cdp_candidates(self.cdp_url, self.cdp_port))}）。\n"
-            f"    先跑：.venv/bin/python -m hunter connect --launch")
+            f"    先跑：{PY_CMD} -m hunter connect --launch")
 
     def _page(self, ctx):
         """找一个 apple.com.cn 上的标签页来发同源请求。没有就开一个。"""
@@ -312,7 +313,7 @@ class SessionProbe:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            raise SystemExit("没装 playwright。用虚拟环境跑：.venv/bin/python -m hunter ...")
+            raise SystemExit(f"没装 playwright。用虚拟环境跑：{PY_CMD} -m hunter ...")
 
         self.t0 = time.time()
         deadline = self.t0 + self.hours * 3600 if self.hours else 0.0
