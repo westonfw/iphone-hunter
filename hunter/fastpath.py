@@ -38,6 +38,9 @@ import time
 _FUL = "checkout.fulfillment"
 _LOC = f"{_FUL}.pickupTab.pickup.storeLocator"
 _ADDR = f"{_LOC}.address.stateCitySelectorForCheckout"
+#: 取货时段。2026-09-17 的 HAR 里，continueFromFulfillmentToPickupContact 多了
+#: 这一组字段（09-14 那份 HAR 完全没有）——Apple 给自提加了「选具体时间」。
+_SLOT = f"{_FUL}.pickupTab.pickup.timeSlot.dateTimeSlots"
 _CONTACT = "checkout.pickupContact"
 _SELF = f"{_CONTACT}.selfPickupContact"
 _BILL = "checkout.billing.billingOptions"
@@ -56,12 +59,24 @@ PLACE_PATH, PLACE_ACTION, PLACE_MODULE = (
     "/shop/checkoutx/review", "continueFromReviewToProcess", "checkout.review.placeOrder")
 STATUS_PATH, STATUS_ACTION, STATUS_MODULE = (
     "/shop/checkoutx/statusX", "checkStatus", "spinner")
+#: checkStatus 属于 status 页，不是结账页。见 JS_POST 上面那段注释。
+STATUS_MODEL_PAGE = "checkoutStatusPage"
+
+#: 「操作超时」页。结账会话 5 分钟没交互就作废，然后整页被扔到这儿。
+#: 参数写在结账页模型的 `checkout.session` 里：interactionMs=300000、
+#: alertMs=60000、ttl≈20 分钟，还带着一个 `extendSession` 的续期接口。
+EXPIRED_URL = "/shop/sorry/session_expired"
 
 #: 在页面里发一个同源 POST。走页面的 fetch 而不是 Python 的 requests，
 #: 是因为这样复用的是浏览器自己的 cookie、TLS 指纹和 UA——换成外部客户端，
 #: 指纹对不上反而更容易被风控盯上，而我们打的正是最敏感的那族端点。
+#:
+#: `x-aos-model-page` **不是常量**，这一点栽过一次（2026-09-18 07:15）：
+#: 前六步和提交在 `checkoutPage` 上，而提交之后的 `checkStatus` 属于
+#: **`checkoutStatusPage`**（真实浏览器的请求头就是这么写的）。拿 checkoutPage
+#: 去问 checkStatus，服务端一律回「还在处理」——9 轮全废，而订单其实早就建好了。
 JS_POST = r"""
-async ([path, query, body, stk, callId]) => {
+async ([path, query, body, stk, callId, modelPage]) => {
     const url = location.origin + path + "?" + query;
     const t0 = performance.now();
     try {
@@ -74,7 +89,7 @@ async ([path, query, body, stk, callId]) => {
                 "X-Requested-With": "Fetch",
                 "syntax": "graviton",
                 "modelVersion": "v2",
-                "x-aos-model-page": "checkoutPage",
+                "x-aos-model-page": modelPage || "checkoutPage",
                 "x-aos-stk": stk,
                 "x-aos-ui-fetch-call-1": callId,
             },
@@ -346,6 +361,9 @@ def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
     if r.get("status") == 200 and "/shop/checkout" in url:
         log(f"[快车道] 直接从购物袋接口进结账（{dt:.0f}ms，没加载购物袋页）")
         return url
+    if EXPIRED_URL in url or "/shop/sorry/" in url:
+        # 报成「没给出结账地址」会让人去查购物袋、查令牌，全是白查。
+        raise SessionExpired(f"购物袋接口把我们指向「操作超时」页（{url[:60]}）")
     log(f"[快车道] 购物袋接口没给出结账地址（{dt:.0f}ms，"
         f"status={r.get('status')} head={r.get('head')} url={url[:60] or '无'}），退回点页面")
     return ""
@@ -393,6 +411,18 @@ class CartMismatch(Exception):
     """
 
 
+class SessionExpired(Exception):
+    """结账会话作废了（被指向 `/shop/sorry/session_expired`）。
+
+    **跟 Stalled 必须分开。** Stalled 是「这一步没生效，重新加载页面接着走」；
+    会话过期是「整条链路作废」，在上面重试、重新加载都没用——只能重新登录、
+    从购物袋重新开始。
+
+    来路写在结账页的模型里（2026-09-17 的 HAR）：`checkout.session` 那一节的
+    `interactionMs: 300000` —— **5 分钟没有交互就作废**，`expiredUrl` 就是那一页。
+    """
+
+
 class Stalled(Exception):
     """请求返回 200，但这一步**并没有推进**。
 
@@ -414,6 +444,65 @@ EXPECT = {
 }
 
 
+#: 时段字段的对照表：左边是请求体里的表单名，右边是响应里那个时段对象的键名。
+#: 两边名字对不上是 Apple 自己的事，对照关系抄自 checkout.js 里那段 setValue
+#: （`b("timeSlotId",t.SlotId||"")`…），不是猜的。
+SLOT_FIELDS = (
+    ("startTime", "checkInStart"),
+    ("endTime", "checkInEnd"),
+    ("displayStartTime", "displayStart"),
+    ("displayEndTime", "displayEnd"),
+    ("timeSlotType", "timeSlotType"),
+    ("timeSlotId", "SlotId"),
+    ("signKey", "signKey"),
+    ("timeZone", "timeZone"),
+    ("timeSlotValue", "timeSlotValue"),
+    ("isRestricted", "isRestricted"),
+)
+
+#: "12:30 PM" / "9:05 AM" / "12:30"。取货时段的开始时刻长这几种样子。
+_CLOCK = re.compile(r"^\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*([AaPp])?[Mm]?\.?\s*$")
+
+
+def clock_minutes(text: str) -> int:
+    """把时刻折算成当天的分钟数，看不懂返回 -1。
+
+    **12 小时制必须认**：响应里的 `checkInStart` 是「12:30 PM」这种写法，
+    按 24 小时制硬读会把下午一点读成凌晨一点，于是配了 "13:00" 反而选到最早那档。
+    """
+    m = _CLOCK.match(str(text or ""))
+    if not m:
+        return -1
+    hour, minute, half = int(m.group(1)), int(m.group(2)), (m.group(3) or "").upper()
+    if minute > 59 or hour > (12 if half else 23):
+        return -1
+    if half == "A" and hour == 12:
+        hour = 0
+    elif half == "P" and hour != 12:
+        hour += 12
+    return hour * 60 + minute
+
+
+def slot_minutes(slot: dict) -> int:
+    """一档时段几点开始。先认 `checkInStart`，它不在就从 timeSlotValue 拆。
+
+    timeSlotValue 形如 `18-12:30-12:45`（日-开始-结束），是兜底而不是首选：
+    它没有 AM/PM，只在 checkInStart 缺席时才比它强。
+    """
+    got = clock_minutes(slot.get("checkInStart"))
+    if got >= 0:
+        return got
+    parts = str(slot.get("timeSlotValue") or "").split("-")
+    return clock_minutes(parts[1]) if len(parts) >= 2 else -1
+
+
+def slot_label(chosen: dict) -> str:
+    """给日志用的人话：`2026-09-18 12:30 – 12:45`。"""
+    slot = chosen.get("slot") or {}
+    when = str(slot.get("Label") or slot.get("timeSlotValue") or "").strip()
+    return f"{chosen.get('date') or '?'} {when}".strip()
+
+
 class FastCheckout:
     """六步走完结账向导，停在 Review。
 
@@ -425,7 +514,7 @@ class FastCheckout:
                  city: str = "上海", state: str = "上海", district: str = "杨浦区",
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
-                 stk_timeout_ms: int = 15000, log=print):
+                 pickup_time: str = "", stk_timeout_ms: int = 15000, log=print):
         self.store = (store or "").strip()
         self.id_last4 = (id_last4 or "").strip()
         self.last_name = (last_name or "").strip()
@@ -437,6 +526,16 @@ class FastCheckout:
         #: 走到 Review 之后要不要真的提交。提交只创建待付款订单，不扣款——
         #: 但仅限扫码通道，信用卡路径在 _may_place 里硬拒。
         self.place_order = bool(place_order)
+        #: 想要哪一档取货时段：earliest（默认，最早可选）/ latest / "HH:MM"。
+        #: 具体含义见 choose_slot。
+        self.pickup_time = (pickup_time or "").strip()
+        #: 第 2 步挑好的那一档，第 3 步要连同门店一起回传。空 dict = 这家店
+        #: 这一版流程不需要选时段（2026-09-17 之前就是这样）。
+        self.slot: dict = {}
+        #: 「立即下单」那一发**已经送出去了**。一旦为 True，订单就可能已经在
+        #: Apple 那边建好了——哪怕后面轮询没能拿到结论。调用方必须靠它决定
+        #: 「还能不能再点一次下单」，见 2026-09-18 07:15 那单的教训。
+        self.submitted = False
         #: 等 x-aos-stk 出现的上限。页面越慢这条路越值钱，所以别急着放弃。
         self.stk_timeout_ms = int(stk_timeout_ms)
         self.log = log
@@ -448,11 +547,12 @@ class FastCheckout:
     # ---------- 底层 ----------
 
     def _post(self, page, path: str, action: str, module: str,
-              fields: list[tuple[str, str]]) -> dict:
+              fields: list[tuple[str, str]], model_page: str = "") -> dict:
         t0 = time.monotonic()
         query = encode([("_a", action), ("_m", module)])
         body = encode(fields)
-        r = page.evaluate(JS_POST, [path, query, body, self.stk, new_call_id()]) or {}
+        r = page.evaluate(JS_POST, [path, query, body, self.stk, new_call_id(),
+                                    model_page or "checkoutPage"]) or {}
         dt = time.monotonic() - t0
         self.timings.append((action, dt))
         status = r.get("status")
@@ -462,6 +562,13 @@ class FastCheckout:
             raise RuntimeError(f"{action} 返回 {status}"
                                + (f"：{r['error']}" if r.get("error") else ""))
         data = r.get("json") or {}
+        # 会话过期时服务端照样回 200，跳转写在响应体里（见 follow 的注释）。
+        # 这一步必须排在 EXPECT 之前：不然会被报成「响应里没有 xxx 这一节」，
+        # 看着像 Apple 改了结构，实际是会话早就没了。
+        dest = str(((data.get("head") or {}).get("data") or {}).get("url") or "")
+        if EXPIRED_URL in dest or "/shop/sorry/" in dest:
+            raise SessionExpired(
+                f"{action} 被指向「操作超时」页（{dest}）——结账会话作废了")
         want = EXPECT.get(action)
         if want:
             got = ((data.get("body") or {}).get("checkout") or {})
@@ -499,15 +606,16 @@ class FastCheckout:
                    "selectFulfillmentLocationAction", f"{_FUL}.fulfillmentOptions",
                    [(f"{_FUL}.fulfillmentOptions.selectFulfillmentLocation", "RETAIL")])
 
-    def step2_store(self, page) -> None:
-        self._post(page, "/shop/checkoutx/fulfillment", "search", _LOC,
-                   self._store_fields())
+    def step2_store(self, page) -> dict:
+        """选门店。**返回值别丢**：取货时段就挂在这一步的响应里。"""
+        return self._post(page, "/shop/checkoutx/fulfillment", "search", _LOC,
+                          self._store_fields())
 
     def step3_to_contact(self, page) -> dict:
         return self._post(page, "/shop/checkoutx/fulfillment",
                    "continueFromFulfillmentToPickupContact", _FUL,
                    [(f"{_FUL}.fulfillmentOptions.selectFulfillmentLocation", "RETAIL")]
-                   + self._store_fields())
+                   + self._store_fields() + self.slot_fields(self.slot))
 
     def step4_to_billing(self, page, contact_model: dict) -> dict:
         fields = self.contact_fields(contact_model)
@@ -537,6 +645,119 @@ class FastCheckout:
                               (f"{_BILL}.bankLookUp.selectBank", ""),
                               (f"{_INSTALL}.selectInstallmentOption", str(months)),
                           ])
+
+    # ---------- 取货时段 ----------
+    #
+    # 2026-09-17 的 HAR 里，自提多了一步「选具体时间」：第 3 步的请求体里
+    # 多出 13 个 `...timeSlot.dateTimeSlots.*` 字段，其中 timeSlotId 和 signKey
+    # 是**服务端签发**的，编不出来——只能从第 2 步的响应里原样取出来回传。
+    # 老流程（09-14 的 HAR）完全没有这一组，所以这里一律「有就带、没有就算」，
+    # 免得在还没上这套流程的门店/地区上平白多发一堆字段。
+
+    @classmethod
+    def slot_candidates(cls, data: dict) -> list[dict]:
+        """把响应里的取货时段摊平成候选列表，保持 Apple 给的先后顺序。
+
+        模型是两个平行的列表：`pickUpDates` 是可选的日子，`timeSlotWindows`
+        是每天的时段，按 `dayOfMonth` 索引（见 checkout.js 里的 `p[a][t.dayOfMonth]`）。
+        `enabled: false` 的档位是页面上灰掉的那些，选了也结不了账，直接扔掉。
+        """
+        out: list[dict] = []
+        for node in cls._walk(data, "timeSlotWindows"):
+            dates = node.get("pickUpDates")
+            windows = node.get("timeSlotWindows")
+            if not isinstance(dates, list) or not isinstance(windows, list):
+                continue
+            for i, day in enumerate(dates):
+                if not isinstance(day, dict):
+                    continue
+                dom = str(day.get("dayOfMonth") or "")
+                bucket = windows[i] if i < len(windows) else None
+                if not (isinstance(bucket, dict) and dom in bucket):
+                    # 下标对不上就按 dayOfMonth 找。顺序是 Apple 的实现细节，
+                    # 别让它一变就整条路走不通。
+                    bucket = next((b for b in windows
+                                   if isinstance(b, dict) and dom in b), None)
+                for slot in ((bucket or {}).get(dom) or []):
+                    if not isinstance(slot, dict) or slot.get("enabled") is False:
+                        continue
+                    if not slot.get("timeSlotValue"):
+                        continue
+                    out.append({"slot": slot, "dayOfMonth": dom,
+                                "date": str(day.get("date") or "")})
+            if out:
+                break
+        return out
+
+    def choose_slot(self, data: dict) -> dict:
+        """按配置挑一档。挑不出来返回空 dict。
+
+        * 空 / earliest：最早那一档（默认——抢购场景就是越早拿到越好）
+        * latest：**最早那一天**里最晚的一档，不是最后一天
+        * "HH:MM"：那天里第一档不早于它的；当天没有就退到当天最后一档
+
+        日子一律只看最早有档期的那天：自提的意义就在当天/次日拿货，
+        为了一个时间点把取货日推后几天不是这个工具该替人做的决定。
+        """
+        cands = self.slot_candidates(data)
+        if not cands:
+            return {}
+        want = self.pickup_time.lower()
+        if want in ("", "earliest", "最早"):
+            return cands[0]
+
+        first_day = cands[0]["dayOfMonth"]
+        same_day = [c for c in cands if c["dayOfMonth"] == first_day]
+        if want in ("latest", "最晚"):
+            return same_day[-1]
+
+        mins = clock_minutes(want)
+        if mins < 0:
+            self.log(f"[快车道] ⚠️ 看不懂取货时段「{self.pickup_time}」"
+                     f"（要 earliest / latest / HH:MM），按最早的那档选")
+            return cands[0]
+        later = [c for c in same_day if slot_minutes(c["slot"]) >= mins]
+        if later:
+            return later[0]
+        self.log(f"[快车道] ⚠️ {same_day[0].get('date') or '当天'} {self.pickup_time} "
+                 f"之后没有档期了，改用当天最后一档")
+        return same_day[-1]
+
+    @staticmethod
+    def slot_fields(chosen: dict) -> list[tuple[str, str]]:
+        """拼第 3 步要多带的那组字段。没挑到时返回空表——一个字段都别发。"""
+        if not chosen:
+            return []
+        slot = chosen.get("slot") or {}
+
+        def val(v) -> str:
+            if v is None or v is False:
+                return ""          # 实测 isRestricted / timeSlotType 就是发空串
+            return "true" if v is True else str(v)
+
+        out = [(f"{_SLOT}.{name}", val(slot.get(src))) for name, src in SLOT_FIELDS]
+        out.append((f"{_SLOT}.date", str(chosen.get("date") or "")))
+        out.append((f"{_SLOT}.dayRadio", str(chosen.get("dayOfMonth") or "")))
+        out.append((f"{_SLOT}.isRecommended",
+                    "true" if slot.get("recommendationLabel") else "false"))
+        return out
+
+    def take_slot(self, data: dict) -> dict:
+        """第 2 步之后挑时段，并把「要选却选不出来」这件事当场说清楚。
+
+        响应里有时段模块、却一个可选的档位都没有，意味着这家店当下根本排不上
+        取货——这时候继续往下发包只会换来一个 200 却不推进的响应，日志上看着
+        像代码坏了。宁可在这儿停住，把原因写明白。
+        """
+        self.slot = self.choose_slot(data)
+        if self.slot:
+            self.log(f"[快车道] 取货时段 {slot_label(self.slot)}"
+                     f"（{self.pickup_time or 'earliest'}）")
+        elif self._walk(data, "timeSlotWindows"):
+            raise Stalled(
+                f"门店 {self.store} 要选取货时段，但响应里一个可选的档位都没有"
+                f"——这家店当下排不上取货，换一家或者改时间再试")
+        return self.slot
 
     # ---------- 取货人信息 ----------
 
@@ -610,22 +831,73 @@ class FastCheckout:
         return f"「{want}」不在已知的扫码付款方式里，保险起见不代下单"
 
     def step7_place_order(self, page) -> str:
+        # 发出去之前就置位：请求一旦离开这台机器，订单就可能已经建好了，
+        # 而响应有没有回来、回来的是什么，都不改变这件事。
+        self.submitted = True
         data = self._post(page, PLACE_PATH, PLACE_ACTION, PLACE_MODULE, [])
         return str(((data.get("head") or {}).get("data") or {}).get("url") or "")
 
-    def step8_check_status(self, page, tries: int = 12, delay: float = 1.5) -> str:
-        """轮询下单结果，返回最终去处的 URL。
+    def follow(self, page, url: str) -> bool:
+        """跟着服务端给的「假跳转」真的导航过去。成了返回 True。
+
+        Apple 这套框架的跳转**不是 HTTP 301/302**：HTTP 层永远是 200，
+        跳转写在响应体里（`{"head":{"status":302,"data":{"url":"…"}}}`），
+        由前端读出来做 `window.location.href = …`。HAR 里那两跳
+        （`/shop/checkout/status`、`/shop/checkout/thankyou`）的请求头是
+        `Sec-Fetch-Mode: navigate`，是**整页导航**，不是 XHR。
+
+        发包这条路原来把这两跳全省了——省错了：省掉之后每一步都还挂在结账页上，
+        请求头里的 `x-aos-model-page` 和 referer 都跟真实浏览器不一样。
+        """
+        if not url:
+            return False
+        full = url if url.startswith("http") else self.origin(page) + url
+        try:
+            page.goto(full, timeout=20000, wait_until="domcontentloaded")
+            self.log(f"[快车道] 跟着跳到 {full.split('//')[-1][:60]}")
+            return True
+        except Exception as e:
+            self.log(f"[快车道] 跳转 {full[:50]} 失败（{type(e).__name__}），"
+                     f"留在当前页继续问")
+            return False
+
+    @staticmethod
+    def origin(page) -> str:
+        here = str(getattr(page, "url", "") or "")
+        m = re.match(r"(https?://[^/]+)", here)
+        return m.group(1) if m else ""
+
+    def step8_check_status(self, page, tries: int = 12, delay: float = 1.5,
+                           status_url: str = "") -> str:
+        """轮询下单结果，返回最终去处的 URL；拿不到结论就返回空串。
 
         **成功与否看这个 URL，不要看页面文案。** status 页在处理中显示「正在处理」，
-        失败时也一样——只有最终跳去哪里能分辨：回到 /shop/checkout 就是被驳回。
+        失败时也一样——只有最终跳去哪里能分辨。
+
+        2026-09-18 07:15 那一单（9 轮全「处理中」，而订单确认邮件已经到了）
+        教了三件事：
+
+        1. **得先真的跳到 status 页再问。** `checkStatus` 属于 `checkoutStatusPage`，
+           在结账页上问它，服务端就一直回「处理中」。浏览器那次是先整页导航到
+           `/shop/checkout/status`，第一轮就拿到了 thankyou。
+        2. **每一轮拿到什么必须打出来。** 那次只记了耗时，事后没法判断是服务端慢
+           还是我们问错了地方。
+        3. **服务端不给跳转时，页面自己可能已经到了。** 所以每轮顺手看一眼 page.url。
         """
+        self.follow(page, status_url)
         last = ""
         for i in range(max(1, tries)):
-            data = self._post(page, STATUS_PATH, STATUS_ACTION, STATUS_MODULE, [])
+            data = self._post(page, STATUS_PATH, STATUS_ACTION, STATUS_MODULE, [],
+                              model_page=STATUS_MODEL_PAGE)
             url = str(((data.get("head") or {}).get("data") or {}).get("url") or "")
+            self.log(f"[快车道] checkStatus 第 {i + 1} 轮 → {url or '（没给跳转）'}")
             last = url or last
             if url and "/shop/checkout/status" not in url:
                 return url
+            here = str(getattr(page, "url", "") or "")
+            if self.ORDER_OK.search(here.split("?")[0]):
+                self.log(f"[快车道] 服务端没给跳转，但页面已经在 {here[:60]}")
+                return here
             if i + 1 < tries:
                 page.wait_for_timeout(int(delay * 1000))
         return last
@@ -647,6 +919,23 @@ class FastCheckout:
         因为处理中和失败的 status 页文案都是「正在处理」。
         """
         return not cls.ORDER_OK.search((url or "").split("?")[0])
+
+    @classmethod
+    def order_unknown(cls, url: str) -> bool:
+        """这次下单的结果**根本没拿到结论**吗。
+
+        跟「被驳回」必须分开，因为两者该做的事正好相反：被驳回意味着订单没建
+        起来、可以重试；结果不明意味着**订单可能已经建好了**，这时候重试就是
+        再下一单。
+
+        2026-09-18 07:15：六步 + 提交全部 200，checkStatus 连着 9 轮都是
+        `/shop/checkout/status`（处理中），而 Apple 的订单确认邮件**已经到了**。
+        按老写法这会被判成「被驳回」，然后退回点页面再下一单。
+        """
+        bare = (url or "").split("?")[0]
+        if not bare:
+            return True                       # 一次跳转都没拿到
+        return "/shop/checkout/status" in bare  # 轮询用尽还停在「处理中」
 
     # ---------- 从响应里挖选项 ----------
 
@@ -748,7 +1037,7 @@ class FastCheckout:
 
         try:
             self.step1_pickup(page)
-            self.step2_store(page)
+            self.take_slot(self.step2_store(page))
             contact = self.step3_to_contact(page)
             billing = self.step4_to_billing(page, contact)
 
@@ -776,17 +1065,34 @@ class FastCheckout:
                 else:
                     dest = self.step7_place_order(page)
                     self.log(f"[快车道] 已提交，处理中（{dest or '?'}）")
-                    final = self.step8_check_status(page)
+                    final = self.step8_check_status(page, status_url=dest)
                     self.order_url = final
+                    # 成功了就把页面也带过去。发包这条路不跳页面，人打开浏览器
+                    # 只会看到还停在结账页的那个标签——而二维码在 thankyou 上。
+                    if final and not self.order_rejected(final):
+                        self.follow(page, final)
+                    if self.order_unknown(final):
+                        # **不能说成「被驳回」，也绝对不能让上层重试。**
+                        # 提交已经送出去了，订单很可能已经建好（邮件都到了），
+                        # 只是这个会话的 status 一直没翻过来。
+                        return False, "⚠️ 下单结果不明", (
+                            f"六步和提交都是 200，但轮询 {final or '一直停在处理中'}，"
+                            f"没拿到最终去处。**订单很可能已经创建**——"
+                            f"去邮箱或 https://www.apple.com.cn/shop/order/list 确认，"
+                            f"别再让它下一单。要付款的话在那儿扫码，本工具不代付款。")
                     if self.order_rejected(final):
                         return False, "⚠️ 下单被驳回", (
-                            f"六步都走通了，提交后被打回结账页（{final or '无跳转'}）。"
+                            f"六步都走通了，提交后被打回结账页（{final}）。"
                             f"最常见的原因是所选取货门店在提交那一刻已不能履约——"
                             f"Apple 的原话是「你所选择的『送货与取货』选项已不再为本订单提供」。"
                             f"请去浏览器里看结账页上的提示。")
                     return True, "✅ 待付款订单已创建", (
                         f"跳转到 {final}。"
                         f"请在约 30 分钟内自己扫码支付——**本工具不代付款**。")
+        except SessionExpired as e:
+            return False, "⚠️ 结账会话已过期", (
+                f"{e}。**在这条链路上重试没有意义**——要重新登录、"
+                f"从购物袋重新走一遍。（Apple 的结账会话 5 分钟没交互就作废。）")
         except Stalled as e:
             return False, "⚠️ 步骤没生效", (
                 f"{e}。已经改动过的服务端状态和页面可能不一致，"
@@ -800,7 +1106,8 @@ class FastCheckout:
 
         total = time.monotonic() - t0
         detail = " / ".join(f"{a} {d * 1000:.0f}ms" for a, d in self.timings)
+        when = f"取货时段 {slot_label(self.slot)}。" if self.slot else ""
         return True, "已到 Review（未下单）", (
             f"六步走完共 {total:.1f}s（{detail}）。"
-            f"付款方式 {self.payment_label} {months} 期。"
+            f"{when}付款方式 {self.payment_label} {months} 期。"
             f"**没有提交订单**，下单那一下留给你。")

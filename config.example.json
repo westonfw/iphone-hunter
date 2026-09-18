@@ -68,6 +68,7 @@
     "pickup_first_name": "",
     "pickup_phone": "",
     "fast_path": false,
+    "pickup_time": "earliest",
     "pickup_city": "上海",
     "pickup_state": "上海",
     "pickup_district": "杨浦区"

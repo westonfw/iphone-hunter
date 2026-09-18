@@ -432,7 +432,8 @@ def cmd_fastpath(args) -> int:
         page = pages[0]
         print(f"结账页：{page.url[:90]}")
         print(f"门店 {store} / 付款 {ab.get('payment_method')} "
-              f"{ab.get('installment_months')} 期\n")
+              f"{ab.get('installment_months')} 期 / 取货时段 "
+              f"{args.time or ab.get('pickup_time') or 'earliest'}\n")
         fc = FastCheckout(
             store=store,
             id_last4=str(ab.get("id_last4") or ""),
@@ -441,6 +442,7 @@ def cmd_fastpath(args) -> int:
             city=args.city or str(ab.get("pickup_city") or "上海"),
             state=args.state or str(ab.get("pickup_state") or "上海"),
             district=args.district or str(ab.get("pickup_district") or "杨浦区"),
+            pickup_time=args.time or str(ab.get("pickup_time") or ""),
             payment_label=str(ab.get("payment_method") or "招商银行"),
             installment_months=int(ab.get("installment_months") or 24),
             # 默认只走到 Review。真要下单必须显式 --confirm——这条命令是拿来
@@ -571,6 +573,8 @@ def main(argv=None) -> int:
     sf.add_argument("--city", default="", help="覆盖配置里的城市")
     sf.add_argument("--state", default="", help="覆盖配置里的省/直辖市")
     sf.add_argument("--district", default="", help="覆盖配置里的区（搜索门店用）")
+    sf.add_argument("--time", default="",
+                    help="取货时段：earliest（默认）/ latest / HH:MM（当天不早于它的第一档）")
     sf.add_argument("--confirm", action="store_true",
                     help="真的提交订单（创建待付款订单，仍需你自己扫码付款）；"
                          "不给这个开关就只走到 Review")

@@ -80,6 +80,12 @@ PICKUP_SWITCH = ("我要取货", "到店取货", "零售店取货", "门店取�
 # 谁先点它谁就把订单推成了送货——所以必须等确认切过去了再往下走。
 PICKUP_READY_MS = 20000
 
+#: 等取货时段下拉框渲染出来的上限。它是选完门店之后服务端那一趟回来才有的，
+#: 所以必须等；但没有这一步的流程里它永远不来，所以等待随时可以被
+#: 「页面上没有日期单选 + 继续按钮已经可点」打断（见 _pick_time_slot），
+#: 这里只是兜底上限。
+SLOT_WAIT_MS = 8000
+
 # 每一步等控件就绪的上限。翻页时按钮会先消失再重建，转圈久一点就要十几秒，
 # 原来按 timeout_ms//4 算出来只有 7.5s，经常刚好差一点。
 STEP_WAIT_MS = 15000
@@ -153,6 +159,72 @@ JS_PICK_STORE = r"""
         }
     }
     return {clicked: "", seen: rows.map(x => x.t.slice(0, 40))};
+}
+"""
+
+# 取货时段的下拉框。2026-09-17 起自提多了「选具体时间」，不选就点不动「继续」。
+# 页面上是「日期单选 + 时间下拉」两级：下拉里只有**当前选中那一天**的档位。
+#
+# 两个坑：
+#   1. 这是 React 受控组件，直接改 .value 它不认——必须用原型上的原生 setter
+#      写进去再派发 change，否则视觉上选中了、模型里还是空的，继续依然点不动。
+#   2. 灰掉的档位（disabled）和占位那一项（value 为空）都得跳过，选了也白选。
+JS_PICK_TIMESLOT = r"""
+(want) => {
+    const vis = (el) => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && el.offsetParent !== null;
+    };
+    const mins = (t) => {
+        const m = /^\s*(\d{1,2}):(\d{2})\s*([AaPp])?/.exec(t || "");
+        if (!m) return -1;
+        let h = parseInt(m[1], 10);
+        const half = (m[3] || "").toUpperCase();
+        if (half === "A" && h === 12) h = 0;
+        else if (half === "P" && h !== 12) h += 12;
+        return h * 60 + parseInt(m[2], 10);
+    };
+    const days = [...document.querySelectorAll('input[type=radio]')].filter(
+        i => (i.getAttribute("data-autom") || "").startsWith("day-of-week-option"));
+    const sel = [...document.querySelectorAll("select")].find(
+        s => vis(s) && (s.getAttribute("data-autom") || "").includes("availablewindow"));
+    // hasDays 是给调用方判断的：日期单选在，说明这一版流程**有**选时段这一步，
+    // 下拉只是还没渲染出来，得接着等。
+    if (!sel) return {absent: true, hasDays: days.length > 0};
+    if (sel.value) return {picked: (sel.options[sel.selectedIndex] || {}).text || "",
+                           already: true};
+
+    const opts = [...sel.options].filter(o => o.value && !o.disabled);
+    if (!opts.length) {
+        // 这一天排满了。换下一天再看——日期单选换了之后下拉会重渲染。
+        const at = days.findIndex(d => d.checked);
+        const next = days.slice(at + 1).find(d => !d.disabled);
+        if (!next) return {none: true};
+        const lab = next.id ? document.querySelector(`label[for="${CSS.escape(next.id)}"]`) : null;
+        (lab || next).click();
+        return {switched: true};
+    }
+
+    // 开始时刻从 value 里拆：形如 18-12:30-12:45（日-开始-结束）。
+    const start = (o) => {
+        const parts = (o.value || "").split("-");
+        const t = parts.length >= 2 ? mins(parts[1]) : -1;
+        return t >= 0 ? t : mins(o.text);
+    };
+    let pick = opts[0];
+    const w = (want || "").toLowerCase();
+    if (w === "latest" || w === "最晚") pick = opts[opts.length - 1];
+    else if (w && w !== "earliest" && w !== "最早") {
+        const want_m = mins(w);
+        if (want_m >= 0) pick = opts.find(o => start(o) >= want_m) || opts[opts.length - 1];
+    }
+
+    const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLSelectElement.prototype, "value").set;
+    setter.call(sel, pick.value);
+    sel.dispatchEvent(new Event("change", {bubbles: true}));
+    return {picked: (pick.text || pick.value).trim()};
 }
 """
 
@@ -302,11 +374,13 @@ JS_SNAPSHOT = r"""
         .test(body);
     const thank = /thankyou|thank-you|\/shop\/checkout\/thankyou|\/shop\/order\//i.test(url);
     const signIn = /\/signin|idmsa\.apple\.com/i.test(url);
+    // 「操作超时」：会话没了，页面上再点什么都没用。必须比 signIn 更早判。
+    const expired = /\/shop\/sorry\/|session_expired/i.test(url);
     const idEl = document.getElementById("checkout.pickupContact.selfPickupContact.nationalIdSelf.nationalIdSelf");
     const cont = document.getElementById("rs-checkout-continue-button-bottom");
     const contText = cont ? (cont.innerText || cont.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim() : "";
     return {
-        url, step, order, unpaid, thank, signIn, compact,
+        url, step, order, unpaid, thank, signIn, expired, compact,
         hasIdField: !!(idEl),
         idFilled: !!(idEl && String(idEl.value || "").trim()),
         hasPickup: /到店取货|零售店取货|门店取货|自提/.test(body),
@@ -701,6 +775,31 @@ def is_sign_in(url: str) -> bool:
     return "/signin" in u or "idmsa.apple.com" in u
 
 
+#: 「操作超时」页。结账页的模型里写明了它的来路（2026-09-17 的 HAR）：
+#:
+#:   "session": {"d": {"alertMs": "60000", "interactionMs": "300000",
+#:                     "expiredUrl": "https://www.apple.com.cn/shop/sorry/session_expired",
+#:                     "canExtend": true, "ttl": "1199729",
+#:                     "extendSessionUrl": "/shop/checkoutx/session?_a=extendSessionUrl&…"}}
+#:
+#: 也就是：**结账会话 5 分钟（interactionMs）没有交互就作废**，然后整页被扔到
+#: 这里；过期前 60 秒（alertMs）会先弹一次提醒；会话总寿命 ttl ≈ 20 分钟。
+SORRY_EXPIRED = "/shop/sorry/session_expired"
+
+
+def is_session_expired(url: str) -> bool:
+    """这个 URL 是不是「会话已经没了」。
+
+    `/shop/sorry/` 下面那几页一律算：它们都意味着同一件事——**当前这条结账链路
+    已经作废，在上面再点、再发包都没有意义**，必须回去重新登录、重新走。
+
+    跟 `is_sign_in` 分开是因为处置方式不同：登录页上就地登录就行；这一页上
+    连登录框都没有，只能先离开它。
+    """
+    u = (url or "").lower()
+    return "/shop/sorry/" in u or "session_expired" in u
+
+
 def on_checkout(page, timeout_ms: int = 9000) -> bool:
     """这个页面是不是真的进到结账向导了。**要等它渲染完再判。**
 
@@ -716,8 +815,8 @@ def on_checkout(page, timeout_ms: int = 9000) -> bool:
     while _t.monotonic() < deadline:
         try:
             url = page.url or ""
-            if is_sign_in(url):
-                return False
+            if is_sign_in(url) or is_session_expired(url):
+                return False        # 登录墙 / 会话过期：再等、再换主机都没有意义
             if "/shop/checkout" in url and \
                     step_from_button(find_continue(page).get("text", "")):
                 return True
@@ -1274,7 +1373,7 @@ class OrderPlacer:
                  fast_path: bool = False, place_order: bool = True,
                  pickup_city: str = "上海",
                  pickup_state: str = "上海", pickup_district: str = "杨浦区",
-                 timeout_ms: int = 30000, log=print):
+                 pickup_time: str = "", timeout_ms: int = 30000, log=print):
         self.region = region
         # 可接受的取货门店，按优先级排。监控命中时会把「真有货的那几家」放在前面。
         self.pickup_stores = [x.strip() for x in (pickup_stores or []) if x and x.strip()]
@@ -1305,9 +1404,21 @@ class OrderPlacer:
         self.pickup_city = pickup_city
         self.pickup_state = pickup_state
         self.pickup_district = pickup_district
+        #: 想要哪一档取货时段：earliest（默认）/ latest / "HH:MM"。
+        #: 点页面和快车道两条路都认它，行为保持一致。
+        self.pickup_time = (pickup_time or "").strip()
         #: 快车道是否已经把订单创建出来了。place() 靠它决定还要不要再点页面——
         #: 漏判会导致重复点「立即下单」，那比慢几秒严重得多。
         self.fast_ordered = False
+        #: 快车道把「立即下单」那一发**送出去了**，但没拿到明确结论。
+        #: 这跟「下单失败」不是一回事：订单可能已经建好了，所以**什么都不能再点**。
+        self.fast_unknown = False
+        #: 这次失败值不值得下一轮再试。调用方（AutoBuy）读它来定 retriable。
+        #: 「结果不明」时必须是 False——重试就是再下一单。
+        self.no_retry = False
+        #: 撞上了「操作超时」页。跟 no_retry 正好相反：会话过期时订单**肯定没建**，
+        #: 所以该重试——但得先重新登录，在死会话上重试多少次都一样。
+        self.session_expired = False
         self.timeout_ms = timeout_ms
         self.log = log
         #: watch_checkout_block() 返回的那个 dict，由 enter() 挂上。
@@ -1395,7 +1506,7 @@ class OrderPlacer:
             id_last4=self.id_last4, last_name=self.last_name,
             first_name=self.first_name,
             city=self.pickup_city, state=self.pickup_state,
-            district=self.pickup_district,
+            district=self.pickup_district, pickup_time=self.pickup_time,
             payment_label=self.payment, installment_months=self.installment_months,
             # stop_at_review 是硬闸门：它打开时快车道走到 Review 就停，
             # 跟点页面那条路的行为保持一致，不能出现「点页面会停、发包却下单」。
@@ -1405,6 +1516,15 @@ class OrderPlacer:
         self.log(f"[快车道] {stage}：{detail}")
         self.fast_ordered = bool(
             ok and fc.order_url and not FastCheckout.order_rejected(fc.order_url))
+        #: 提交发出去了、却没拿到明确结论。这时候**不能**退回点页面：
+        #: 2026-09-18 07:15 那单六步全 200、订单邮件都到了，而轮询 9 轮仍是
+        #: 「处理中」——按老逻辑会去点页面再下一单。
+        self.fast_unknown = bool(
+            fc.submitted and not self.fast_ordered
+            and FastCheckout.order_unknown(fc.order_url))
+        if self.fast_unknown:
+            self.fast_detail = detail
+            return False
         if not ok:
             # 快车道可能已经推进过服务端状态，而页面 DOM 还停在原来那一步。
             # 不刷新就退回点页面，等于对着一个状态错位的页面点——实测会变成
@@ -1445,8 +1565,25 @@ class OrderPlacer:
                         # 订单已经创建，别再让点页面那条路去点一次「立即下单」
                         return self._ok(t0, snapshot(page).get("order") or "")
                     self.log(f"[快车道] 已到 Review（{time.monotonic() - t0:.1f}s）")
+                elif self.fast_unknown:
+                    # **这条路必须在这里断掉。** 「立即下单」已经发出去了，
+                    # 订单可能已经建好；再往下走点页面那条路，就是对着一个
+                    # 可能已经成单的会话再点一次「立即下单」。
+                    self.no_retry = True
+                    self.log("[下单] 提交已送出但结果不明，停手不再点页面，"
+                             "以免重复下单")
+                    return False, "⚠️ 下单结果不明，已停手", (
+                        getattr(self, "fast_detail", "")
+                        or "提交发出去了但没拿到结论，订单可能已经创建。"
+                    ), ""
             except Exception as e:
                 self.log(f"[快车道] 异常，退回点页面：{type(e).__name__}: {str(e)[:70]}")
+                if self.fast_unknown:
+                    # 异常发生在提交之后，同样不能重试
+                    self.no_retry = True
+                    return False, "⚠️ 下单结果不明，已停手", (
+                        f"提交之后出错（{type(e).__name__}），订单可能已经创建，"
+                        f"请去邮箱或订单列表确认。"), ""
         deadline = time.monotonic() + max(180.0, self.timeout_ms / 1000 * 4)
         last = "还在结账向导里"
         last_key = None
@@ -1469,6 +1606,14 @@ class OrderPlacer:
             snap = snapshot(page)
             key = snap.get("key") or ""
 
+            if snap.get("expired"):
+                # 会话作废了。**这一页上什么都别点**：连登录框都没有，
+                # 每一次点击只是对着一个死掉的会话空转。交给上层去重新登录。
+                self.session_expired = True
+                return False, "⚠️ 结账会话已过期", (
+                    f"被扔到「操作超时」页（{snap.get('url', '')[:60]}）。"
+                    f"Apple 的结账会话 5 分钟没交互就作废（模型里的 interactionMs=300000），"
+                    f"要重新登录、从购物袋重新走一遍。"), ""
             if snap.get("signIn"):
                 return False, "⚠️ 卡在登录页", "结账被登录墙拦住，先在这个 Chrome 里登录 Apple ID。", ""
             if looks_unpaid(snap):
@@ -1547,6 +1692,7 @@ class OrderPlacer:
             return "⚠️ 没能切到「我要取货」"
 
         picked = self._click_store(page)
+        self._pick_time_slot(page)
         hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "fulfillment")
         where = f"门店「{picked}」" if picked else "门店（未自动选中）"
         if hit == MOVED_ON:
@@ -1625,6 +1771,53 @@ class OrderPlacer:
         seen = r.get("seen") or []
         self.log(f"[下单] 没找到这几家里的任何一家：{'、'.join(self.pickup_stores)}"
                  + (f"（页面上有 {len(seen)} 家：{seen[:3]}）" if seen else "（页面上没有门店列表）"))
+        return ""
+
+    def _pick_time_slot(self, page) -> str:
+        """选取货时段。返回选中的那档（没有这一步就返回空串）。
+
+        2026-09-17 起自提要选具体时间，不选就点不动「继续」——外层只会看到
+        「没等到可点的继续按钮」，完全看不出是缺了这一步。
+
+        下拉框是选完门店之后由服务端那一趟回来才渲染的，所以要等；但**不能傻等满**：
+        没有这一步的流程（2026-09-14 之前就是）里它永远不会出现，等满就是在放货
+        那一刻白扔几秒。所以「页面上连日期单选都没有、而继续已经可点」就立刻不等了。
+        """
+        deadline = time.monotonic() + SLOT_WAIT_MS / 1000
+        switched = 0
+        while time.monotonic() < deadline:
+            try:
+                r = page.evaluate(JS_PICK_TIMESLOT, self.pickup_time) or {}
+            except Exception as e:
+                self.log(f"[下单] 选取货时段出错：{str(e)[:80]}")
+                return ""
+            if r.get("picked"):
+                how = "本来就选中的" if r.get("already") else "已选"
+                self.log(f"[下单] 取货时段「{r['picked'].strip()}」（{how}）")
+                return r["picked"].strip()
+            if r.get("switched"):
+                # 这一天排满了，JS 已经点到下一天，等它重渲染再看。
+                switched += 1
+                if switched > 4:
+                    self.log("[下单] ⚠️ 连着几天都没有可选的取货时段，交给页面")
+                    return ""
+                page.wait_for_timeout(600)
+                continue
+            if r.get("none"):
+                self.log("[下单] ⚠️ 这家店没有可选的取货时段——它当下排不上取货")
+                return ""
+            # absent：还没渲染出来，或者这一版流程根本不用选时段。
+            # 日期单选都没有 + 继续已经可点 = 没有这一步，别再等了。
+            # 反过来，日期单选在就说明有这一步，哪怕继续看着可点也得等下拉出来——
+            # 不选就点继续，校验不过又不报错，外层要等满一个 12s 冷却才会重来。
+            try:
+                if not r.get("hasDays") and snapshot(page).get("continueEnabled"):
+                    return ""
+            except Exception:
+                pass
+            page.wait_for_timeout(250)
+        self.log(f"[下单] ⚠️ {SLOT_WAIT_MS / 1000:.0f}s 内没等到取货时段的下拉框，"
+                 f"当作没有这一步继续往下走")
         return ""
 
     def _step_contact(self, page, snap: dict) -> tuple[bool, str]:

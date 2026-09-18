@@ -31,7 +31,7 @@ from .apple import REGIONS
 from .checkout import (BTN_SIGN_IN, ID_ACCOUNT, ID_PWD, JS_FILL, OrderPlacer,
                        goto_buy_page, login_state, watch_checkout_block,
                        click_id, eval_in_frames, fill_field, frame_for_id,
-                       is_sign_in, read_field, wait_settled)
+                       is_session_expired, is_sign_in, read_field, wait_settled)
 
 DEFAULT_CDP_PORT = 9222
 
@@ -79,6 +79,7 @@ def _part_of(url: str) -> str:
 #: 判断逻辑在 checkout.py（那边的 enter/on_checkout 也要用，而它不能反向
 #: import autobuy）。这里起个别名，保持本模块内的老叫法。
 _is_sign_in = is_sign_in
+_is_expired = is_session_expired
 
 
 class AutoBuyUnavailable(RuntimeError):
@@ -239,6 +240,8 @@ class AutoBuy:
         self.pickup_city = str(self.cfg.get("pickup_city") or "上海")
         self.pickup_state = str(self.cfg.get("pickup_state") or "上海")
         self.pickup_district = str(self.cfg.get("pickup_district") or "杨浦区")
+        #: 取货时段：earliest（默认，最早可选）/ latest / "HH:MM"（当天不早于它的第一档）。
+        self.pickup_time = str(self.cfg.get("pickup_time") or "")
         self.delivery = (self.cfg.get("delivery") or "pickup").strip()
         self.region = (self.cfg.get("region") or "cn").strip()
         self.id_last4 = str(self.cfg.get("id_last4") or "")
@@ -295,7 +298,15 @@ class AutoBuy:
         if not self.warmed or self._page is None:
             return False
         try:
-            return not self._page.is_closed()
+            if self._page.is_closed():
+                return False
+            # 预热页挂着的这几小时里会话可能早没了。带着一个死会话去 fire()，
+            # 六步会一步步撞墙，而日志看着像「代码坏了」。
+            if _is_expired(self._page.url):
+                self.log("[预热] ⚠️ 预热页被踢到「操作超时」页，预热作废")
+                self.warmed = False
+                return False
+            return True
         except Exception:
             return False
 
@@ -654,6 +665,7 @@ class AutoBuy:
             pickup_city=self.pickup_city,
             pickup_state=self.pickup_state,
             pickup_district=self.pickup_district,
+            pickup_time=self.pickup_time,
             timeout_ms=self.timeout,
             log=self.log,
         )
@@ -664,12 +676,21 @@ class AutoBuy:
         # 先试从购物袋接口直接拿结账地址：省掉加载 259KB 购物袋页 + 渲染 + 找按钮
         # 那 ~6s。拿不到就照常走点页面，不影响正确性。
         if self.fast_path:
-            from .fastpath import CartMismatch, bag_to_checkout
+            from .fastpath import CartMismatch, SessionExpired, bag_to_checkout
             direct = ""
             try:
                 direct = bag_to_checkout(
                     page, want_part=want_part, want_qty=1,
                     want_origin=REGIONS.get(self.region) or "", log=self.log)
+            except SessionExpired as e:
+                # 会话作废了。**别退回点页面**——那条路会在同一个死会话上
+                # 从头点一遍，每一步都撞同一堵墙。先重新登录。
+                note = self._recover_session(page)
+                if note:
+                    return BuyResult(False, "⚠️ 结账会话已过期", page.url,
+                                     f"{e}。{note}")
+                self.log(f"[自动下单] {e}——已重新登录，这一轮重新走")
+                page = self._checkout_via_bag(ctx, page)
             except CartMismatch as e:
                 # 正常路径上这里不该触发：上面已经按 part 决定过清袋和加购。
                 # 真触发了说明清袋或加购静默失败了，退回点页面那条路——它会
@@ -694,6 +715,14 @@ class AutoBuy:
         # 登录页不用等它「稳定」，认出来就直接去登录，省掉那几秒
         if not _is_sign_in(page.url):
             self._settle(page)
+
+        if _is_expired(page.url):
+            # 「操作超时」页上没有登录框，也没有任何能点的东西——先离开它。
+            # _recover_session 会重新登录并回到购物袋，之后照常往下走。
+            note = self._recover_session(page)
+            if note:
+                return BuyResult(False, "⚠️ 结账会话已过期", page.url, note)
+            page = self._checkout_via_bag(ctx, page)
 
         if _is_sign_in(page.url):
             self.log(f"[自动下单] 被拦在登录页（{time.monotonic() - t0:.1f}s），尝试自动登录")
@@ -738,10 +767,54 @@ class AutoBuy:
         if placer.secure_host:
             self.secure_host = placer.secure_host
 
-        ok, stage, detail, order_id = placer.place(page, t0)
+        result = self._wrap(placer, page.url, *placer.place(page, t0))
+        if getattr(placer, "session_expired", False):
+            # 会话过期时订单**肯定没建**，所以这一轮该重试——但得先重新登录，
+            # 在死会话上重试多少次都是一样的结果。
+            self._recover_session(page)
+        return result
+
+    def _wrap(self, placer, url: str, ok: bool, stage: str, detail: str,
+              order_id: str) -> BuyResult:
+        """把 placer 的结论包成 BuyResult。
+
+        **`no_retry` 必须在这里变成 `retriable=False`。** 默认的 retriable=True
+        会让监控下一轮再跑一遍整条链路——而「结果不明」意味着那一单可能已经成了
+        （2026-09-18 07:15 就是这样，订单确认邮件都到了）。重试就是再下一单。
+        """
         if ok:
             self.order_placed = True
-        return BuyResult(ok, stage, page.url, detail, order_id=order_id)
+        if getattr(placer, "no_retry", False):
+            # 当成「已下单」：这之后谁都别再动手，等人去看邮箱/订单列表。
+            self.order_placed = True
+            return BuyResult(ok, stage, url, detail, order_id=order_id,
+                             retriable=False)
+        return BuyResult(ok, stage, url, detail, order_id=order_id)
+
+    def _recover_session(self, page) -> str:
+        """从「操作超时」页里爬出来：重新登录，然后回到购物袋。
+
+        返回空串 = 已经恢复，调用方可以接着往下走；返回说明 = 没救回来。
+
+        为什么不能在原地重试：那一页是 `/shop/sorry/session_expired`，上面连登录框
+        都没有，结账会话已经作废（模型里 `interactionMs: 300000`——5 分钟没交互
+        就过期）。所以只能先离开它、确认登录态、再从购物袋重新走一遍。
+        """
+        self.log("[自动下单] ⚠️ 撞上「操作超时」页，结账会话作废了——重新登录")
+        self.signed_in = False
+        note = self._preflight_login(page)
+        self.log(f"[自动下单] 重新登录：{note}")
+        if not self.signed_in:
+            return (f"结账会话过期，而且没能重新登录（{note}）。"
+                    f"请在这个 Chrome 里手动登录 Apple ID，下一轮会再试。")
+        try:
+            page.goto(f"{REGIONS[self.region]}/shop/bag",
+                      timeout=self.timeout, wait_until="domcontentloaded")
+            page.wait_for_timeout(1200)
+        except Exception as e:
+            return f"重新登录成功，但回购物袋失败（{type(e).__name__}）。下一轮会再试。"
+        self.log("[自动下单] 已重新登录并回到购物袋，继续")
+        return ""
 
     # ---------- 登录 ----------
 

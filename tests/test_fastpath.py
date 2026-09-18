@@ -7,19 +7,28 @@ from hunter.fastpath import BLOCK_CODES, Blocked, FastCheckout, encode, new_call
 class FakePage:
     """按顺序吐出预设响应，并记下每次请求的参数。"""
 
+    #: 假页面也要有 url：提交之后 step8 会跟着服务端给的跳转真的导航过去，
+    #: 而 follow() 要靠它拼出 origin。
+    url = "https://secure6.www.apple.com.cn/shop/checkout?_s=Review"
+
     def __init__(self, responses, html='"x-aos-stk":"TOKEN1234567890123456789"'):
         self._r = list(responses)
         self._html = html
         self.calls = []
+        self.gotos = []
+
+    def goto(self, url, **kw):
+        self.gotos.append(url)
+        self.url = url
 
     def evaluate(self, js, arg=None):
         if arg is None:                       # JS_READ_STK
             import re
             m = re.search(r'["\']x-aos-stk["\']\s*:\s*["\']([^"\']+)', self._html)
             return m.group(1) if m else ""
-        path, query, body, stk, call_id = arg
+        path, query, body, stk, call_id, model_page = arg
         self.calls.append({"path": path, "query": query, "body": body,
-                           "stk": stk, "call_id": call_id})
+                           "stk": stk, "call_id": call_id, "model_page": model_page})
         return self._r.pop(0) if self._r else {"status": 200, "json": {}}
 
     def wait_for_timeout(self, _ms):
@@ -315,12 +324,21 @@ class PlaceOrderTests(unittest.TestCase):
         self.assertIn("不再为本订单提供", detail)
 
     def test_still_processing_is_not_success(self):
-        """轮询耗尽时最后拿到的还是 status 页——这必须算失败，不能算成功。"""
+        """轮询耗尽时最后拿到的还是 status 页——绝不能算成功。
+
+        但**也不能算「被驳回」**：2026-09-18 07:15 那一单就是这个形状，
+        9 轮全是「处理中」而 Apple 的订单确认邮件已经到了。被驳回可以重试，
+        结果不明只能停手，两者混在一起就会再下一单。详见 order_unknown。
+        """
         page = FakePage(HAPPY + [self.PLACED]
                         + [self._status("/shop/checkout/status")] * 12)
-        ok, stage, _ = placer(place_order=True).run(page)
+        fc = placer(place_order=True)
+        ok, stage, detail = fc.run(page)
         self.assertFalse(ok)
-        self.assertIn("驳回", stage)
+        self.assertIn("结果不明", stage)
+        self.assertNotIn("驳回", stage)
+        self.assertTrue(fc.submitted, "提交发出去了，这个标记必须立着")
+        self.assertIn("订单很可能已经创建", detail)
 
     def test_never_places_on_card_payment(self):
         """信用卡点下单是即时扣款，等于代人付款——硬拒，不给配置绕过。"""

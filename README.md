@@ -424,7 +424,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `connect` | 诊断能否挂到你已登录的 Chrome；`--launch` 直接开一个 |
 | `rehearse` | 彩排自动下单流程（不会真的下单） |
 | `inspect-checkout` | 只读查看结账页的配送方式控件 |
-| `fastpath` | 在已打开的结账页上跑发包流程；默认停在 Review，`--confirm` 才真下单；`--store R581` |
+| `fastpath` | 在已打开的结账页上跑发包流程；默认停在 Review，`--confirm` 才真下单；`--store R581`、`--time 12:30` |
 | `har <文件>` | 解析 Chrome 导出的 HAR，看结账每一步发了什么（**抓结账链路首选这个**） |
 | `record` | 挂到 Chrome 录人工结账；`--attach` 只挂钩不跳转。**CDP 下会静默卡死，优先用 `har`** |
 | `session-probe` | 长时间记录登录/会话状态，测它到底能挂多久（见[会话保活](#会话保活挂几天的话什么会先掉)） |
@@ -450,6 +450,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.enabled` | 命中时是否自动走到结账页，默认 `false`（**先跑 `rehearse`**） |
 | `autobuy.warm` | 是否预热产品页，**默认 `false`**。只在知道几点开卖时才开（发布会当晚提前半小时）；补货监控不知道什么时候放货，挂久了预热页的会话会过期 |
 | `autobuy.pickup_stores` | 可接受的取货门店名（如 `["五角场","浦东"]`）。放货那一刻真有货的会自动排到最前，留空 = 有货的都能下。老字段 `pickup_store_name` 仍兼容 |
+| `autobuy.pickup_time` | 自提要选的取货时段：`earliest`（默认，最早可选）/ `latest`（最早那天里最晚的一档）/ `"HH:MM"`（当天第一档不早于它的）。见[自提要选「具体时间」了](#自提要选具体时间了2026-09-17-起) |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
 | `autobuy.pickup_store_name` | 结账时尝试选的取货门店名，如 `"五角场"` |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |
@@ -612,7 +613,7 @@ continueFromBillingToReview ✓ 10517ms （TTFB 10349ms / 排队 1ms / 收包 0m
 |---|---|---|---|
 | 1 | `selectFulfillmentLocationAction` | `/checkoutx/fulfillment` | `selectFulfillmentLocation=RETAIL` |
 | 2 | `search` | `/checkoutx/fulfillment` | `selectStore=R581`、`city`/`state`/`district` |
-| 3 | `continueFromFulfillmentToPickupContact` | `/checkoutx/fulfillment` | 同上全带一遍 |
+| 3 | `continueFromFulfillmentToPickupContact` | `/checkoutx/fulfillment` | 同上全带一遍 **+ 取货时段那 13 个字段**（见下） |
 | 4 | `continueFromPickupContactToBilling` | `/checkoutx` | 姓名、身份证后四位、`selectFapiao` |
 | 5 | `selectBillingOptionAction` | `/checkoutx/billing` | `selectBillingOption`、`locationConsent=true` |
 | 6 | `continueFromBillingToReview` | `/checkoutx/billing` | `selectBillingOption`、`selectInstallmentOption` |
@@ -622,6 +623,60 @@ continueFromBillingToReview ✓ 10517ms （TTFB 10349ms / 排队 1ms / 收包 0m
 第 7 步就是「立即下单」。它只创建**待付款订单**，二维码留给人扫——
 本工具永远不代付款，信用卡这类即时扣款的付款方式在代码里硬拒（`_may_place`）。
 
+#### 自提要选「具体时间」了（2026-09-17 起）
+
+2026-09-17 的 HAR 比 09-14 那份多出一整组字段：第 3 步的请求体里除了门店，
+还要带 13 个 `checkout.fulfillment.pickupTab.pickup.timeSlot.dateTimeSlots.*`：
+
+```
+...dateTimeSlots.date          = 2026-09-18
+...dateTimeSlots.dayRadio      = 18
+...dateTimeSlots.timeSlotValue = 18-12:30-12:45      ← 日-开始-结束
+...dateTimeSlots.startTime     = 12:30 PM            ← 注意是 12 小时制
+...dateTimeSlots.endTime       = 12:45 PM
+...dateTimeSlots.timeSlotId    = Q_AgEtN1G1aEmjhSVZB8E…（91 字符）
+...dateTimeSlots.signKey       = 1aosFn8R1yelRr1jvW8L9W5d4o0CnVg=
+...dateTimeSlots.timeZone      = Asia/Shanghai
+...dateTimeSlots.timeSlotType / isRestricted / displayStartTime / displayEndTime = 空
+...dateTimeSlots.isRecommended = false
+```
+
+关键点，按重要性排：
+
+1. **`timeSlotId` 和 `signKey` 是服务端签发的，编不出来。** 它们跟着**第 2 步
+   （选门店）的响应**一起下来，只能原样取出来回传——所以 `step2_store()` 的
+   返回值不能再丢掉，那是这组字段唯一的来源。
+2. **档位挂在两个平行的列表里**：`pickUpDates`（可选的日子）和 `timeSlotWindows`
+   （每天的档位，按 `dayOfMonth` 索引）。`enabled: false` 是页面上灰掉的那些，
+   选了也结不了账，直接扔。
+3. **`checkInStart` 是 12 小时制**（`12:30 PM`）。按 24 小时制硬读会把下午一点
+   读成凌晨一点，于是配了 `13:00` 反而选中最早那档——`clock_minutes()` 里
+   那段 AM/PM 处理就是为它写的。
+4. **老流程一个字段都别发。** 09-14 那份 HAR 完全没有这一组，所以响应里没有
+   时段模块时，`slot_fields()` 返回空表——在会返 541 的这族端点上，多发一堆
+   不该发的字段是白给风控送特征。
+
+点页面那条路同样缺这一步：时段是「日期单选 + 时间下拉」两级，下拉不选就
+**点不动「继续」**，而外层只能看到「没等到可点的继续按钮」，完全看不出是缺了
+这一步。`_pick_time_slot()` 补的就是它，两个细节：
+
+- 下拉是 React 受控组件，直接改 `.value` 它不认，必须用原型上的原生 setter
+  写进去再派发 `change`，否则视觉上选中了、模型里还是空的。
+- 它是选完门店之后服务端那一趟回来才渲染的，所以要等；但**不能傻等满**——
+  没有这一步的流程里它永远不来，所以「页面上连日期单选都没有、而『继续』已经
+  可点」就立刻不等了，免得在放货那一刻白扔 8 秒。反过来，日期单选在就说明
+  有这一步，哪怕继续看着可点也得等下拉出来：不选就点继续，校验不过又不报错，
+  外层要等满一个 12s 冷却才会重来。
+
+选哪一档由 `autobuy.pickup_time` 决定：`earliest`（默认）/ `latest` /
+`"HH:MM"`（当天第一档不早于它的；当天没有更晚的就退到最后一档）。
+**日子一律只看最早有档期的那天**：自提的意义就是当天/次日拿货，为了一个
+时间点把取货日推后几天不是这个工具该替人做的决定。
+
+响应里有时段模块、却一个可选的档位都没有 = 这家店当下排不上取货。这时候
+快车道**当场停住**并说明原因，而不是继续发包——继续只会换来一个 200 却不推进
+的响应，日志上看着像代码坏了。
+
 #### 下单成功与否：只认跳转，别看文案
 
 `checkStatus` 返回 `{"head":{"status":302,"data":{"url": <去处>}}}`，**那个 URL 才是结论**：
@@ -630,11 +685,117 @@ continueFromBillingToReview ✓ 10517ms （TTFB 10349ms / 排队 1ms / 收包 0m
 |---|---|
 | `.../checkout/thankyou`、`/shop/order` | ✅ 订单已创建 |
 | `.../shop/checkout` | ❌ 被驳回，退回结账页 |
-| `.../checkout/status` | ⏳ 还在处理，继续轮询 |
+| `.../checkout/status` | ⏳ 还在处理，继续轮询；**轮完还是它 = 结果不明，停手**（见下一节） |
 
 判定写成「回结账页=失败，其余=成功」会制造**假成功**：轮询超时时最后拿到的
 还是 status 页，按那种写法会报下单成功，于是不重试也不提醒，而购物袋还在那儿。
 所以 `order_rejected()` 反过来写——**只有明确跳到 thankyou/订单页才算成功**。
+
+#### 结账会话 5 分钟就过期，「操作超时」页必须单独认（2026-09-18）
+
+`https://www.apple.com.cn/shop/sorry/session_expired`。参数不用猜，**结账页的模型里
+就写着**（2026-09-17 的 HAR，`checkout.session` 那一节）：
+
+```json
+"session": {"d": {
+  "alertMs":          "60000",      // 过期前 60 秒先弹一次提醒
+  "interactionMs":    "300000",     // ← 5 分钟没有交互就作废
+  "ttl":              "1199729",    // 会话总寿命 ≈ 20 分钟
+  "expiredUrl":       "https://www.apple.com.cn/shop/sorry/session_expired",
+  "canExtend":        true,
+  "extendSessionUrl": "/shop/checkoutx/session?_a=extendSessionUrl&_m=checkout.session"
+}}
+```
+
+**5 分钟**这个数字值得记住：快车道六步 + 提交 + 轮询就要 ~100 秒（每步 TTFB
+8~10 秒），中间只要被 541 拦一次、或者人工插手看两眼，就可能越线。
+
+为什么必须跟别的失败分开——**处置方式正好相反**：
+
+| 症状 | 该做什么 |
+|---|---|
+| 「这一步没生效」（Stalled） | 重新加载结账页，接着走 |
+| 登录墙（signIn / idmsa） | **就地**登录 |
+| **会话过期（sorry 页）** | 那一页上连登录框都没有。**先离开**，重新登录，从购物袋重来 |
+
+混在一起的表现是「每一步都 200 但一步也不推进」或者「反复点同一个按钮」——
+日志看着像代码坏了，实际是会话早就没了。所以：
+
+- `is_session_expired()` / `snapshot().expired`：点页面那条路认它，认出来**立刻停手**
+- `SessionExpired` 异常：发包那条路每一步都检查响应体里的跳转目标，撞上就**不再发包**
+  （多发一个都是白撞，而撞的正是会返 541 的那族端点）
+- `_recover_session()`：重新登录 → 回购物袋 → 这一轮重新走
+- `retriable` 保持 **True**。这跟「下单结果不明」正好相反：会话过期时订单**肯定没建**，
+  该重试；结果不明时订单可能已经建好，必须停手。两者绝不能用同一个开关。
+- `warm_alive` 也查一遍：预热页挂几小时后可能自己就被踢到 sorry 页了，
+  带着死会话去 `fire()` 会一步步撞墙。
+
+> 还没做：`extendSession` 那个续期接口（`canExtend: true`）。真要长时间挂着预热页，
+> 靠它主动续期比事后恢复省事得多——但预热默认是关的，而且这条路**没有实测过**。
+
+#### 跳转是假的 302，而 `x-aos-model-page` 不是常量（2026-09-18 查清）
+
+这一节是 07:15 那一单**真正的病根**，比下面那个三态判定更靠前。
+
+先说跳转机制：**HTTP 层从头到尾都是 200，没有 `Location` 头**。跳转写在响应体里，
+前端读出来自己做整页导航：
+
+```
+POST …_a=continueFromReviewToProcess     HTTP 200
+     body: {"head":{"status":302,"data":{"url":"/shop/checkout/status"}},"body":{}}
+        ↓ 前端 window.location.href = …（HAR 里那一跳 Sec-Fetch-Mode: navigate）
+GET  /shop/checkout/status               HTTP 200 text/html   ← 整页加载，25KB
+        ↓ 新页面上的 spinner 模块再问一次
+POST …_a=checkStatus&_m=spinner          HTTP 200
+     body: {"head":{"status":302,"data":{"url":"/shop/checkout/thankyou"}},"body":{}}
+        ↓ 又一次整页导航
+GET  /shop/checkout/thankyou             HTTP 200 text/html   ← 二维码在这儿
+```
+
+所以 `head.status: 302` 是**应用层的约定**，不是 HTTP 状态码；判据只能看
+`head.data.url`，这部分原来就是对的。错的是下面这个：
+
+| 请求 | 真实浏览器发的 `x-aos-model-page` | referer |
+|---|---|---|
+| 前六步、`continueFromReviewToProcess` | `checkoutPage` | `/shop/checkout?_s=Review` |
+| **`checkStatus`** | **`checkoutStatusPage`** | **`/shop/checkout/status`** |
+
+发包这条路把那两次整页导航全省了，于是八步一律发 `checkoutPage`——
+**拿结账页的身份去问 status 页的接口，服务端就一直回「还在处理」**。
+07:15 那次 9 轮全废就是这个原因，而浏览器那次（secure7 HAR）第一轮就拿到了
+thankyou。省掉导航省错了：它不只是"少两个请求"，请求头和 referer 都跟着不对。
+
+修法就是**跟着跳**（`follow()`）：提交后真的 `goto` status 页，在那儿用
+`checkoutStatusPage` 问 checkStatus，拿到 thankyou 再 `goto` 过去。附带好处是
+**浏览器那个标签页终于会停在二维码页上**——发包这条路以前跑完，人打开浏览器
+看到的还是停在结账页的旧标签，而订单其实早成了。
+
+#### 「结果不明」不是「被驳回」——混在一起会重复下单（2026-09-18）
+
+07:15 那一单：六步全 200、`continueFromReviewToProcess` 200、`checkStatus` 连着
+**9 轮**都是 `/shop/checkout/status`（处理中），而 **Apple 的订单确认邮件已经到了**。
+订单是成功的。
+
+老代码把这个形状判成「下单被驳回」，接着做两件事，每一件都是再下一单：
+
+1. `_try_fast_path` 返回 False → 退回点页面那条老路 → 对着一个**可能已经成单**
+   的会话重走一遍向导、再点一次「立即下单」；
+2. `BuyResult.retriable` 默认 `True` → 下一轮监控命中又来一遍。
+
+所以下单结果必须是**三态**，不是两态：
+
+| `checkStatus` 最后给的 URL | 判定 | 该做什么 |
+|---|---|---|
+| `thankyou` / `/shop/order` / `orderstatus` | ✅ 成功 | 提醒去扫码付款 |
+| `/shop/checkout` | ❌ 明确被打回 | 那一单没建起来，可以重试 |
+| `/shop/checkout/status`、或**一个跳转都没拿到** | ⚠️ **结果不明** | **停手**：订单可能已经建好，等人去看邮箱 |
+
+判据在 `order_unknown()`，`submitted` 标记则在**请求发出去之前**就立起来——
+请求一旦离开这台机器，订单就可能已经建好了，响应有没有回来并不改变这件事。
+`OrderPlacer.no_retry` 把这个结论一路传到 `BuyResult.retriable=False`。
+
+> 顺带修掉一个诊断盲区：`checkStatus` 每一轮拿到什么现在会打进日志。那次 9 轮
+> 只记了耗时，事后完全没法判断是服务端慢、还是我们读错了字段。
 
 #### 驳回长什么样（2026-09-14 实测）
 
@@ -672,7 +833,8 @@ checkStatus                 → 302 .../shop/checkout        ← 驳回
   "payment_method": "招商银行",
   "installment_months": 24,
   "pickup_store_numbers": ["R581", "R359", "R389"],
-  "pickup_city": "上海", "pickup_state": "上海", "pickup_district": "杨浦区"
+  "pickup_city": "上海", "pickup_state": "上海", "pickup_district": "杨浦区",
+  "pickup_time": "earliest"
 }
 ```
 
