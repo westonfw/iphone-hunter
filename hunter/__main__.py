@@ -457,7 +457,12 @@ def cmd_fastpath(args) -> int:
         ok, stage, detail = fc.run(page)
         print(f"\n{'✅' if ok else '❌'} {stage}\n   {detail}")
         if ok and not args.confirm:
-            print("\n浏览器里刷一下就能看到 Review 页。")
+            # 别让人自己刷：标签页的 URL 还挂着上一步的 _s= 锚点，F5 等于带着
+            # 那个锚点重开，页面回到那一步，看着就像流程从头走了一遍。
+            if fc.show_review(page):
+                print("\n浏览器已经停在 Review 页上了（没有下单）。")
+            else:
+                print(f"\n没能把标签页带过去，自己开 {FastCheckout.review_url(page)} 看。")
         return 0 if ok else 1
 
 

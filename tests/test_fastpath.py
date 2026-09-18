@@ -346,6 +346,27 @@ class ContactHarvestTests(unittest.TestCase):
         self.assertIn("id_last4", detail)
 
 
+class ShowReviewTests(unittest.TestCase):
+    """六步只改服务端状态，标签页还停在原来那一步——得把它带过去。
+
+    让人自己按 F5 是不行的：URL 里还挂着上一步的 _s= 锚点，刷新等于带着那个
+    锚点重开，页面回到那一步，看着就像整个流程又走了一遍。"""
+
+    def test_navigates_to_review_on_the_same_host(self):
+        page = FakePage([])
+        page.url = "https://secure6.www.apple.com.cn/shop/checkout?_s=Fulfillment-init"
+        self.assertTrue(placer().show_review(page))
+        self.assertEqual(
+            ["https://secure6.www.apple.com.cn/shop/checkout?_s=Review"], page.gotos)
+
+    def test_review_url_follows_the_session_host(self):
+        """会话分在哪台 secureN 上就得用哪台，拼死地址会跳错主机。"""
+        page = FakePage([])
+        page.url = "https://secure8.www.apple.com.cn/shop/checkout?_s=Billing"
+        self.assertEqual("https://secure8.www.apple.com.cn/shop/checkout?_s=Review",
+                         FastCheckout.review_url(page))
+
+
 class PlaceOrderTests(unittest.TestCase):
     """提交订单可以（只创建待付款单），代人付款不行。
     而且「成不成」只认硬证据——误报成功会让人以为抢到了，实际购物袋还在。"""

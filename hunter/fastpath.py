@@ -62,6 +62,12 @@ STATUS_PATH, STATUS_ACTION, STATUS_MODULE = (
 #: checkStatus 属于 status 页，不是结账页。见 JS_POST 上面那段注释。
 STATUS_MODEL_PAGE = "checkoutStatusPage"
 
+#: Review 那一步的页面地址。六步全是 XHR，服务端状态早就到 Review 了，
+#: 但**标签页还停在原来那一步**，URL 里挂着的还是 `?_s=Fulfillment-init`
+#: 之类的锚点——人手动按 F5 等于带着那个锚点重开，页面就回到那一步，
+#: 看着就像「又重新走了一遍流程」。所以别让人刷，直接导航过去。
+REVIEW_PATH = "/shop/checkout?_s=Review"
+
 #: 「操作超时」页。结账会话 5 分钟没交互就作废，然后整页被扔到这儿。
 #: 参数写在结账页模型的 `checkout.session` 里：interactionMs=300000、
 #: alertMs=60000、ttl≈20 分钟，还带着一个 `extendSession` 的续期接口。
@@ -903,6 +909,15 @@ class FastCheckout:
             self.log(f"[快车道] 跳转 {full[:50]} 失败（{type(e).__name__}），"
                      f"留在当前页继续问")
             return False
+
+    def show_review(self, page) -> bool:
+        """把标签页真的带到 Review 上，别让人自己按 F5（见 REVIEW_PATH）。"""
+        return self.follow(page, REVIEW_PATH)
+
+    @classmethod
+    def review_url(cls, page) -> str:
+        """Review 页的完整地址。会话分在哪台 secureN 上，就得用哪台的。"""
+        return cls.origin(page) + REVIEW_PATH
 
     @staticmethod
     def origin(page) -> str:
