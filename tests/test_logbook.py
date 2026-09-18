@@ -43,8 +43,14 @@ class DailyFileTests(unittest.TestCase):
         self.assertEqual("一\n二\n", f.path_for().read_text(encoding="utf-8"))
 
     def test_write_failure_is_swallowed_and_remembered(self):
+        # 造一个「爹是个文件」的目录，mkdir 在哪个系统上都必然失败。
+        # 原来这里写的是 /proc/nonexistent-for-test：Linux 上 /proc 只读所以
+        # 失败，Windows 上它变成 C:\proc\... 而 mkdir 会成功——测试反而挂了，
+        # 还在人家 C 盘根目录留下一个 proc 目录。
+        blocker = Path(self.tmp.name) / "不是目录"
+        blocker.write_text("x", encoding="utf-8")
         f = DailyFile(self.dir, "watch", ".log")
-        f.dir = Path("/proc/nonexistent-for-test")   # mkdir 必然失败
+        f.dir = blocker / "logs"
         self.assertFalse(f.write("x\n"))
         self.assertTrue(f.broken)
 
