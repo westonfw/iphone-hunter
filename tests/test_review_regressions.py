@@ -1056,3 +1056,67 @@ class ParkAfterAttemptRegressions(unittest.TestCase):
         p.is_closed.return_value = True
         ab._park_after_attempt(p)
         p.goto.assert_not_called()
+
+
+class QuotaIsCumulativeRegressions(unittest.TestCase):
+    """已买台数是**累计**的、落盘的，不会自己清——不然重启一次就能再买两台。"""
+
+    def guard(self, root, **kw):
+        from hunter.purchase_guard import PurchaseGuard
+        return PurchaseGuard(root, **kw)
+
+    def buy_one(self, root, part):
+        with self.guard(root, max_orders=2) as g:
+            g.submitted(store='R1', part=part)
+            g.finish('confirmed', f'/{part}')
+
+    def test_the_count_survives_a_restart(self):
+        from hunter.purchase_guard import QuotaReached
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.buy_one(root, 'A')
+            self.buy_one(root, 'B')
+            # 新进程 = 新的 PurchaseGuard 实例，读的是同一个 order-attempt.json
+            with self.assertRaises(QuotaReached):
+                with self.guard(root, max_orders=2):
+                    pass
+
+    def test_resolve_alone_does_not_clear_the_count(self):
+        """--resolve 是「这笔不明的单我核对过了」，不是「让我再买两台」。"""
+        from hunter.purchase_guard import QuotaReached
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.buy_one(root, 'A'); self.buy_one(root, 'B')
+            with self.guard(root, inspect=True) as g:
+                g.resolve()
+            with self.assertRaises(QuotaReached):
+                with self.guard(root, max_orders=2):
+                    pass
+
+    def test_reset_count_starts_a_new_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.buy_one(root, 'A'); self.buy_one(root, 'B')
+            with self.guard(root, inspect=True) as g:
+                self.assertEqual(2, g.reset_count())
+            with self.guard(root, max_orders=2) as g:      # 不抛
+                self.assertEqual([], g.bought)
+
+    def test_raising_the_limit_also_lets_more_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.buy_one(root, 'A'); self.buy_one(root, 'B')
+            with self.guard(root, max_orders=3):
+                pass
+
+    def test_an_unknown_order_does_not_count_but_still_blocks(self):
+        from hunter.purchase_guard import PendingOrder
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.guard(root, max_orders=2) as g:
+                g.submitted(store='R1', part='A')
+                g.finish('unknown', '/A')
+                self.assertEqual([], g.bought)             # 不计入
+            with self.assertRaises(PendingOrder):          # 但挡住一切
+                with self.guard(root, max_orders=2):
+                    pass

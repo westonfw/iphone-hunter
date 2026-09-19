@@ -473,6 +473,9 @@ def cmd_order_state(args) -> int:
         got = guard.bought
         print(f"已确认到手 {len(got)} 台" + (
             "：" + "、".join(f"{x.get('part')}@{x.get('store')}" for x in got) if got else ""))
+        if getattr(args, 'reset_count', False):
+            n = guard.reset_count()
+            print(f'已清空已买台数（原来 {n} 台），可以开始新一轮。')
         if args.resolve:
             guard.resolve(bought=args.bought)
             print('已确认人工核对订单，解除自动购买保护。'
@@ -554,6 +557,9 @@ def main(argv=None) -> int:
     so.add_argument('--bought', action='store_true',
                     help='配合 --resolve：这一单其实建成了，计入已买台数'
                          '（不加则按「没建单」处理）')
+    so.add_argument('--reset-count', action='store_true',
+                    help='清空已买台数，开始新一轮。已买台数是累计的、'
+                         '重启也不会清，所以清零必须显式做')
     so.set_defaults(func=cmd_order_state)
 
     scn = sub.add_parser("connect", help="诊断能否挂到你已登录的 Chrome")

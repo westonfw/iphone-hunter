@@ -475,7 +475,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.preflight_warm_checkout` | 空闲期把结账那道登录墙提前撞掉，默认 `false`。**会往购物袋里加一台再清掉**，所以要你明确打开。实测墙一次付清后面全免（跨清袋、跨型号、跨门店），有效期 12~45 分钟，由 10 分钟一次的保活维持；换掉的是放货时 5~20 秒的登录。开着它就**不再翻订单页**——结账页认了你，那是比订单页更硬的登录证据 |
 | `autobuy.preflight_clear_bag` | 空闲期就把袋子清空，默认 `true`。放货那一刻的清袋 + 重开产品页是关键路径上最大的一块固定开销，提前做掉 |
 | `autobuy.login_warn_days` | 登录凭证剩余天数低于它就提前推送，默认 `3`。到期要人工过双重认证，脚本代不了劳 |
-| `autobuy.max_orders` | 最多买几台，默认 `1`。Apple 限购 2，但多买一台是不可逆的花钱动作，必须显式写成 `2` 才会买第二台。结果不明的单**不计入**，而且会挡住后续所有购买 |
+| `autobuy.max_orders` | **累计**最多买几台，默认 `1`。Apple 限购 2，但多买一台是不可逆的花钱动作，必须显式写成 `2` 才会买第二台。已买台数记在 `order-attempt.json` 里，**重启不会清**，买够了就永远不再下单，直到跑 `order-state --reset-count`。结果不明的单**不计入**，但会挡住后续所有购买（要 `order-state --resolve`） |
 | `autobuy.fast_add_to_cart` | 用 cookie 里的 `atbtoken` 发一个 GET 直接加购，默认 `true`（实测 388ms vs 走产品页 11~28s）。**只在「不折抵 + 不加 AppleCare」时生效**——那两个选项是写死在 URL 参数里的；失败会自动退回产品页 |
 | `autobuy.bag_trust_seconds` | 同型号重试时，距上次尝试多久之内还值得赌「袋里还在」，默认 `600`。赌对省掉一次产品页加载（11~26s），赌错只多花一次 `/shop/bag`（几秒）|
 | `autobuy.candidate_max_age` | 库存观察超过这么多秒就不再拿去下单，默认 `90`。太小会让 `max_attempts_per_stock` 形同虚设 |

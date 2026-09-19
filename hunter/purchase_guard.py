@@ -105,9 +105,10 @@ class PurchaseGuard:
                             '`python -m hunter order-state --resolve`')
                     if len(self.bought) >= self.max_orders:
                         raise QuotaReached(
-                            f'已经拿到 {len(self.bought)} 台（上限 {self.max_orders}），'
-                            f'停止抢购。要继续请调大 autobuy.max_orders 或运行 '
-                            f'`python -m hunter order-state --resolve`')
+                            f'已经拿到 {len(self.bought)} 台（上限 {self.max_orders}）。'
+                            f'这个数是**累计**的，记在 order-attempt.json 里，重启也不会清。'
+                            f'要开始新一轮：`python -m hunter order-state --reset-count`；'
+                            f'只是想买更多就调大 autobuy.max_orders。')
             return self
         except BaseException:
             self.__exit__(None, None, None)
@@ -139,6 +140,20 @@ class PurchaseGuard:
         got.append({'attempt_id': aid, 'part': self.record.get('part'),
                     'store': self.record.get('store'), 'url': url, 'at': time.time()})
         self.record['confirmed'] = got
+
+    def reset_count(self) -> int:
+        """清空已买台数，开始新一轮。返回清掉了几台。
+
+        配额是**累计**的、落在磁盘上的，不会自己清——不然重启一次就能再买两台，
+        这个上限等于没有。所以清零必须是人显式做的一个动作。
+        """
+        n = len(self.bought)
+        self.record = dict(self.record or {})
+        self.record['confirmed'] = []
+        self.record.setdefault('status', 'resolved')
+        self.record['updated_at'] = time.time()
+        atomic_json(self.path, self.record)
+        return n
 
     def resolve(self, *, bought: bool = False) -> None:
         """人工核对完毕。bought=True 表示「这单确实建成了」，计入配额。
