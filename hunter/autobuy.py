@@ -120,6 +120,16 @@ def _apple_password(cfg: dict, log=print) -> str:
     return os.environ.get(PWD_ENV, "")
 
 
+def _pages(ctx) -> set:
+    """context 当前开着的标签页。拿不到就当空集——这只用来收拾自己开出来的
+    多余标签，问不出来时宁可不收，也不能让预热本身炸掉。"""
+    try:
+        pages = ctx.pages
+    except Exception:
+        return set()
+    return set(pages) if isinstance(pages, (list, tuple, set)) else set()
+
+
 def _store_list(*sources) -> list[str]:
     """把 pickup_stores / pickup_store_name 归一成有序去重的门店名列表。
 
@@ -485,17 +495,46 @@ class AutoBuy:
                          log=self.log)
         if not st.get('kept'):
             return f"探路加购没进袋（{st.get('reason') or 'token 多半已用过'}）"
+        before = _pages(ctx)
         try:
-            page = self._enter_checkout(ctx, page, part)
+            landed = self._enter_checkout(ctx, page, part)
+            self._settle(landed)
+            if _is_sign_in(landed.url):
+                ok, why = self._sign_in(landed)
+                self.signed_in = True if ok else False
+                note = '结账登录墙已撞掉' if ok else f'⚠️ 结账登录墙没撞掉：{why}'
+            else:
+                # 结账页认了我们——这是比订单页更硬的登录证据，它就是下单要的那一级
+                self.signed_in = True
+                self.login_note = ""
+                self.login_verified_at = time.time()
+                note = '结账会话已就绪（本来就没墙）'
+            m = re.search(r'https://(secure\d+)\.', landed.url or '')
+            if m and not self.secure_host:
+                self.secure_host = m.group(1)
+                self.log(f'[预热] 结账主机记为 {m.group(1)}（从结账页读到）')
+            return note
         except Blocked:
             raise
         except Exception as e:
             return f'进结账失败：{type(e).__name__}: {e}'
-        self._settle(page)
-        if not _is_sign_in(page.url):
-            return '结账会话已就绪（本来就没墙）'
-        ok, why = self._sign_in(page)
-        return '结账登录墙已撞掉' if ok else f'⚠️ 结账登录墙没撞掉：{why}'
+        finally:
+            # 结账页有个「5 分钟不操作就超时」的计时器（模型里的 interactionMs），
+            # 预热完必须收拾干净：
+            #   1. _checkout_via_bag 可能**另开一个标签**并返回它，那个标签不收掉
+            #      就会一直停在结账页上滴答，过会儿弹超时——用户会看见。
+            #   2. 自己这一页也要带离结账页。顺带落在 /shop/bag 上，正好是后面
+            #      清袋要的那个 origin。
+            for extra in _pages(ctx) - before:
+                try:
+                    extra.close()
+                except Exception:
+                    pass
+            try:
+                page.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,
+                          wait_until='domcontentloaded')
+            except Exception:
+                pass
 
     def prepare(self, probe_url: str = ""):
         """空闲期的保活 + 体检：验登录（权威）、顺手清袋，不加购。
@@ -514,13 +553,19 @@ class AutoBuy:
                 self._login_page = check
             if _is_sign_in(check.url) and self._sign_in_blocked(check):
                 return self._sign_in_blocked(check)
-            note = self._preflight_login(check)
-            # 顺序要紧：先撞结账墙（会加一台），再清袋。反过来袋里会留东西。
-            if self.signed_in is True and self.warm_checkout and probe_url:
+            # 结账预热本身就是最权威的登录验证——它撞的正是下单要的那一级鉴权。
+            # 开着它的时候不用再去翻订单页，那一趟纯属多余的导航。
+            note, self.signed_in = '', None
+            if self.warm_checkout and probe_url:
                 try:
-                    note = f'{note}；{self.warm_checkout_session(self._ctx, check, probe_url)}'
+                    note = self.warm_checkout_session(self._ctx, check, probe_url)
                 except Exception as e:
-                    note = f'{note}；结账预热出错：{type(e).__name__}'
+                    note = f'结账预热出错：{type(e).__name__}'
+            if self.signed_in is None:
+                # 预热关着、或者它没能给出结论（读不到 token、探路加购没进袋）：
+                # 退回订单页探针，那是不下单也能问出登录态的唯一办法。
+                probe = self._preflight_login(check)
+                note = f'{note}；{probe}' if note else probe
             if self.signed_in is True and self.clear_bag and self.preclear_bag:
                 try:
                     check.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,
@@ -781,6 +826,7 @@ class AutoBuy:
                 cleanup()
             self._checkout_cleanup = None
             self.submit_guard = None
+            self._park_after_attempt(page)
 
     def _drive_inner(self, ctx, page, url: str | None, dry_run: bool,
                in_stock: list[str] | None = None,
@@ -1051,6 +1097,31 @@ class AutoBuy:
             raise AutoBuyUnavailable('点击结账后未得到结账或登录页')
         finally:
             ctx.remove_listener('page', opened.append)
+
+    def _park_after_attempt(self, page) -> None:
+        """一单结束后别把标签留在结账页上。
+
+        结账页的模型里写着 `interactionMs: 300000`——**五分钟不操作就自己跳到
+        「操作超时」页**。留一个在那儿滴答，人打开浏览器只看到一个吓人的超时提示；
+        而且 warm_alive 会因为 _is_expired 把预热判成作废。
+
+        **可能已经下单的一律不动**：`order_placed` 同时覆盖了「成功」和「结果
+        不明」两种（见 _wrap 里的 no_retry 分支）。那一页上有二维码和订单号，
+        导航走就找不回来了。
+        """
+        if self.order_placed:
+            return
+        target = getattr(self, "_page", None) or page
+        try:
+            if target is None or target.is_closed():
+                return
+            url = target.url or ""
+            if "/shop/checkout" not in url and not _is_expired(url):
+                return
+            target.goto(f"{REGIONS[self.region]}/shop/bag", timeout=self.timeout,
+                        wait_until="domcontentloaded")
+        except Exception:
+            pass
 
     def _wrap(self, placer, url: str, ok: bool, stage: str, detail: str,
               order_id: str) -> BuyResult:

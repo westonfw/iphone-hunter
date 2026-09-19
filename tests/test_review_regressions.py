@@ -873,7 +873,186 @@ class CheckoutWarmupRegressions(unittest.TestCase):
         ab.start = Mock()
         ab._login_page = self.page('https://www.apple.com.cn/shop/bag')
         order = []
-        ab.warm_checkout_session = Mock(side_effect=lambda *a: order.append('warm') or '撞掉了')
+
+        def warm(*a):
+            order.append('warm')
+            ab.signed_in = True          # 真方法会设它，固件也得设
+            return '撞掉了'
+
+        ab.warm_checkout_session = warm
         ab.preflight_clear_bag = Mock(side_effect=lambda *a: order.append('clear') or '清空了')
         ab.prepare(self.URL)
         self.assertEqual(['warm', 'clear'], order)
+
+
+class CheckoutTabHygieneRegressions(unittest.TestCase):
+    """结账页有「5 分钟不操作就超时」的计时器，预热完必须收拾干净。"""
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+    BAG = 'https://www.apple.com.cn/shop/bag'
+
+    def page(self, url):
+        p = Mock()
+        p.url = url
+        p.is_closed.return_value = False
+        p.goto.side_effect = lambda u, **kw: setattr(p, 'url', u)
+        return p
+
+    def buyer(self, **cfg):
+        ab = AutoBuy({'preflight_warm_checkout': True, **cfg},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab._settle, ab._sign_in = Mock(), Mock(return_value=(True, ''))
+        ab._ctx = Mock()
+        ab._ctx.cookies.return_value = [{'name': 'as_atb', 'value': '1.0|x|' + 'c' * 40}]
+        return ab
+
+    def test_a_tab_opened_by_the_bag_path_is_closed_again(self):
+        """_checkout_via_bag 会另开一个标签并返回它。不收掉就一直停在结账页上
+        滴答，过会儿弹超时——用户会看见。"""
+        ab = self.buyer()
+        mine = self.page(self.BAG)
+        spawned = self.page('https://secure7.www.apple.com.cn/shop/checkout')
+        ab._ctx.pages = [mine]
+
+        def enter(ctx, page, part):
+            ab._ctx.pages = [mine, spawned]      # 模拟新标签冒出来
+            return spawned
+
+        ab._enter_checkout = enter
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}):
+            ab.warm_checkout_session(ab._ctx, mine, self.URL)
+        spawned.close.assert_called_once()
+        mine.close.assert_not_called()
+
+    def test_our_own_page_is_taken_off_the_checkout_page(self):
+        ab = self.buyer()
+        mine = self.page(self.BAG)
+        ab._ctx.pages = [mine]
+        ab._enter_checkout = lambda ctx, page, part: page   # 同一页导航过去
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}):
+            ab.warm_checkout_session(ab._ctx, mine, self.URL)
+        self.assertEqual(self.BAG, mine.url)      # 最后落在购物袋页，不是结账页
+
+    def test_cleanup_still_happens_when_entering_checkout_blows_up(self):
+        ab = self.buyer()
+        mine = self.page(self.BAG)
+        spawned = self.page('https://secure7.www.apple.com.cn/shop/checkout')
+        ab._ctx.pages = [mine]
+
+        def enter(ctx, page, part):
+            ab._ctx.pages = [mine, spawned]
+            raise RuntimeError('boom')
+
+        ab._enter_checkout = enter
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}):
+            note = ab.warm_checkout_session(ab._ctx, mine, self.URL)
+        self.assertIn('进结账失败', note)
+        spawned.close.assert_called_once()
+
+    def test_unreadable_page_list_never_breaks_the_warmup(self):
+        ab = self.buyer()
+        mine = self.page(self.BAG)
+        type(ab._ctx).pages = property(lambda _: (_ for _ in ()).throw(RuntimeError()))
+        ab._enter_checkout = lambda ctx, page, part: page
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}):
+            ab.warm_checkout_session(ab._ctx, mine, self.URL)   # 不抛
+        del type(ab._ctx).pages
+
+
+class OrderPageProbeRegressions(unittest.TestCase):
+    """结账预热是比订单页更硬的登录证据——开着它就不该再翻订单页。"""
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+
+    def buyer(self, **cfg):
+        ab = AutoBuy({'preflight_warm_checkout': True, **cfg},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab.start, ab._settle = Mock(), Mock()
+        ab.preflight_clear_bag = Mock(return_value='清空了')
+        p = Mock(); p.url = 'https://www.apple.com.cn/shop/bag'
+        p.is_closed.return_value = False
+        ab._login_page, ab._ctx = p, Mock()
+        ab._preflight_login = Mock(return_value='订单页探针跑了')
+        return ab
+
+    def test_warmup_success_means_the_order_page_is_never_opened(self):
+        ab = self.buyer()
+
+        def warm(*a):
+            ab.signed_in = True
+            return '结账会话已就绪'
+
+        ab.warm_checkout_session = warm
+        note = ab.prepare(self.URL)
+        ab._preflight_login.assert_not_called()
+        self.assertIn('结账会话已就绪', note)
+
+    def test_warmup_saying_not_signed_in_also_skips_the_order_page(self):
+        """它已经给出结论了，再去翻订单页问一遍没有意义。"""
+        ab = self.buyer()
+
+        def warm(*a):
+            ab.signed_in = False
+            return '⚠️ 结账登录墙没撞掉'
+
+        ab.warm_checkout_session = warm
+        ab.prepare(self.URL)
+        ab._preflight_login.assert_not_called()
+
+    def test_indeterminate_warmup_falls_back_to_the_order_page(self):
+        """读不到 token / 探路加购没进袋时，订单页是唯一不下单也能问出登录态的办法。"""
+        ab = self.buyer()
+        ab.warm_checkout_session = Mock(return_value='读不到 atbtoken，跳过结账预热')
+        ab.prepare(self.URL)
+        ab._preflight_login.assert_called_once()
+
+    def test_warmup_off_keeps_the_order_page_probe(self):
+        ab = self.buyer(preflight_warm_checkout=False)
+        ab.warm_checkout_session = Mock()
+        ab.prepare(self.URL)
+        ab.warm_checkout_session.assert_not_called()
+        ab._preflight_login.assert_called_once()
+
+
+class ParkAfterAttemptRegressions(unittest.TestCase):
+    """结账页 5 分钟不操作就跳「操作超时」，一单结束别把标签留在那儿。"""
+
+    CHECKOUT = 'https://secure7.www.apple.com.cn/shop/checkout?_s=Fulfillment-init'
+    BAG = 'https://www.apple.com.cn/shop/bag'
+
+    def setup(self, url=CHECKOUT, placed=False):
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        ab.order_placed = placed
+        p = Mock(); p.url = url
+        p.is_closed.return_value = False
+        p.goto.side_effect = lambda u, **kw: setattr(p, 'url', u)
+        ab._page = p
+        return ab, p
+
+    def test_a_failed_attempt_leaves_the_tab_off_the_checkout_page(self):
+        ab, p = self.setup()
+        ab._park_after_attempt(p)
+        self.assertEqual(self.BAG, p.url)
+
+    def test_a_possible_order_is_never_navigated_away(self):
+        """order_placed 同时覆盖「成功」和「结果不明」。那一页上有二维码和订单号。"""
+        ab, p = self.setup(placed=True)
+        ab._park_after_attempt(p)
+        self.assertEqual(self.CHECKOUT, p.url)
+        p.goto.assert_not_called()
+
+    def test_an_already_expired_page_is_also_taken_away(self):
+        ab, p = self.setup('https://www.apple.com.cn/shop/sorry/session_expired')
+        ab._park_after_attempt(p)
+        self.assertEqual(self.BAG, p.url)
+
+    def test_pages_elsewhere_are_left_alone(self):
+        ab, p = self.setup('https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A')
+        ab._park_after_attempt(p)
+        p.goto.assert_not_called()
+
+    def test_a_closed_page_never_raises(self):
+        ab, p = self.setup()
+        p.is_closed.return_value = True
+        ab._park_after_attempt(p)
+        p.goto.assert_not_called()
