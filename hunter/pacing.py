@@ -51,6 +51,12 @@ class TokenBucket:
         self.tokens = min(self.burst, self.tokens + (t - self.last) * self.rate)
         self.last = t
 
+    def set_rate(self, per_hour: float) -> None:
+        """换补充速率。**先按旧速率补满到此刻**再换，否则这段时间会按新速率
+        重算，等于凭空多给（或少给）令牌。"""
+        self._refill()
+        self.rate = max(per_hour, 1.0) / 3600.0
+
     def take(self, n: float) -> None:
         """记账：已经发了 n 个请求。允许透支，透支的部分由 wait_for 还回来。"""
         self._refill()
@@ -144,6 +150,12 @@ class Pacer:
     max_scale: float = 8.0
     #: 这么久没被拦就把倍率直接归 1，不再一轮一轮磨。见 on_ok。
     heal_after: float = 600.0
+    #: 看到有货之后，压到 min_interval 冲刺多久。0 = 关掉。见 boost。
+    boost_seconds: float = 180.0
+    #: 冲刺期间的每小时预算。常规预算（220/h ≈ 16.4s 一次）会把冲刺掐死：
+    #: 2026-09-19 22:43 那波实测，冲刺目标 4s，burst 的 20 个令牌只撑了 105 秒，
+    #: 之后就被补充速率按在 14~17s——而那时候货还在，正是最该快的时候。
+    boost_budget_per_hour: float = 900.0
     clock: object = time.monotonic
     sleeper: object = time.sleep
     calendar: object = datetime.now
@@ -151,6 +163,8 @@ class Pacer:
 
     def __post_init__(self):
         self.scale = 1.0
+        self.boost_until = 0.0
+        self._boosted_budget = False
         self.blocks = 0
         self.bucket = TokenBucket(self.budget_per_hour, self.burst, self.clock)
         self.retry_after = 0.0
@@ -182,9 +196,48 @@ class Pacer:
         self.scale = min(self._max_scale, self.scale * self.block_factor)
         self.retry_after = max(self.retry_after, retry_after)
 
+    def boost(self, seconds: float = 0.0) -> float:
+        """看到货了：临时压到 min_interval 冲刺一会儿。返回冲刺到什么时候。
+
+        补货捡漏最难的一段就在这里：`hot_windows` 要求你提前知道几点放货，而补货
+        压根不挑时间。真正可靠的信号是「刚刚有一个型号从无货变有货」——那一刻
+        大概率还有后续，也可能第一单没抢到要马上再来，所以这几分钟值得全速。
+
+        只降间隔、不动预算：令牌桶照常扣，撞上 budget_per_hour 时 next_delay 还是
+        会把人按住。所以冲刺花的是**余额**，不会变成无限刷。
+        """
+        span = self.boost_seconds if seconds <= 0 else seconds
+        if span <= 0:
+            return self.boost_until
+        self.boost_until = max(self.boost_until, self.clock() + span)
+        self._sync_budget()
+        return self.boost_until
+
+    def boosting(self) -> bool:
+        return self.clock() < self.boost_until
+
+    def _sync_budget(self) -> None:
+        """冲刺期间把令牌桶切到冲刺预算，结束后切回来。
+
+        只降间隔不给预算等于没降：桶一空，next_delay 里的 bucket.wait_for
+        会把人按在补充速率上，冲刺目标再低也没用。
+        """
+        want = self.boosting()
+        if want == self._boosted_budget:
+            return
+        self._boosted_budget = want
+        self.bucket.set_rate(self.boost_budget_per_hour if want else self.budget_per_hour)
+        if not want:
+            self.log(f"[节奏] 冲刺结束，预算回到 {self.budget_per_hour:.0f} 次/小时")
+
     def spend(self, requests: float) -> None:
         """这一轮实际发了几个请求，记进预算。"""
         self.bucket.take(requests)
+
+    #: 等令牌时每次至少睡这么久。浮点误差会让 tokens 永远差一丁点儿到不了 1，
+    #: 于是 acquire 用越来越小的间隔空转、永不收敛（确定性时钟下直接死循环，
+    #: 真实时钟靠 time.sleep 的毫秒粒度才蹭过去）。睡够一个下限就一定往前走。
+    MIN_SLEEP = 0.05
 
     def acquire(self) -> None:
         """在每次实际发送请求之前等待并扣除一个令牌。"""
@@ -193,7 +246,7 @@ class Pacer:
             if delay <= 0:
                 self.bucket.take(1)
                 return
-            self.sleeper(min(delay, 30))
+            self.sleeper(min(max(delay, self.MIN_SLEEP), 30))
 
     # ---------- 决策 ----------
 
@@ -208,12 +261,16 @@ class Pacer:
         t = self.base_interval * self.scale
         if not self.is_hot():
             t *= self.cold_multiplier
+        if self.boosting():
+            # 退避优先于冲刺：被拦过就老实按退避后的间隔走，别拿冲刺去顶限流。
+            t = min(t, max(self.min_interval * self.scale, self.min_interval))
         return min(max(t, self.min_interval), self.max_interval)
 
     FLOOR = 0.8
     CEIL = 1.2
 
     def next_delay(self, next_cost: float = 1.0) -> float:
+        self._sync_budget()
         target = self.target()
         delay = min(max(random.uniform(target * self.FLOOR, target * self.CEIL),
                         self.min_interval), self.max_interval)
@@ -229,6 +286,8 @@ class Pacer:
 
     def describe(self) -> str:
         bits = [f"目标 {self.target():.0f}s"]
+        if self.boosting():
+            bits.append(f"冲刺 {self.boost_until - self.clock():.0f}s")
         if self.scale > 1.0:
             bits.append(f"退避 ×{self.scale:.2f}")
         if not self.is_hot():
@@ -263,6 +322,9 @@ def build_pacer(cfg: dict, sprint: bool = False, log=print, **kw) -> Pacer:
         recover_step=float(pc.get("recover_step", 0.25)),
         max_scale=float(pc.get("max_scale", 8)),
         heal_after=float(pc.get("heal_after", 600)),
+        boost_seconds=float(pc.get("boost_seconds", 180)),
+        boost_budget_per_hour=float(pc.get("boost_budget_per_hour",
+                                           pc.get("sprint_budget_per_hour", 900))),
         log=log,
         **kw,
     )

@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from hunter.autobuy import AutoBuy, BuyResult
+from hunter.autobuy import SEL_ADD_TO_CART, AutoBuy, BuyResult
 from hunter.checkout import OrderPlacer
 from hunter.fastpath import Blocked, CartMismatch, FastCheckout, bag_to_checkout, prepare_bag
 from hunter.monitor import BaseWatcher
@@ -162,7 +162,11 @@ class AutoBuyOnlyTests(unittest.TestCase):
             r = self.drive()
         self.assertFalse(r.ok)
         self.assertEqual([self.URL], [c.args[0] for c in self.page.goto.call_args_list])
-        self.page.locator.assert_called_once()  # 唯一的点击是产品页加购
+        # 唯一的点击是产品页加购。断言点击本身，而不是 locator 的调用次数——
+        # 等页面渲染也要用 locator，那一次不点任何东西。
+        self.page.locator.return_value.first.click.assert_called_once()
+        self.assertIn(SEL_ADD_TO_CART,
+                      [c.args[0] for c in self.page.locator.call_args_list])
 
     def test_cart_mismatch_stops_before_checkout(self):
         with patch('hunter.fastpath.bag_to_checkout', side_effect=CartMismatch('wrong SKU')):

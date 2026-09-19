@@ -292,6 +292,8 @@ python3 -m hunter check --location 200000
   "recover_step": 0.25,           // 每成功一轮，退避倍率减多少
   "max_scale": 8,                 // 退避倍率硬上限 ← 真正的等待交给熔断器
   "heal_after": 600,              // 这么久没被拦，退避倍率和熔断档位都归零
+  "boost_seconds": 180,           // 看到有货后压到 min_interval 冲刺多久，0 = 关
+  "boost_budget_per_hour": 900,   // 冲刺期间的预算 ← 不给它就只能快 100 秒
   "cooldowns": [90, 180, 300],    // 第 1/2/3+ 次被拦，该端点分别静默多久
   "availability_every": 6         // 每几轮查一次发货状态，0 = 关掉
 }
@@ -470,6 +472,13 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.pickup_stores` | 门店名显示偏好，兼容老字段 `pickup_store_name`；不限制快车道候选。限制取货门店请配置 `pickup.stores` / `autobuy.pickup_store_numbers` 编号 |
 | `autobuy.pickup_time` | 自提要选的取货时段：`earliest`（默认，最早可选）/ `latest`（最早那天里最晚的一档）/ `"HH:MM"`（当天第一档不早于它的）。见[自提要选「具体时间」了](#自提要选具体时间了2026-09-17-起) |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
+| `autobuy.preflight_warm_checkout` | 空闲期把结账那道登录墙提前撞掉，默认 `false`。**会往购物袋里加一台再清掉**，所以要你明确打开。实测墙一次付清后面全免（跨清袋、跨型号、跨门店），有效期 12~45 分钟，由 10 分钟一次的保活维持；换掉的是放货时 5~20 秒的登录 |
+| `autobuy.preflight_clear_bag` | 空闲期就把袋子清空，默认 `true`。放货那一刻的清袋 + 重开产品页是关键路径上最大的一块固定开销，提前做掉 |
+| `autobuy.login_warn_days` | 登录凭证剩余天数低于它就提前推送，默认 `3`。到期要人工过双重认证，脚本代不了劳 |
+| `autobuy.max_orders` | 最多买几台，默认 `1`。Apple 限购 2，但多买一台是不可逆的花钱动作，必须显式写成 `2` 才会买第二台。结果不明的单**不计入**，而且会挡住后续所有购买 |
+| `autobuy.fast_add_to_cart` | 用 cookie 里的 `atbtoken` 发一个 GET 直接加购，默认 `true`（实测 388ms vs 走产品页 11~28s）。**只在「不折抵 + 不加 AppleCare」时生效**——那两个选项是写死在 URL 参数里的；失败会自动退回产品页 |
+| `autobuy.bag_trust_seconds` | 同型号重试时，距上次尝试多久之内还值得赌「袋里还在」，默认 `600`。赌对省掉一次产品页加载（11~26s），赌错只多花一次 `/shop/bag`（几秒）|
+| `autobuy.candidate_max_age` | 库存观察超过这么多秒就不再拿去下单，默认 `90`。太小会让 `max_attempts_per_stock` 形同虚设 |
 | `autobuy.pickup_store_numbers` | 快车道门店编号，如 `["R581"]`；监控命中时优先使用实际有货的门店编号。仅有门店名不能运行快车道 |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |
 | `autobuy.cdp_url` | 锁定调试端口地址；留空自动探测 |
@@ -524,16 +533,46 @@ GET /shop/buy-iphone/iphone-18-pro/mjt74ch/a
     &acpart=none&atbtoken=8
 ```
 
-**2. 但 `atbtoken` 是有效校验的防自动化令牌。** 用抓来的值发 `fetch` → 返回 200、354KB 的完整页面，但**购物袋没有任何变化**。这个 token 由页面 JS 在点击时现算，不在 DOM 也不在全局变量里。要程序化生成它，就是在绕过这个防护机制——**本项目不做**。
+**2. `atbtoken` 就在 cookie 里，不是页面算的。**（2026-09-19 更正——之前这里
+写的是「由页面 JS 在点击时现算，不在 DOM 也不在全局变量里」，错了。它确实不在
+DOM 也不在全局变量里，因为它在 **cookie** 里。）
 
-**3. 而且发包省不掉网络开销，也绕不过排队：**
+页面 JS 自己就是这么取的：
 
-- 加购本来就只是**一个 GET**。点击和发包都是一个请求，成本完全一样。
-- Apple 的排队和限流做在**边缘层（CDN/WAF）**，拦的是请求本身，不区分你是浏览器点击还是 curl 发包。坑 1 里那个对所有请求恒返 541 的接口就是证据。
+```js
+const t = Is.get("as_atb"), a = (t ? t.split("|") : []).pop(), r = "atbtoken";
+```
 
-**真正的开销在加载产品页那 700KB**——而那页必须加载，因为 `atbtoken` 要靠它的 JS 生成。
+`as_atb` 形如 `1.0|<base64 时间戳>|<40 位十六进制>`，最后一段就是 `atbtoken`。
+读自己会话的 cookie 跟伪造令牌是两回事，性质和 `x-aos-stk` 完全相同——都是
+**服务端发给这个会话、原样回传**。
 
-**所以正解不是换协议，是把页面加载挪到开卖之前**，也就是下面的预热。
+**3. 这条路实测可用，而且快两个数量级。** 空袋状态下读 cookie、发那一个 GET：
+
+```
+加购前：count=0
+GET …/mjye4ch/a?product=MJYE4CH%2FA&purchaseOption=fullPrice&step=select
+                &acpart=none&atbtoken=<cookie 末段>&igt=true&add-to-cart=add-to-cart
+  → 200，落地 …?product=mjye4ch/a&step=attach，**388ms**
+加购后：count=1 skus=['MJYE4CH/A']
+```
+
+对比走产品页：2026-09-19 实测 11.5s 和 28.4s。而且折抵和 AppleCare 就编码在
+`purchaseOption=fullPrice` / `acpart=none` 里，连「等页面水合、点两个单选框」
+都省了——那一步正是 09-19 丢掉两单的地方。
+
+**4. 但 token 是一次性的，而且失败无声。** 同一个 token 隔 5 秒再发一次：返回
+200、页面照常、**袋子纹丝不动**。上面第 2 条里记的那次「200 但购物袋没有任何
+变化」，多半就是用了已消耗的 token，不是被防护拦了。
+
+所以代码里这条路有两条硬规矩（见 `atb_token` / `_fast_add`）：
+
+- **每次现读 cookie**，绝不缓存 token；
+- **加完必须用 `prepare_bag` 复核**，绝不看状态码。没进袋就老实退回产品页那条路。
+
+**5. 发包仍然绕不过边缘层的排队和限流**——Apple 拦的是请求本身，不区分浏览器
+点击还是程序发包。坑 1 里那个对所有请求恒返 541 的接口就是证据。快的是**省掉了
+700KB 产品页**，不是绕过了什么。
 
 #### 顺带验证过的无效路径
 
@@ -996,11 +1035,28 @@ cookie jar（零请求），做一个动作，再读一次，看到期时间戳�
 所以它不是挂几天的风险点——但这条是从前后两次读数推断的，`session-probe` 记录
 `gone` / `reissued` 就是为了直接抓到重铸那一刻。
 
-**3. 登录态只能从渲染后的 DOM 判断。** 购物袋页是 React SPA，fetch 回来的 HTML
-外壳里没有任何账号状态——`data-autom` 账号钩子、`isLoggedIn`、`signIn` 链接、
-「退出登录」字样，四组正则全部零命中。判据得用渲染后的 DOM：账号入口会是指向
-`secureN` 的绝对地址（`https://secure7.www.apple.com.cn/shop/account/home`），
-同时页面上「登录」字样为 0。这跟 shield 那条是同一个教训：**fetch 到的 HTML ≠ 跑完 JS 的页面。**
+**3. 登录态只能从渲染后的 DOM 判断，而且「账号入口」不是判据。** 购物袋页是
+React SPA，fetch 回来的 HTML 外壳里没有任何账号状态——`data-autom` 账号钩子、
+`isLoggedIn`、`signIn` 链接、「退出登录」字样，四组正则全部零命中。这跟 shield
+那条是同一个教训：**fetch 到的 HTML ≠ 跑完 JS 的页面。**
+
+但渲染后的 DOM 也得挑对判据。原来用的是「有指向 `secureN` 的账号入口
+（`https://secure7.www.apple.com.cn/shop/account/home`）且页面上『登录』字样为 0」
+——**这条是错的，2026-09-19 被实测打脸**：登出状态下这个链接照样渲染在导航里，
+点进去才跳 idmsa。于是监控日志一路报「已登录」，人点进订单却被要求登录，而真正
+发现问题的时刻是放货那一秒在结账页上撞见登录墙。
+
+现在的判据分两层：
+
+- **正向证据只认「退出登录」入口**（`signOut` 链接 / `data-autom` / 字样）。
+  账号入口只用来读 `secureN`，不参与判定。
+- **权威结论靠一次真实导航到 `/shop/order/list`**（`verify_signed_in`）。选订单页
+  不是随便挑的：它跟结账要的是**同一级**鉴权，而账号首页在「认得你但没登录」的
+  状态下也可能渲染出来。被弹到 idmsa = Apple 自己给的否定，最硬的证据；
+  既不像登录页也不像订单页 = **判不准**，如实报判不准，**绝不报「已登录」**。
+
+这一趟导航顺带把 `as_dc`(2h) 和 `as_sfa`(180d) 都续了（见上表：两者都只认
+「真实导航 + 跑 JS」），所以保活和验证是同一个动作，不额外花请求。
 
 #### `hunter session-probe`：把猜测变成一张表
 

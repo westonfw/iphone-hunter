@@ -1223,14 +1223,23 @@ JS_LOGIN_DOM = r"""
     const body = document.body ? (document.body.innerText || "") : "";
     const hrefs = [...document.querySelectorAll('a[href]')]
         .map(a => a.getAttribute('href') || "");
-    // 登录后账号入口是指向 secureN 的绝对地址；登出后会变成 signIn/idmsa
+    // 账号入口**不是**登录证据：登出状态下这个链接照样渲染，点进去才跳 idmsa。
+    // 留着它只为读 secureN，判定登录靠 signOut。
     const acct = hrefs.find(h => /\/shop\/account\/home/i.test(h)) || "";
     const signIn = hrefs.find(h => /signIn|idmsa\.apple/i.test(h)) || "";
+    // 退出登录的入口只有真的登录了才会渲染出来——这才是正向证据。
+    const signOut = hrefs.find(h => /signOut|logout|\/shop\/signout/i.test(h)) || "";
+    const outAutom = document.querySelector(
+        '[data-autom*="signOut" i], [data-autom*="logout" i]') ? 1 : 0;
+    const outWords = (body.match(/退出登录|登出|Sign Out/g) || []).length;
     const words = (body.match(/登录|Sign In/g) || []).length;
     const m = acct.match(/^https:\/\/(secure\d+)\./i);
     return {
         acctLink: acct.slice(0, 60),
         signInLink: signIn.slice(0, 60),
+        signOutLink: signOut.slice(0, 60),
+        signOutAutom: outAutom,
+        signOutWords: outWords,
         signInWords: words,
         secureHost: m ? m[1] : "",
         rendered: body.length,
@@ -1242,24 +1251,75 @@ JS_LOGIN_DOM = r"""
 def login_state(page) -> dict:
     """读当前**已渲染**页面的登录态。返回 {signed_in, secure_host, evidence}。
 
-    判据取「有账号入口」且「页面上没有登录字样」，两个都满足才算登录。单看一个
-    都会误判：账号入口可能只是还没渲染出来，而「登录」二字也可能出现在页脚的
-    帮助链接里。拿不准一律当没登录——多登一次只是慢几秒，漏登一次是抢不到。
+    正向证据只认「退出登录」入口（链接 / data-autom / 字样）。**账号入口不算**：
+    登出状态下 `/shop/account/home` 这个链接照样渲染在导航里，点进去才会跳
+    idmsa——原来拿它当判据，于是监控日志报「已登录」，人点进订单却被要求登录，
+    而且放货那一刻才在结账页上撞见登录墙。
+
+    没有正向证据时返回 None（判不准），不返回 False：购物袋页本来就不一定渲染
+    退出入口，把「没看见」当成「没登录」会让保活每轮都去重登。真正的否定结论由
+    `verify_signed_in` 用一次真实导航给出。
     """
     try:
         r = page.evaluate(JS_LOGIN_DOM) or {}
     except Exception as e:
         return {"signed_in": None, "secure_host": "",
                 "evidence": f"探测失败：{type(e).__name__}: {str(e)[:60]}"}
-    signed = bool(r.get("acctLink")) and not r.get("signInWords")
-    return {
-        "signed_in": signed,
-        "secure_host": r.get("secureHost") or "",
-        "evidence": (f"acct={r.get('acctLink') or '无'} "
-                     f"signIn={r.get('signInLink') or '无'} "
-                     f"登录字样={r.get('signInWords')} "
-                     f"渲染={r.get('rendered')}字"),
-    }
+    evidence = (f"acct={r.get('acctLink') or '无'} "
+                f"signOut={r.get('signOutLink') or '无'}/"
+                f"autom={r.get('signOutAutom')}/字样={r.get('signOutWords')} "
+                f"signIn={r.get('signInLink') or '无'} "
+                f"登录字样={r.get('signInWords')} "
+                f"渲染={r.get('rendered')}字")
+    signed_out_marks = (bool(r.get("signOutLink")) or bool(r.get("signOutAutom"))
+                        or bool(r.get("signOutWords")))
+    if signed_out_marks:
+        state = True
+    elif r.get("signInLink") or r.get("signInWords"):
+        state = False
+    else:
+        state = None
+    return {"signed_in": state, "secure_host": r.get("secureHost") or "", "evidence": evidence}
+
+
+#: 订单列表。选它做登录探针不是随便挑的：它跟结账要的是**同一级**鉴权，
+#: 而账号首页在「认得你但没登录」的状态下也可能渲染出来。用户实测过的
+#: 正是这个落差——监控报已登录，点订单却被要求登录。
+ORDER_LIST_PATH = "/shop/order/list"
+
+
+def verify_signed_in(page, base: str, timeout_ms: int = 30000,
+                     settle=None, log=print) -> dict:
+    """真实导航到订单列表，给出**权威**的登录结论。
+
+    返回 {signed_in: True/False/None, secure_host, evidence}。这一趟还顺带续了
+    `as_dc`(2h) 和 `as_sfa`(180d)——两者都只认「真实导航 + 跑 JS」，所以保活和
+    验证是同一个动作，不额外花请求。
+
+    True  = 订单页真的打开了（有退出入口，或页面上出现订单列表的结构）
+    False = 被弹到 signIn / idmsa，这是 Apple 自己给的否定，最硬的证据
+    None  = 导航失败或页面既不像登录页也不像订单页，判不准，绝不报「已登录」
+    """
+    url = base.rstrip("/") + ORDER_LIST_PATH
+    try:
+        page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+    except Exception as e:
+        return {"signed_in": None, "secure_host": "",
+                "evidence": f"打不开订单页：{type(e).__name__}: {str(e)[:60]}"}
+    if settle is not None:
+        settle(page)
+    try:
+        landed = page.url or ""
+    except Exception:
+        landed = ""
+    if is_sign_in(landed):
+        return {"signed_in": False, "secure_host": "",
+                "evidence": f"订单页被弹到登录：{landed[:80]}"}
+    st = login_state(page)
+    st["evidence"] = f"落地={landed[:60]} {st['evidence']}"
+    if st["signed_in"] is None:
+        log(f"[登录探针] 订单页既无退出入口也无登录入口，判不准：{st['evidence']}")
+    return st
 
 
 #: Apple 找不到页面时会 302 到这里，而且它返回 **200**，不是 404 状态码——
@@ -1452,7 +1512,7 @@ class OrderPlacer:
             self.retriable = False
             return False
         fc = FastCheckout(
-            store=self.store_numbers[0],
+            store=self.store_numbers[0], stores=self.store_numbers,
             id_last4=self.id_last4, last_name=self.last_name,
             first_name=self.first_name, email=self.email, phone=self.phone,
             city=self.pickup_city, state=self.pickup_state,
@@ -1464,6 +1524,9 @@ class OrderPlacer:
         try:
             ok, self.fast_stage, self.fast_detail = fc.run(page)
         finally:
+            # 轮换过的话，实际下单的门店跟候选表头不是同一家——通知里必须写对，
+            # 不然人跑错店。
+            self.store_used = getattr(fc, "store_used", "") or self.store_numbers[0]
             # 即使 run 抛异常，也必须先把提交状态带回上层。
             self.fast_ordered = bool(
                 fc.submitted and fc.order_url
@@ -1516,8 +1579,10 @@ class OrderPlacer:
         return ok, self.fast_stage, self.fast_detail, ""
 
     def _ok(self, t0: float, order_id: str) -> tuple[bool, str, str, str]:
+        store = getattr(self, "store_used", "") or ""
         return True, "已创建待付款订单", (
             f"订单号 {order_id or '（页面未解析到，请看标签页）'}。"
-            f"请在付款窗口内自己扫码支付（约 30 分钟，以页面倒计时为准）。"
-            f"总耗时 {time.monotonic() - t0:.1f}s"
+            + (f"取货门店 {store}。" if store else "")
+            + f"请在付款窗口内自己扫码支付（约 30 分钟，以页面倒计时为准）。"
+              f"总耗时 {time.monotonic() - t0:.1f}s"
         ), order_id

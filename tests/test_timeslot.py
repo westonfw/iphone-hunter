@@ -208,10 +208,28 @@ class WizardTests(unittest.TestCase):
         self.assertNotIn("timeSlot", self.body(page, "_a=search"))
 
     def test_old_flow_sends_nothing_extra(self):
-        page, _, ok, stage, _ = self.run_wizard(FUL_PLAIN)
+        """老流程（2026-09-14 的 HAR）整个时段模块都没有。
+
+        现在默认认定「没有时段 = 拿不到这家店的货」并换店，所以要走老流程必须
+        显式 require_slot=False。这个开关存在的唯一理由就是 Apple 万一回退。
+        """
+        page, _, ok, stage, _ = self.run_wizard(FUL_PLAIN, require_slot=False)
         self.assertTrue(ok, stage)
         self.assertNotIn("timeSlot",
                          self.body(page, "continueFromFulfillmentToPickupContact"))
+
+    def test_missing_slot_module_stops_instead_of_burning_step3(self):
+        """没有时段模块时，默认必须当场停住而不是撞进必死的第 3 步。
+
+        2026-09-16 起 9/9 的实测：带着空时段发 continueFromFulfillmentToPickupContact
+        一律返回 200 但没有 pickupContact，白烧一个 10 秒的请求还把状态改脏。
+        """
+        page, _, ok, stage, detail = self.run_wizard(FUL_PLAIN)
+        self.assertFalse(ok)
+        self.assertIn("取货时段", detail)
+        # 关键：第 3 步压根没发出去
+        self.assertFalse([c for c in page.calls
+                          if "continueFromFulfillmentToPickupContact" in c["query"]])
 
     def test_store_that_cannot_be_scheduled_stops_with_a_reason(self):
         """有时段模块、却一档都排不上 = 这家店当下取不了货。继续发包只会换来

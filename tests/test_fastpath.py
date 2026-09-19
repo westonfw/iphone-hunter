@@ -45,7 +45,20 @@ def resp(section, extra=None):
                                     "body": {"checkout": {section: node}}}}
 
 
-FUL = resp("fulfillment")                       # 第 1、2 步
+#: 2026-09-17 起自提必须选具体时段：第 2 步的响应里带着 timeSlot 模块，拿不到
+#: 就是拿不到这家店的货（实测 9/9 会死在第 3 步）。固件按现在的真实形状来，
+#: 老流程（没有这一组）另有 FUL_NO_SLOT 专门覆盖。
+_SLOT = {"checkInStart": "2026-09-18T10:00", "checkInEnd": "2026-09-18T10:15",
+         "displayStart": "10:00 AM", "displayEnd": "10:15 AM",
+         "timeSlotType": "regular", "SlotId": "SLOT-1", "signKey": "SIGN-1",
+         "timeZone": "Asia/Shanghai", "timeSlotValue": "18-10:00-10:15",
+         "isRestricted": False}
+_SLOT_MODEL = {"d": {"dayRadio": "18",
+                     "pickUpDates": [{"dayOfMonth": "18", "date": "2026-09-18"}],
+                     "timeSlotWindows": [{"18": [_SLOT]}]}}
+FUL = resp("fulfillment", {"pickupTab": {"pickup": {
+    "timeSlot": {"dateTimeSlots": _SLOT_MODEL}}}})   # 第 1、2 步
+FUL_NO_SLOT = resp("fulfillment")               # 老流程：整个时段模块都没有
 #: 第 3 步：Apple 按账号预填好姓名/邮箱/电话，身份证后四位留空由用户填
 CONTACT = resp("pickupContact", {"selfPickupContact": {
     "selfContact": {"address": {

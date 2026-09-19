@@ -470,9 +470,14 @@ def cmd_order_state(args) -> int:
     from .purchase_guard import PurchaseGuard
     with PurchaseGuard(ROOT, inspect=True) as guard:
         print(json.dumps(guard.record or {'status': 'none'}, ensure_ascii=False, indent=2))
+        got = guard.bought
+        print(f"已确认到手 {len(got)} 台" + (
+            "：" + "、".join(f"{x.get('part')}@{x.get('store')}" for x in got) if got else ""))
         if args.resolve:
-            guard.finish('resolved')
-            print('已确认人工核对订单，解除自动购买保护。')
+            guard.resolve(bought=args.bought)
+            print('已确认人工核对订单，解除自动购买保护。'
+                  + ('这一单计入已买台数。' if args.bought
+                     else '按「没有建单」处理；如果其实建成了，请改用 --resolve --bought。'))
     return 0
 
 
@@ -546,6 +551,9 @@ def main(argv=None) -> int:
     so = sub.add_parser('order-state', help='查看订单提交记录')
     so.add_argument('--resolve', action='store_true',
                     help='已人工核对订单、确认允许下一次购买后解除保护')
+    so.add_argument('--bought', action='store_true',
+                    help='配合 --resolve：这一单其实建成了，计入已买台数'
+                         '（不加则按「没建单」处理）')
     so.set_defaults(func=cmd_order_state)
 
     scn = sub.add_parser("connect", help="诊断能否挂到你已登录的 Chrome")

@@ -25,15 +25,21 @@ class Offer:
 
 class PurchaseWorker:
     def __init__(self, buyer, report, *, max_age=30, max_attempts=2,
-                 retry_delay=15, warm_url='', log=print, clock=time.monotonic):
+                 retry_delay=15, warm_url='', probe_url='', log=print,
+                 clock=time.monotonic):
         self.buyer, self.report, self.log = buyer, report, log
         self.max_age = max(1, float(max_age))
         self.max_attempts = max(1, int(max_attempts))
         self.retry_delay = max(1, float(retry_delay))
         self.warm_url, self.clock = warm_url, clock
+        #: 结账预热拿哪个型号探路。跟 warm_url 分开：预热产品页可以关着，
+        #: 结账预热照样要有一个型号可用。
+        self.probe_url = probe_url or warm_url
         self.offers = {}
         self.attempts = {}
         self.epochs = {}
+        #: 每个型号已经试过的门店。冒出一家没试过的 = 新机会，重试计数清零。
+        self.tried = {}
         self.cv = threading.Condition()
         self.closed = False
         self.halted = False
@@ -44,24 +50,69 @@ class PurchaseWorker:
 
     def observe(self, part, offers, unavailable=()):
         with self.cv:
-            # 未知/缺失门店撤回候选，但不当成一次新的放货。
+            prev = {k[1] for k in self.offers if k[0] == part}
             self.offers = {k: v for k, v in self.offers.items() if k[0] != part}
-            for store in unavailable:
-                key = part, store
-                self.attempts.pop(key, None)
-                self.epochs[key] = self.epochs.get(key, 0) + 1
             for offer in offers:
                 self.offers[offer.key] = offer
+            live = {o.store for o in offers}
+            tried = self.tried.get(part, set())
+
+            if unavailable and prev and not live:
+                # **明确**报无货：这一轮卖完了，下次放货算全新的一轮。
+                # 注意跟「结果未知」区分——未知只是撤回候选，不能当成新一轮，
+                # 否则接口抖一下就把重试次数刷没了。
+                self.attempts.pop(part, None)
+                self.tried.pop(part, None)
+                self.epochs[part] = self.epochs.get(part, 0) + 1
+            elif live - prev - tried:
+                # 冒出一家没试过的门店：重试计数清零，而且换 epoch——正在跑的
+                # 那一单是拿旧门店表打的，它的结论管不了这家新店。
+                fresh = "、".join(sorted(live - prev - tried))
+                self.attempts.pop(part, None)
+                self.epochs[part] = self.epochs.get(part, 0) + 1
+                self.log(f'[购买] {part} 新增有货门店 {fresh}，重试次数重新计')
             self.cv.notify_all()
 
+    def _targets(self, part, now) -> list:
+        """这个型号当前所有还新鲜的门店候选，按优先级排。
+
+        全都交给买家，让它在**同一个结账会话**里换店（一次 search 就够），
+        而不是回到这里重来一整轮。
+        """
+        return sorted((o for k, o in self.offers.items()
+                       if k[0] == part and now - o.observed <= self.max_age),
+                      key=lambda o: o.priority)
+
+    def _eligible(self, offer, now) -> bool:
+        """这个型号现在能不能打：观察还新鲜、还有重试次数、也过了重试间隔。
+
+        计数按**型号**记，不按门店——一轮尝试内部就会把有货的几家挨个试过，
+        再按门店计数等于把同一轮重复算好几次。
+        """
+        count, after = self.attempts.get(offer.part, (0, -1))
+        return (now - offer.observed <= self.max_age and count < self.max_attempts
+                and offer.observed > after
+                and (count == 0 or now >= after + self.retry_delay))
+
     def _next(self):
+        """挑下一个要打的目标：按优先级取第一个还能打的。
+
+        **不锁型号。** 曾经锁过——理由是换型号要清袋、重加购、重进结账，代价
+        15~30 秒。2026-09-19 查明加购其实是一个带 atbtoken 的 GET（388ms）之后，
+        换型号的净代价降到 **0.4 秒**，那个理由就没了。
+
+        反过来锁定还有害：失败最常见的原因是「拿不到取货时段」，而 select_store
+        已经在一次尝试里把该型号所有有货门店都试过了。既然这个型号全军覆没，
+        再守着它重试大概率还是同样结果，隔壁型号反而可能下得了单。
+
+        留下来的是跟锁无关的那几样：按**型号**计重试次数（一次尝试内部就把门店
+        试遍了，按门店计会重复计数）、一次把所有有货门店交给买家、新门店给新机会。
+        """
         now = self.clock()
         if now < self.cooldown_until:
             return None
         for offer in sorted(self.offers.values(), key=lambda o: o.priority):
-            count, after = self.attempts.get(offer.key, (0, -1))
-            if (now - offer.observed <= self.max_age and count < self.max_attempts
-                    and offer.observed > after and (count == 0 or now >= after + self.retry_delay)):
+            if self._eligible(offer, now):
                 return offer
         return None
 
@@ -91,19 +142,52 @@ class PurchaseWorker:
         if not getattr(self.buyer, 'cfg', {}).get('preflight', True):
             return
         try:
-            note = self.buyer.prepare()
+            note = self.buyer.prepare(self.probe_url)
             if self.buyer.signed_in is not True and note != getattr(self, '_login_note', ''):
-                self.report(BuyResult(False, '请提前检查登录', '', note), '购买就绪检查', '')
+                # wake=True：登录掉了必须当场叫醒。凌晨掉线、早上才发现，
+                # 等于整晚白挂，而重登要人过双重认证，脚本代不了劳。
+                self.report(BuyResult(False, '请提前检查登录', '', note, wake=True),
+                            '购买就绪检查', '')
             self._login_note = note
+            self._warn_login_expiry()
         except Exception as e:
             self._cool_if_blocked(e)
-            from .purchase_guard import PendingOrder
+            from .purchase_guard import PendingOrder, QuotaReached
+            if isinstance(e, QuotaReached):
+                self.halted = True
+                self.log(f'[购买] {e}')
+                return
             if isinstance(e, PendingOrder):
                 self.buyer.order_placed = self.halted = True
             note = str(e)
             if note != getattr(self, '_login_note', ''):
-                self.report(BuyResult(False, '购买就绪检查未通过', '', note), '购买就绪检查', '')
+                self.report(BuyResult(False, '购买就绪检查未通过', '', note, wake=True),
+                            '购买就绪检查', '')
             self._login_note = note
+
+    def _warn_login_expiry(self):
+        """idmsa 的 DES 凭证 15 天到期，到期必须人工过双重认证。
+
+        所以别等它掉——掉的那一刻可能正好是放货前一小时。剩余天数低于
+        `login_warn_days` 就提前喊一次，让人挑个有空的时候重登。读的是 cookie
+        自己的到期时间，零请求。
+        """
+        getter = getattr(self.buyer, 'login_days_left', None)
+        days = getter() if callable(getter) else None
+        if days is None:
+            return
+        limit = float(getattr(self.buyer, 'cfg', {}).get('login_warn_days', 3))
+        if limit <= 0 or days > limit:
+            self._expiry_warned = False
+            return
+        if getattr(self, '_expiry_warned', False):
+            return
+        self._expiry_warned = True
+        self.report(BuyResult(
+            False, '登录快到期了', '',
+            f'登录凭证还有 {days:.1f} 天到期。到期要人工过双重认证，脚本代不了劳'
+            f'——挑个有空的时候手动重登一次，别等放货那天。', wake=True),
+            '购买就绪检查', '')
 
     def _run(self):
         warm_after = 0
@@ -119,7 +203,11 @@ class PurchaseWorker:
                         self.cv.wait(timeout=1)
                         continue
                     offer = self._next()
-                    epoch = self.epochs.get(offer.key, 0) if offer else 0
+                    epoch = self.epochs.get(offer.part, 0) if offer else 0
+                    # 把这个型号**所有**有货的门店一起交出去，让买家在一个结账
+                    # 会话里换店。原来只传命中的那一家，另外几家有货的门店压根
+                    # 没机会试——2026-09-19 22:46 四家同时有货，只试了一家。
+                    live = self._targets(offer.part, self.clock()) if offer else []
                 if offer is None:
                     if self.clock() < self.cooldown_until:
                         with self.cv:
@@ -143,26 +231,38 @@ class PurchaseWorker:
                             self.cv.wait(timeout=1)
                     continue
                 started = self.clock()
-                self.log(f'[购买] {offer.part}/{offer.store}，库存观察距今 '
+                stores = [o.store for o in live] or [offer.store]
+                names = [o.name for o in live] or [offer.name]
+                self.log(f'[购买] {offer.part} @ {"、".join(stores)}，库存观察距今 '
                          f'{started - offer.observed:.1f}s')
                 try:
                     buy = self.buyer.fire if self.buyer.warm_alive else self.buyer.buy
-                    result = buy(offer.url, [offer.name], [offer.store])
+                    result = buy(offer.url, names, stores)
                 except Exception as e:
                     delay = self._cool_if_blocked(e)
                     result = BuyResult(False, '购买流程异常', offer.url,
                                        f'{type(e).__name__}: {e}',
                                        retriable=not delay, retry_after=delay)
+                if result.quota_done:
+                    # 买够了：收工，不是故障。
+                    with self.cv:
+                        self.halted = True
+                    self.log(f'[购买] {result.detail or "已达到订单上限，停止抢购"}')
+                    self.report(result, offer.title, offer.url)
+                    continue
                 with self.cv:
-                    if self.epochs.get(offer.key, 0) == epoch:
-                        count = self.attempts.get(offer.key, (0, 0))[0] + 1
+                    self.tried[offer.part] = self.tried.get(offer.part, set()) | set(stores)
+                    if self.epochs.get(offer.part, 0) == epoch:
+                        count = self.attempts.get(offer.part, (0, 0))[0] + 1
                         if not result.retriable:
                             count = self.max_attempts
-                        self.attempts[offer.key] = count, self.clock()
+                        self.attempts[offer.part] = count, self.clock()
                     self.cooldown_until = max(self.cooldown_until,
                                               self.clock() + result.retry_after)
-                    self.halted = bool(result.ok or self.buyer.order_placed)
-                self.log(f'[购买] {offer.part}/{offer.store}：{result.stage}，'
+                    # 买够了才停。max_orders>1 时一单成功只是「还差几台」，
+                    # 真正的上限由 PurchaseGuard 的配额说了算。
+                    self.halted = bool(self.buyer.order_placed)
+                self.log(f'[购买] {offer.part}：{result.stage}，'
                          f'耗时 {self.clock() - started:.1f}s')
                 try:
                     self.report(result, offer.title, offer.url)

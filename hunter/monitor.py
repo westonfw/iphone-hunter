@@ -130,7 +130,8 @@ class BaseWatcher:
                 url = result.url or url
             self.bc.send(f"{'✅' if result.ok else '⚠️'} 自动下单：{result.stage}",
                          result.detail or '详见终端', url,
-                         critical=True, wake=self.autobuy.order_placed)
+                         critical=True,
+                         wake=self.autobuy.order_placed or result.wake)
 
     def _notify_pay(self, r, hit_title: str) -> None:
         """订单已创建、等待付款——单独发一条，别混在「下单成功」里。
@@ -289,10 +290,11 @@ class StockWatcher(BaseWatcher):
             ab = cfg.get('autobuy') or {}
             self.purchase_worker = PurchaseWorker(
                 self.autobuy, self._report_purchase,
-                max_age=ab.get('candidate_max_age', 30),
+                max_age=ab.get('candidate_max_age', 90),
                 max_attempts=ab.get('max_attempts_per_stock', 2),
                 retry_delay=ab.get('retry_delay', 15),
-                warm_url=self._buy_url(self.parts[0]) if self.warm_enabled else '', log=log)
+                warm_url=self._buy_url(self.parts[0]) if self.warm_enabled else '',
+                probe_url=self._buy_url(self.parts[0]) if self.parts else '', log=log)
 
     def _want_availability(self) -> bool:
         """这一轮要不要顺带查一下发货状态。"""
@@ -378,12 +380,21 @@ class StockWatcher(BaseWatcher):
                         not allowed or s.store_number.upper() in allowed]
             observed = getattr(self.client, "observed_at", {}).get(PICKUP_PATH, time.monotonic())
             preferred = allowed or self.only_stores
-            worker.observe(part, [Offer(
+            live = [Offer(
                 part, s.store_number, s.store_name, self._buy_url(part), label, observed,
                 (self.parts.index(part), preferred.index(s.store_number.upper())
                  if s.store_number.upper() in preferred else len(preferred)))
-                for s in accepted if s.state is Stock.AVAILABLE],
+                for s in accepted if s.state is Stock.AVAILABLE]
+            worker.observe(part, live,
                 [s.store_number for s in accepted if s.state is Stock.UNAVAILABLE])
+            pacer = getattr(self, 'pacer', None)
+            if live and pacer is not None:
+                # 有货就冲刺：补货不挑时间，hot_windows 帮不上忙，而「刚看到货」
+                # 是唯一可靠的提速信号——第一单没抢到时，后续几分钟最值钱。
+                until = pacer.boost()
+                if until:
+                    self.log(f'[{now()}] {label}: 发现有货，巡检冲刺 '
+                             f'{until - time.monotonic():.0f}s（{pacer.describe()}）')
         if not stores:
             self.log(f'[{now()}] {label}: 门店结果为空，保留上次状态')
             return

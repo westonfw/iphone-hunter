@@ -99,12 +99,12 @@ class WorkerTests(unittest.TestCase):
         w, _ = self.make()
         w.observe('P', [self.offer()])
         self.assertIsNotNone(w._next())
-        w.attempts[('P', 'R001')] = (1, 105)
+        w.attempts['P'] = (1, 105)
         self.t = 125
         self.assertIsNone(w._next())
         w.observe('P', [self.offer(at=125)])
         self.assertIsNotNone(w._next())
-        w.attempts[('P', 'R001')] = (2, 126)
+        w.attempts['P'] = (2, 126)
         self.t = 145
         w.observe('P', [self.offer(at=145)])
         self.assertIsNone(w._next())
@@ -114,7 +114,9 @@ class WorkerTests(unittest.TestCase):
 
     def test_unknown_withdraws_candidate_without_resetting_attempts(self):
         w, _ = self.make()
-        w.attempts[('P', 'R001')] = (2, 99)
+        # attempts 和 tried 在生产里永远是一起写的（_run 里同一个临界区），
+        # 固件也得照这个来：试过 R001 才会有 R001 的重试计数。
+        w.attempts['P'], w.tried['P'] = (2, 99), {'R001'}
         w.observe('P', [])
         w.observe('P', [self.offer()])
         self.assertIsNone(w._next())

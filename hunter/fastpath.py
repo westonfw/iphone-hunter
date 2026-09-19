@@ -264,6 +264,61 @@ def _origin_ok(st: dict, want_origin: str, log) -> bool:
     return False
 
 
+#: 加购其实是一个 **GET**，不是 POST（2026-09-19 从 HAR 里挖出来的）：
+#:
+#:   GET /shop/buy-iphone/iphone-18-pro/mjy94ch/a
+#:         ?product=MJY94CH/A&purchaseOption=fullPrice&step=select
+#:         &acpart=none&atbtoken=<40位十六进制>&igt=true&add-to-cart=add-to-cart
+#:   → 303 → …?product=mjy94ch/a&step=attach
+#:
+#: 折抵和 AppleCare 就编码在 purchaseOption / acpart 里——所以这条路连「等页面
+#: 水合、点两个单选框」都不需要。实测空袋加一台 **388ms**，而走产品页是 11~28s。
+ATB_COOKIE = "as_atb"
+
+
+def atb_token(ctx) -> str:
+    """从浏览器的 cookie jar 里读 atbtoken。零请求。
+
+    它不是「页面 JS 在点击时现算」的（README 以前是这么写的，错了），而是
+    cookie `as_atb` 用 `|` 分割后的最后一段。页面 JS 自己就是这么取的：
+
+        const t = Is.get("as_atb"), a = (t ? t.split("|") : []).pop();
+
+    形如 `1.0|<base64 时间戳>|<40 位十六进制>`。读自己会话的 cookie 跟伪造令牌
+    是两回事，性质和 x-aos-stk 完全相同。
+
+    **一次性**：用过的 token 再发一次，服务端返回 200、页面照常、袋子纹丝不动
+    （实测）。所以每次都要现读，而且加完必须复核。
+    """
+    if ctx is None:
+        return ""
+    try:
+        jar = ctx.cookies()
+        if not isinstance(jar, (list, tuple)):
+            return ""
+        for c in jar:
+            if isinstance(c, dict) and str(c.get("name") or "") == ATB_COOKIE:
+                seg = str(c.get("value") or "").split("|")
+                return seg[-1].strip() if seg else ""
+    except Exception:
+        return ""
+    return ""
+
+
+def atb_add_url(buy_url: str, part: str, token: str) -> str:
+    """拼出「加购」那个 GET 的地址。
+
+    路径用小写（HAR 里就是 `/…/mjy94ch/a`），而 `product` 参数用大写原样。
+    """
+    from urllib.parse import quote, urlsplit, urlunsplit
+    u = urlsplit(buy_url)
+    q = ("product=" + quote(part.upper(), safe="")
+         + "&purchaseOption=fullPrice&step=select&acpart=none"
+         + "&atbtoken=" + quote(token, safe="")
+         + "&igt=true&add-to-cart=add-to-cart")
+    return urlunsplit((u.scheme, u.netloc, u.path.lower(), q, ""))
+
+
 def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> dict:
     """确保购物袋里**只有**这次要买的那台。返回 {ok, kept, removed, reason}。
 
@@ -321,6 +376,38 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
     log(f"[快车道] 已清空购物袋（接口删了 {removed} 件，"
         f"{(time.monotonic() - t0) * 1000:.0f}ms，没加载购物袋页）")
     return {"ok": True, "kept": False, "removed": removed}
+
+
+def wait_for_bag_count(page, minimum: int = 1, cap_ms: int = 2000,
+                       step_ms: int = 100) -> float:
+    """轮询购物袋接口，等袋里至少有 minimum 件。返回实际等了多少毫秒。
+
+    替掉加购后那个固定的 600ms：快的时候（通常 100~200ms 就进袋了）立刻往下走，
+    慢的时候多给到 2s，而不是雷打不动睡 600ms——固定睡法快慢两头都不讨好。
+
+    等不到也不报错：调用方紧接着就是 bag_to_checkout，它对空袋本来就有明确处理。
+    """
+    t0 = time.monotonic()
+    deadline = t0 + cap_ms / 1000
+    while True:
+        try:
+            st = page.evaluate(JS_CART_STATE)
+        except Exception:
+            st = {}
+        if not isinstance(st, dict):
+            # 读不到可用的购物袋模型——再轮询也是同样的结果，交给 bag_to_checkout
+            # 去下结论，别在这儿空转。
+            break
+        count = st.get("count")
+        if isinstance(count, int) and count >= minimum:
+            break
+        if time.monotonic() >= deadline:
+            break
+        try:
+            page.wait_for_timeout(step_ms)
+        except Exception:
+            break
+    return (time.monotonic() - t0) * 1000
 
 
 def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
@@ -547,6 +634,16 @@ def slot_label(chosen: dict) -> str:
     return f"{chosen.get('date') or '?'} {when}".strip()
 
 
+def _dedupe(items) -> list[str]:
+    """保序去重，顺手 strip。门店编号列表两头都要用。"""
+    out: list[str] = []
+    for x in items or []:
+        v = str(x or "").strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 class FastCheckout:
     """六步走完结账向导，停在 Review。
 
@@ -560,10 +657,20 @@ class FastCheckout:
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
                  pickup_time: str = "", stk_timeout_ms: int = 15000, log=print,
-                 submit_guard=None, cancelled=None):
+                 submit_guard=None, cancelled=None, stores=None,
+                 require_slot: bool = True, stages=None):
         self.submit_guard = submit_guard
         self.cancelled = cancelled or (lambda: False)
         self.store = (store or "").strip()
+        #: 备选门店，第 2 步排不上取货时**就地**换下一家，不必把整条链路重来。
+        #: 抢手时这一步最要命：一趟重来是十几秒 + 一次重新加购，而换店只是
+        #: 一次 fulfillment 请求。第一家永远是 self.store。
+        self.stores = [x for x in _dedupe([self.store] + list(stores or [])) if x]
+        #: 实际下单用的那家。轮换之后跟 self.store 可能不同，日志和结果都看它。
+        self.store_used = self.store
+        #: 拿不到取货时段就换店、全都拿不到就停。置 False 可退回老流程（无时段
+        #: 也继续），仅在 Apple 回退到 2026-09-17 之前的流程时才需要。
+        self.require_slot = bool(require_slot)
         self.id_last4 = (id_last4 or "").strip()
         self.last_name = (last_name or "").strip()
         self.first_name = (first_name or "").strip()
@@ -721,6 +828,36 @@ class FastCheckout:
     # 免得在还没上这套流程的门店/地区上平白多发一堆字段。
 
     @classmethod
+    def store_availability(cls, data: dict) -> list[tuple[str, bool, str]]:
+        """从第 2 步的响应里读出**结账自己**看到的每店库存。
+
+        返回 [(门店编号, 现在能不能取, 文案)]，顺序是 Apple 给的（按距离）。
+
+        这是 2026-09-19 手录 HAR 挖出来的：一次 `search` 的响应里带着附近 12 家
+        店的 `availability.availableNowForAllLines` 和「目前不可取货」这类文案，
+        按 `storeId`（就是 R359 这种编号）索引。
+
+        意义在于**换店不用再盲试**：原来一家不行就重发一次 search 试下一家，
+        每次 10 秒；现在第一次 search 回来就知道哪几家真有货，直接挑对的那家。
+        而且这是结账侧的口径——监控用的 pickup-message 接口跟它可能不一致
+        （2026-09-18 07:08 和 07:15 同店同型号一败一成，多半就是这个差异）。
+        """
+        out: list[tuple[str, bool, str]] = []
+        seen = set()
+        for node in cls._walk(data, "retailStores"):
+            for store in node.get("retailStores") or []:
+                if not isinstance(store, dict):
+                    continue
+                sid = str(store.get("storeId") or "").strip().upper()
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                av = store.get("availability") or {}
+                out.append((sid, bool(av.get("availableNowForAllLines")),
+                            str(av.get("storeAvailability") or "").strip()))
+        return out
+
+    @classmethod
     def slot_candidates(cls, data: dict) -> list[dict]:
         """把响应里的取货时段摊平成候选列表，保持 Apple 给的先后顺序。
 
@@ -808,22 +945,99 @@ class FastCheckout:
                     "true" if slot.get("recommendationLabel") else "false"))
         return out
 
-    def take_slot(self, data: dict) -> dict:
-        """第 2 步之后挑时段，并把「要选却选不出来」这件事当场说清楚。
+    def select_store(self, page) -> dict:
+        """选门店并挑时段。第一家不行就按**结账侧的库存**精准换，不盲试。
 
-        响应里有时段模块、却一个可选的档位都没有，意味着这家店当下根本排不上
-        取货——这时候继续往下发包只会换来一个 200 却不推进的响应，日志上看着
-        像代码坏了。宁可在这儿停住，把原因写明白。
+        2026-09-18 07:06 那一单就是盲试丢的：冰川蓝色在南京东路、浦东、静安、
+        环球港四家同时放货，我们只试了南京东路（恰好是先卖完的那家），另外三家
+        一家都没试就整条链路重来了。
+
+        现在第一次 search 回来就能看到 12 家的库存，换店只在**结账说有货**的
+        那几家里换；一家都没有就当场停住，把结账自己的说法原样报出来，而不是
+        带着空时段撞进一个必死的第 3 步。
+        """
+        first = self.store
+        data = self.step2_store(page)
+        self.store_used = self.store
+        try:
+            self.take_slot(data)
+            return data
+        except Stalled as e:
+            # except 的变量在块结束时会被 Python 删掉，得换个名字留住它
+            first_miss, first_data = e, data
+        avail = self.store_availability(data)
+
+        ready = [sid for sid, ok, _ in avail if ok]
+        if avail:
+            shown = "、".join(f"{sid}{'✓' if ok else f'({q or "不可取"})'}"
+                              for sid, ok, q in avail[:8])
+            self.log(f"[快车道] 结账侧门店库存：{shown}")
+
+        # 按我们的偏好顺序取「结账说有货」的那几家，首选那家已经试过了
+        nxt = [x for x in self.stores if x in ready and x != self.store]
+        nxt += [x for x in ready if x not in self.stores and x not in nxt]
+        if avail and not ready:
+            raise Stalled(
+                f"结账侧 {len(avail)} 家门店全是「目前不可取货」——这一单已经没货了"
+                f"（监控看到的是 {self.store}，结账不认）")
+        if not nxt:
+            return self._no_store_left(first, first_data, first_miss)
+
+        for i, store in enumerate(nxt):
+            self.store = store
+            data = self.step2_store(page)
+            try:
+                self.take_slot(data)
+            except Stalled as e:
+                self.log(f"[快车道] {store} 结账说有货但排不上时段（{e}）"
+                         + ("，换下一家" if i + 1 < len(nxt) else "，没有下一家了"))
+                if i + 1 < len(nxt):
+                    continue
+                return self._no_store_left(first, first_data, first_miss)
+            self.store_used = store
+            self.log(f"[快车道] 实际下单门店 {store}（首选 {self.stores[0]} 没排上，"
+                     f"按结账侧库存改选）")
+            return data
+        return self._no_store_left(first, first_data, first_miss)
+
+    def _no_store_left(self, store: str, data: dict, why: Stalled) -> dict:
+        """一家都没排上时的收场。
+
+        默认抛出——没有任何「无时段却下单成功」的样本，继续走第 3 步只是白烧
+        一个 10 秒的请求还把服务端状态改脏。require_slot=False 时退回老流程
+        （2026-09-14 那版根本没有时段字段），这个开关只为 Apple 回退时留的。
+        """
+        if self.require_slot:
+            raise why
+        self.store = self.store_used = store
+        self.slot = {}
+        self.log(f"[快车道] ⚠️ 没有门店给出取货时段，按 require_pickup_slot=false "
+                 f"仍用 {store} 继续：{why}")
+        return data
+
+    def take_slot(self, data: dict) -> dict:
+        """第 2 步之后挑时段。挑不出来一律抛 Stalled，交给 select_store 换店。
+
+        **拿不到时段就是拿不到这家店的货。** 2026-09-16 起 11 次记录里，有时段的
+        2 次 step3 全成功，没时段的 9 次 step3 全部「返回 200 但没有 pickupContact」
+        ——一次例外都没有。
+
+        原来这里分两种情况：有 `timeSlotWindows` 却没有可选档位才抛，响应里压根
+        没有这个模块就静默放行。而实际发生的恰恰是后者——于是带着空时段撞进一个
+        必死的第 3 步，白烧一个 10 秒的请求，还把服务端状态改脏了。
         """
         self.slot = self.choose_slot(data)
         if self.slot:
             self.log(f"[快车道] 取货时段 {slot_label(self.slot)}"
                      f"（{self.pickup_time or 'earliest'}）")
-        elif self._walk(data, "timeSlotWindows"):
+            return self.slot
+        if self._walk(data, "timeSlotWindows"):
             raise Stalled(
                 f"门店 {self.store} 要选取货时段，但响应里一个可选的档位都没有"
-                f"——这家店当下排不上取货，换一家或者改时间再试")
-        return self.slot
+                f"——这家店当下排不上取货")
+        raise Stalled(
+            f"门店 {self.store} 的第 2 步响应里没有取货时段模块——这家店当下"
+            f"拿不到货（继续走第 3 步必定空转，已实测 9/9）")
 
     # ---------- 取货人信息 ----------
 
@@ -1163,7 +1377,7 @@ class FastCheckout:
 
         try:
             self.step1_pickup(page)
-            self.take_slot(self.step2_store(page))
+            self.select_store(page)
             contact = self.step3_to_contact(page)
             billing = self.step4_to_billing(page, contact)
 
