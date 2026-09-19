@@ -19,12 +19,11 @@ class InStockStoreRoutingTests(unittest.TestCase):
 
     # ---------- bug 1：白名单静默吃掉有货门店 ----------
 
-    def test_warns_when_a_stocked_store_is_not_whitelisted(self):
+    def test_display_names_do_not_exclude_a_stocked_store(self):
         ab = self.make(pickup_stores=["五角场", "南京东路"])
         out = ab.store_candidates(["静安"])
-        self.assertEqual(["五角场", "南京东路"], out)
-        self.assertTrue(any("静安" in m and "pickup_stores" in m for m in self.logs),
-                        "有货门店被白名单滤掉却不吭声，等于让整单白跑")
+        self.assertEqual(["静安", "五角场", "南京东路"], out)
+        self.assertFalse(any("本单不会去" in m for m in self.logs))
 
     def test_stocked_store_goes_first_when_whitelisted(self):
         ab = self.make(pickup_stores=["五角场", "南京东路", "静安"])

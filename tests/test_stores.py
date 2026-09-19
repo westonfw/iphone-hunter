@@ -37,11 +37,10 @@ class StoreCandidateTests(unittest.TestCase):
         got = ab.store_candidates(["浦东", "五角场"])
         self.assertEqual(["五角场", "浦东"], got[:2])
 
-    def test_stores_outside_the_allowlist_are_not_promoted(self):
+    def test_unmatched_display_name_does_not_hide_in_stock_store(self):
         ab = make({"pickup_stores": self.ALLOW})
         got = ab.store_candidates(["静安"])
-        self.assertNotIn("静安", got)
-        self.assertEqual(self.ALLOW, got)
+        self.assertEqual(["静安"] + self.ALLOW, got)
 
     def test_empty_allowlist_takes_whatever_has_stock(self):
         ab = make({"pickup_stores": []})

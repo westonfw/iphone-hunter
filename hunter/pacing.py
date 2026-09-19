@@ -1,19 +1,7 @@
-"""请求节奏控制：让长时间监控不被 Apple 的边缘节点掐掉。
+"""监控节奏：有界抖动、逐请求令牌预算、端点冷却及逐步恢复。
 
-固定间隔是最好认的机器特征——就算加了 ±30% 抖动，请求时刻仍然一轮一格，
-把时间戳画出来一眼就是机器。这里用四件事叠起来换掉它：
-
-  1. 泊松间隔      —— 间隔服从指数分布（无记忆），形状跟人的点击流一致
-  2. 令牌桶预算    —— 每小时请求数有硬上限。真正决定「能盯多久」的是它，不是间隔
-  3. AIMD 拥塞控制 —— 被拦一次速率减半，之后每成功一轮慢慢加回来（照抄 TCP）
-  4. 冷热时段      —— 平时省着打，只在会放货的时段全速
-
-第 3 点是原来最缺的：老逻辑一次成功就把 fail_streak 清零、立刻满速冲回去，
-于是「拦截 → 退避 → 满速 → 再拦截」来回震荡，越撞越黑。
-
-第 5 件事后来才加：**Breaker**（按端点熔断）。AIMD 管的是「平时该多快」，
-它管的是「已经被拦了该怎么办」——答案不是慢，是**静默**，而且只静默出事的
-那个端点。理由见 Breaker 的文档。
+抖动用于分散请求时刻，不表示真人行为，也不能保证避免限流。
+令牌桶允许 burst 突发；长期平均速率受 budget_per_hour 约束。
 """
 
 from __future__ import annotations
@@ -46,7 +34,7 @@ def in_window(minute: int, window: tuple[int, int]) -> bool:
 
 
 class TokenBucket:
-    """每小时 N 个请求的硬上限，允许攒出一小段突发。
+    """长期平均每小时 N 个请求，允许 burst 个请求的突发。
 
     只算账不睡觉——要等多久由调用方决定，这样才好测。
     """
@@ -112,7 +100,7 @@ class Breaker:
     def ready(self) -> bool:
         return self.left() <= 0.0
 
-    def trip(self) -> float:
+    def trip(self, retry_after: float = 0.0) -> float:
         """这个端点被拦了。返回这次要静默多久。"""
         t = self.clock()
         # 用 trips 而不是 last_block 的真假来判断「之前拦过没有」——单调时钟
@@ -122,8 +110,9 @@ class Breaker:
         self.tier = min(self.tier + 1, len(self.cooldowns) - 1)
         self.last_block = t
         self.trips += 1
-        self.open_until = t + self.cooldowns[self.tier]
-        return self.cooldowns[self.tier]
+        delay = max(self.cooldowns[self.tier], retry_after)
+        self.open_until = max(self.open_until, t + delay)
+        return self.open_until - t
 
     def ok(self) -> None:
         """这个端点通了。
@@ -197,6 +186,15 @@ class Pacer:
         """这一轮实际发了几个请求，记进预算。"""
         self.bucket.take(requests)
 
+    def acquire(self) -> None:
+        """在每次实际发送请求之前等待并扣除一个令牌。"""
+        while True:
+            delay = self.bucket.wait_for(1)
+            if delay <= 0:
+                self.bucket.take(1)
+                return
+            self.sleeper(min(delay, 30))
+
     # ---------- 决策 ----------
 
     def is_hot(self) -> bool:
@@ -212,31 +210,17 @@ class Pacer:
             t *= self.cold_multiplier
         return min(max(t, self.min_interval), self.max_interval)
 
-    #: 最短间隔占目标的比例。不能取 0：真出现 0.2s 的连发反而像脚本。
-    FLOOR = 0.35
-    #: 最长间隔占目标的比例，防止偶尔抽出一个超长空窗把放货错过去。
-    CEIL = 4.0
+    FLOOR = 0.8
+    CEIL = 1.2
 
     def next_delay(self, next_cost: float = 1.0) -> float:
         target = self.target()
-        # 平移指数分布：均值正好是 target，无记忆性，画出来跟人的点击流同形。
-        #
-        # 注意别用「先抽指数再 clamp 到下界」——指数分布有近 30% 的样本落在
-        # 0.35 倍以下，clamp 会把它们全压成同一个值，等于又造出一个固定节拍。
-        # 平移之后下界处没有堆积，上界靠重抽（概率 <0.5%）也不堆。
-        floor = target * self.FLOOR
-        for _ in range(8):
-            delay = floor + random.expovariate(1.0 / (target - floor))
-            if delay <= target * self.CEIL:
-                break
-        else:
-            delay = target * self.CEIL
-        # 预算不够就多等——这一条决定了长跑能跑多久
-        delay = max(delay, self.bucket.wait_for(next_cost))
-        if self.retry_after:
-            delay = max(delay, self.retry_after)
-            self.retry_after = 0.0
-        return min(max(delay, self.min_interval), self.max_interval)
+        delay = min(max(random.uniform(target * self.FLOOR, target * self.CEIL),
+                        self.min_interval), self.max_interval)
+        # max_interval 只限制普通轮询间隔，不能截短服务端或预算要求的等待。
+        delay = max(delay, self.bucket.wait_for(next_cost), self.retry_after)
+        self.retry_after = 0.0
+        return delay
 
     def sleep(self, next_cost: float = 1.0) -> float:
         d = self.next_delay(next_cost)

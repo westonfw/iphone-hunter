@@ -66,7 +66,7 @@ class SubmittedFlagTests(unittest.TestCase):
 
 
 class FakePage:
-    """够 _try_fast_path 用的最小页面：它会在失败后重载结账页。"""
+    """够 _try_fast_path 用的最小页面；失败后不应再导航。"""
 
     url = "https://secure6.www.apple.com.cn/shop/checkout"
 
@@ -135,16 +135,16 @@ class PlaceStopsAfterSubmitTests(unittest.TestCase):
         self.assertTrue(p.no_retry, "结果不明必须禁掉重试，否则下一轮再下一单")
         self.assertIn("已经创建", detail)
 
-    def test_real_rejection_still_falls_back_to_clicking(self):
-        """明确被打回时那一单没建起来，退回点页面是对的——别把这条路一起堵死。"""
+    def test_real_rejection_is_not_unknown(self):
+        """明确被打回应与提交结果未知区分；两者都不会回退网页。"""
         p, got = try_fast(False, "⚠️ 下单被驳回", "不再为本订单提供",
                           "https://secure6.www.apple.com.cn/shop/checkout", True)
         self.assertFalse(got)
         self.assertFalse(p.fast_unknown)
         self.assertFalse(p.no_retry)
 
-    def test_failure_before_submit_still_falls_back(self):
-        """六步中途就没走通（根本没提交）→ 照常退回点页面，行为不能变。"""
+    def test_failure_before_submit_is_not_unknown(self):
+        """六步中途失败仍然是未提交，保留准确状态。"""
         p, got = try_fast(False, "⚠️ 步骤没生效", "search 返回 200 但没推进",
                           "", False)
         self.assertFalse(got)

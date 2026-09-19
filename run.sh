@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
-# 开卖当天的一键启动：盯上架 + 盯库存/门店，两个循环同时跑。
+# 有启用型号时只盯库存；未配置型号时盯上架。显式传 --sprint 才冲刺。
 set -euo pipefail
 cd "$(dirname "$0")"
-
 PY=./.venv/bin/python
-[ -x "$PY" ] || PY=python3     # 没建虚拟环境就退回系统 python（自动下单会不可用）
-
-"$PY" -m hunter launch --sprint &
-LAUNCH_PID=$!
-trap 'kill $LAUNCH_PID 2>/dev/null || true' EXIT
-
-if "$PY" -c "import json,sys; sys.exit(0 if json.load(open('config.json')).get('watch') else 1)" 2>/dev/null; then
-  "$PY" -m hunter watch --sprint
+[ -x "$PY" ] || PY=python3
+if "$PY" -c 'import json,sys; from hunter.monitor import watch_items; sys.exit(0 if watch_items(json.load(open("config.json"))) else 1)'; then
+  exec "$PY" -m hunter watch "$@"
 else
-  echo "config.json 的 watch 还是空的，本次只监控机型上架。"
-  wait $LAUNCH_PID
+  exec "$PY" -m hunter launch "$@"
 fi

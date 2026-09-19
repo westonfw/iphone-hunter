@@ -33,6 +33,7 @@ import random
 import re
 import string
 import time
+from urllib.parse import urlparse
 
 #: 六步用到的字段前缀。写全是为了在出问题时能一眼对上 HAR。
 _FUL = "checkout.fulfillment"
@@ -47,7 +48,7 @@ _BILL = "checkout.billing.billingOptions"
 _INSTALL = f"{_BILL}.selectedBillingOptions.installments.installmentOptions"
 
 #: 被这些状态码拦住就立刻停。跟 checkout.py 里的判断保持一致。
-BLOCK_CODES = (541, 503, 429)
+BLOCK_CODES = (403, 541, 503, 429)
 
 #: 下单那两步（2026-09-14 从真实 HAR 抓到，两次尝试形状一致）：
 #:   POST /shop/checkoutx/review?_a=continueFromReviewToProcess&_m=checkout.review.placeOrder
@@ -89,6 +90,7 @@ async ([path, query, body, stk, callId, modelPage]) => {
         const res = await fetch(url, {
             method: "POST",
             credentials: "include",
+            signal: AbortSignal.timeout(30000),
             headers: {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "*/*",
@@ -117,6 +119,7 @@ async ([path, query, body, stk, callId, modelPage]) => {
                           stalled: Math.round(e.requestStart - e.startTime)};
         } catch (e) {}
         return {status: res.status, json: data, len: text.length,
+                retry_after: res.headers.get("Retry-After"),
                 ms: {head: Math.round(tHead - t0), body: Math.round(tBody - tHead)},
                 net: net};
     } catch (e) {
@@ -137,7 +140,7 @@ async ([path, query, body, stk, callId, modelPage]) => {
 #:
 #: 真实请求体带着购物车条目 id（item-26bb3a43-…），每单都不同、没法写死，
 #: 所以这里发空体试——响应的 head.status/url 会明确告诉我们成没成，
-#: 不成就退回点页面，不需要猜。
+#: 不成就停止本次尝试，不猜测其它结账入口。
 JS_BAG_TO_CHECKOUT = r"""
 async ([path, query, stk]) => {
     const out = {stk: !!stk};
@@ -145,6 +148,7 @@ async ([path, query, stk]) => {
         const res = await fetch(location.origin + path + "?" + query, {
             method: "POST",
             credentials: "include",
+            signal: AbortSignal.timeout(30000),
             headers: {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "*/*",
@@ -157,6 +161,7 @@ async ([path, query, stk]) => {
             body: "",
         });
         out.status = res.status;
+        out.retry_after = res.headers.get("Retry-After");
         const text = await res.text();
         try {
             const j = JSON.parse(text);
@@ -200,8 +205,10 @@ async () => {
     try {
         // 相对地址会跟着当前页的 origin 走。页面停在 secureN 上时，
         // fetch("/shop/bag") 打的是 secureN，读回来是空的——调用方必须校验 origin。
-        const res = await fetch("/shop/bag", {credentials: "include"});
-        return {...parse(await res.text()), origin: location.origin};
+        const res = await fetch("/shop/bag", {credentials: "include", signal: AbortSignal.timeout(30000)});
+        if (!res.ok) return {status: res.status, cart: false, origin: location.origin,
+                             retry_after: res.headers.get("Retry-After")};
+        return {...parse(await res.text()), status: res.status, origin: location.origin};
     } catch (e) {
         return {stk: "", count: null, cart: false, origin: location.origin,
                 error: String(e).slice(0, 80)};
@@ -221,6 +228,7 @@ async ([itemKey, stk]) => {
                                 encodeURIComponent("shoppingCart.items." + itemKey), {
             method: "POST",
             credentials: "include",
+            signal: AbortSignal.timeout(30000),
             headers: {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "*/*",
@@ -236,7 +244,7 @@ async ([itemKey, stk]) => {
         let left = null;
         const m = text.match(/["']bagCount["']\s*:\s*(\d+)/i);
         if (m) left = parseInt(m[1], 10);
-        return {status: res.status, left: left};
+        return {status: res.status, left: left, retry_after: res.headers.get("Retry-After")};
     } catch (e) { return {status: 0, error: String(e).slice(0, 90)}; }
 }
 """
@@ -271,6 +279,7 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
         st = page.evaluate(JS_CART_STATE) or {}
     except Exception as e:
         return {"ok": False, "reason": f"读购物袋状态失败：{type(e).__name__}"}
+    raise_if_blocked(st, "读取购物袋")
     if not _origin_ok(st, want_origin, log):
         return {"ok": False, "reason": "当前页不在主站上，读到的购物袋状态不可信"}
     stk = str(st.get("stk") or "")
@@ -279,6 +288,10 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
     qty = [int(n) for n in (st.get("qty") or []) if isinstance(n, int)]
     want = (want_part or "").upper().strip()
 
+    if not st.get("cart") or st.get("count") is None:
+        return {"ok": False, "reason": "未读到有效购物袋模型，不能当成空袋"}
+    if not items and st.get("count") != 0:
+        return {"ok": False, "reason": "购物袋非空但条目解析失败"}
     if not items:
         log("[快车道] 购物袋本来就是空的，直接加购")
         return {"ok": True, "kept": False, "removed": 0}
@@ -300,6 +313,7 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
         except Exception as e:
             return {"ok": False, "removed": removed,
                     "reason": f"删 {key[:16]}… 失败：{type(e).__name__}"}
+        raise_if_blocked(r, "删除购物袋条目")
         if r.get("status") != 200:
             return {"ok": False, "removed": removed,
                     "reason": f"删 {key[:16]}… 返回 {r.get('status')}"}
@@ -311,7 +325,7 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
 
 def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
                     want_origin: str = "", log=print) -> str:
-    """从购物袋接口直接拿到结账地址。拿不到返回空串，调用方退回点页面。
+    """从购物袋接口直接拿到结账地址。拿不到返回空串，调用方停止本次尝试。
 
     want_part 给了就**强制复核**袋里的型号，对不上抛 CartMismatch——
     宁可这一单不下，也不能买错机器。
@@ -322,14 +336,12 @@ def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
     except Exception as e:
         log(f"[快车道] 读购物袋状态失败：{type(e).__name__}")
         return ""
+    raise_if_blocked(st, "读取购物袋")
     stk, count = str(st.get("stk") or ""), st.get("count")
-    if not stk:
-        log("[快车道] 购物袋页里没读到令牌，退回点页面")
-        return ""
     # 空袋子不能往下走：加购很可能压根没成，这时候进结账只会得到一个空订单
     # 或者莫名其妙的跳转，而且掩盖了「加购失败」这个真正的问题。
     if count == 0:
-        log("[快车道] ⚠️ 购物袋是空的——加购没成？不进结账，退回点页面去查")
+        log("[快车道] ⚠️ 购物袋是空的——加购没成？不进结账，停止本次尝试")
         return ""
     if count is not None and count > BAG_LIMIT:
         log(f"[快车道] ⚠️ 购物袋里有 {count} 件，超过限购 {BAG_LIMIT} 台"
@@ -350,8 +362,14 @@ def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
             f"购物袋里是 {'、'.join(skus)}，这次要买的是 {want}。"
             f"清空购物袋那一步可能没成，或者加购加错了型号。")
     if want and not skus:
-        log(f"[快车道] ⚠️ 购物袋 HTML 里读不到 sku，没法复核型号，退回点页面")
+        log(f"[快车道] ⚠️ 购物袋 HTML 里读不到 sku，没法复核型号，停止本次尝试")
         return ""
+    if not stk:
+        if want and count == 1 and skus == [want] and qty == [want_qty]:
+            raise EntryUnavailable("已核对购物袋，接口入口缺少令牌，需要页面建立结账会话")
+        return ""
+    if want and (not qty or any(n <= 0 for n in qty) or len(qty) != len(skus)):
+        raise CartMismatch("购物袋数量字段不完整，不能确认实际购买数量")
     if count:
         log(f"[快车道] 购物袋 {count} 件 · {'、'.join(skus) or '?'}，型号已复核")
     try:
@@ -364,14 +382,19 @@ def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
         return ""
     url = str(r.get("url") or "")
     dt = (time.monotonic() - t0) * 1000
-    if r.get("status") == 200 and "/shop/checkout" in url:
+    raise_if_blocked(r, "购物袋结账")
+    from .checkout import is_sign_in
+    if r.get("status") == 200 and ("/shop/checkout" in url or is_sign_in(url)):
         log(f"[快车道] 直接从购物袋接口进结账（{dt:.0f}ms，没加载购物袋页）")
         return url
     if EXPIRED_URL in url or "/shop/sorry/" in url:
         # 报成「没给出结账地址」会让人去查购物袋、查令牌，全是白查。
         raise SessionExpired(f"购物袋接口把我们指向「操作超时」页（{url[:60]}）")
+    if (r.get('status') == 200 and want and count == 1 and skus == [want]
+            and qty == [want_qty] and (not url or urlparse(url).path.rstrip('/') == '/shop/bag')):
+        raise EntryUnavailable('购物袋已核对，接口没有建立结账会话，使用页面入口')
     log(f"[快车道] 购物袋接口没给出结账地址（{dt:.0f}ms，"
-        f"status={r.get('status')} head={r.get('head')} url={url[:60] or '无'}），退回点页面")
+        f"status={r.get('status')} head={r.get('head')} url={url[:60] or '无'}），停止本次尝试")
     return ""
 
 
@@ -405,7 +428,22 @@ def encode(pairs: list[tuple[str, str]]) -> str:
 
 
 class Blocked(Exception):
-    """被边缘节点拦了。不重试、不换路径——见模块开头的风险提示。"""
+    """被边缘节点拦了。携带服务端要求的冷却时间。"""
+
+    def __init__(self, message: str, retry_after=0):
+        from .apple import parse_retry_after
+        super().__init__(message)
+        self.retry_after = parse_retry_after(retry_after)
+
+
+def raise_if_blocked(response: dict, action: str) -> None:
+    if response.get('status') in BLOCK_CODES:
+        raise Blocked(f"{action}被拦（{response['status']}）", response.get('retry_after'))
+
+
+
+class EntryUnavailable(Exception):
+    """购物袋已核实，但接口入口未就绪；允许通过购物袋页面建立会话。"""
 
 
 class CartMismatch(Exception):
@@ -521,7 +559,10 @@ class FastCheckout:
                  city: str = "上海", state: str = "上海", district: str = "杨浦区",
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
-                 pickup_time: str = "", stk_timeout_ms: int = 15000, log=print):
+                 pickup_time: str = "", stk_timeout_ms: int = 15000, log=print,
+                 submit_guard=None, cancelled=None):
+        self.submit_guard = submit_guard
+        self.cancelled = cancelled or (lambda: False)
         self.store = (store or "").strip()
         self.id_last4 = (id_last4 or "").strip()
         self.last_name = (last_name or "").strip()
@@ -551,6 +592,8 @@ class FastCheckout:
         self.stk_timeout_ms = int(stk_timeout_ms)
         self.log = log
         self.order_url = ""
+        self.failure_kind = ""
+        self.retry_after = 0.0
         self.stk = ""
         self.billing_option = ""
         self.timings: list[tuple[str, float]] = []
@@ -568,11 +611,18 @@ class FastCheckout:
         self.timings.append((action, dt))
         status = r.get("status")
         if status in BLOCK_CODES:
+            from .apple import parse_retry_after
+            self.retry_after = parse_retry_after(r.get("retry_after"))
             raise Blocked(f"{action} 被拦（{status}）")
         if status != 200:
             raise RuntimeError(f"{action} 返回 {status}"
                                + (f"：{r['error']}" if r.get("error") else ""))
         data = r.get("json") or {}
+        if not isinstance(data, dict):
+            raise Stalled(f"{action} 没有返回结账对象")
+        business_status = (data.get("head") or {}).get("status")
+        if business_status is not None and str(business_status).isdigit() and int(business_status) >= 400:
+            raise Stalled(f"{action} HTTP 200，但业务状态为 {business_status}")
         # 会话过期时服务端照样回 200，跳转写在响应体里（见 follow 的注释）。
         # 这一步必须排在 EXPECT 之前：不然会被报成「响应里没有 xxx 这一节」，
         # 看着像 Apple 改了结构，实际是会话早就没了。
@@ -655,12 +705,12 @@ class FastCheckout:
                           ])
 
     def step6_to_review(self, page, months: int) -> dict:
-        return self._post(page, "/shop/checkoutx/billing", "continueFromBillingToReview",
-                          "checkout.billing", [
-                              (f"{_BILL}.selectBillingOption", self.billing_option),
-                              (f"{_BILL}.bankLookUp.selectBank", ""),
-                              (f"{_INSTALL}.selectInstallmentOption", str(months)),
-                          ])
+        fields = [(f'{_BILL}.selectBillingOption', self.billing_option),
+                  (f'{_BILL}.bankLookUp.selectBank', '')]
+        if months:
+            fields.append((f'{_INSTALL}.selectInstallmentOption', str(months)))
+        return self._post(page, '/shop/checkoutx/billing', 'continueFromBillingToReview',
+                          'checkout.billing', fields)
 
     # ---------- 取货时段 ----------
     #
@@ -882,6 +932,10 @@ class FastCheckout:
     def step7_place_order(self, page) -> str:
         # 发出去之前就置位：请求一旦离开这台机器，订单就可能已经建好了，
         # 而响应有没有回来、回来的是什么，都不改变这件事。
+        if self.cancelled():
+            raise Stalled("购买流程已停止，未提交订单")
+        if self.submit_guard is not None:
+            self.submit_guard.submitted(store=self.store)
         self.submitted = True
         data = self._post(page, PLACE_PATH, PLACE_ACTION, PLACE_MODULE, [])
         return str(((data.get("head") or {}).get("data") or {}).get("url") or "")
@@ -990,10 +1044,10 @@ class FastCheckout:
         `/shop/checkout/status`（处理中），而 Apple 的订单确认邮件**已经到了**。
         按老写法这会被判成「被驳回」，然后退回点页面再下一单。
         """
-        bare = (url or "").split("?")[0]
-        if not bare:
-            return True                       # 一次跳转都没拿到
-        return "/shop/checkout/status" in bare  # 轮询用尽还停在「处理中」
+        if not cls.order_rejected(url):
+            return False
+        # 只有明确返回结账向导才视为驳回；登录、错误页等都不能证明订单没建。
+        return urlparse(url or "").path.rstrip("/") != "/shop/checkout"
 
     # ---------- 从响应里挖选项 ----------
 
@@ -1028,12 +1082,14 @@ class FastCheckout:
         **不能写死**：实测是 `installments0001321713` 这种 ID，随会话/商品变。
         认的是 labelImageAlt（页面上那个银行 logo 的 alt 文字）。
         """
-        for obj in self._walk(data, "labelImageAlt"):
-            alt = str(obj.get("labelImageAlt") or "")
-            val = str(obj.get("value") or "")
-            if val and (self.payment_label in alt or alt in self.payment_label):
-                return val
-        return ""
+        options = [(str(obj.get('labelImageAlt') or '').strip(), str(obj.get('value') or ''))
+                   for obj in self._walk(data, 'labelImageAlt')]
+        exact = {val for alt, val in options if alt == self.payment_label and val}
+        if len(exact) == 1:
+            return exact.pop()
+        partial = {val for alt, val in options if alt and val and
+                   (self.payment_label in alt or alt in self.payment_label)}
+        return partial.pop() if len(partial) == 1 else ''
 
     def find_installment(self, data: dict, months: int) -> int:
         """找分期期数。选项形如 {"value": 24, "label": "24 期"}。"""
@@ -1046,7 +1102,7 @@ class FastCheckout:
                     continue
         if months in best:
             return months
-        return 0 if not best else max(best)
+        return 0
 
     # ---------- 编排 ----------
 
@@ -1074,7 +1130,19 @@ class FastCheckout:
             page.wait_for_timeout(200)
 
     def run(self, page) -> tuple[bool, str, str]:
-        """跑完六步。返回 (是否到 Review, 阶段, 说明)。**不下单。**"""
+        try:
+            return self._run(page)
+        finally:
+            if self.submitted and self.submit_guard is not None:
+                # 跳回 checkout 也不能作为无订单的证明；都保留提交记录待核对。
+                status = 'confirmed' if not self.order_rejected(self.order_url) else 'unknown'
+                try:
+                    self.submit_guard.finish(status, self.order_url)
+                except OSError as e:
+                    self.log(f'[订单记录] 更新失败，保留提交前记录：{e}')
+
+    def _run(self, page) -> tuple[bool, str, str]:
+        """执行同源结账；按 place_order 决定是否创建待付款订单。"""
         t0 = time.monotonic()
         # 后台标签页会被 Chrome 降网络优先级、还会挨 timer 节流。抢购这几十秒
         # 全花在等服务端上，没理由让浏览器自己再给它打个折。
@@ -1089,7 +1157,7 @@ class FastCheckout:
         if not self.stk:
             return False, "⚠️ 读不到 x-aos-stk", (
                 "结账页里没找到令牌——可能不在结账页上，或者 Apple 改了内联 JSON 的写法。"
-                "退回点页面的老路。")
+                "本次尝试已停止。")
         self.log(f"[快车道] 令牌就位（{len(self.stk)} 字符，等了 "
                  f"{(time.monotonic() - t0) * 1000:.0f}ms），开始六步")
 
@@ -1109,11 +1177,15 @@ class FastCheckout:
             self.log(f"[快车道] 付款方式 {self.payment_label} → {self.billing_option}")
 
             opts = self.step5_select_bank(page)
-            months = self.find_installment(opts, self.installment_months)
-            if not months:
-                return False, "⚠️ 没找到可用的分期期数", "第 5 步的响应里没有分期选项。"
-            if months != self.installment_months:
-                self.log(f"[快车道] ⚠️ 没有 {self.installment_months} 期，改用 {months} 期")
+            months = 0
+            if self.installment_months > 0:
+                months = self.find_installment(opts, self.installment_months)
+                if not months:
+                    return False, '⚠️ 没有所配置的分期期数', (
+                        f'服务端没有提供 {self.installment_months} 期，未擅自更改付款条件。')
+            elif (self.billing_option.startswith('installments')
+                  or self._walk(opts, 'selectInstallmentOption')):
+                return False, '⚠️ 付款配置不一致', '所选方式需要分期，请明确配置期数。'
             self.step6_to_review(page, months)
 
             if self.place_order:
@@ -1146,7 +1218,7 @@ class FastCheckout:
                             f"请去浏览器里看结账页上的提示。")
                     return True, "✅ 待付款订单已创建", (
                         f"跳转到 {final}。"
-                        f"请在约 30 分钟内自己扫码支付——**本工具不代付款**。")
+                        f"请尽快按订单页面显示的期限扫码支付——**本工具不代付款**。")
         except KeyboardInterrupt:
             # KeyboardInterrupt 是 BaseException，下面的 except Exception 接不住它——
             # 而最该喊一嗓子的恰恰是这一刻。submitted 在发包**之前**就置位，为的
@@ -1161,19 +1233,23 @@ class FastCheckout:
                          "确认，别急着再下一单。")
             raise
         except SessionExpired as e:
+            self.failure_kind = "session_expired"
             return False, "⚠️ 结账会话已过期", (
                 f"{e}。**在这条链路上重试没有意义**——要重新登录、"
                 f"从购物袋重新走一遍。（Apple 的结账会话 5 分钟没交互就作废。）")
         except Stalled as e:
+            self.failure_kind = "stalled"
             return False, "⚠️ 步骤没生效", (
                 f"{e}。已经改动过的服务端状态和页面可能不一致，"
-                f"调用方需要重新加载结账页再接管。")
+                f"本次尝试已停止，不再自动操作页面。")
         except Blocked as e:
+            self.failure_kind = "blocked"
             return False, "⚠️ 结账被限流", (
                 f"{e}。这是 Akamai 的拦截，不是页面问题——**别重试**，"
                 f"越撞退避越深。见 README 坑 9。")
         except Exception as e:
-            return False, f"⚠️ {type(e).__name__}", f"{e}。退回点页面的老路。"
+            self.failure_kind = "error"
+            return False, f"⚠️ {type(e).__name__}", f"{e}。本次尝试已停止。"
 
         total = time.monotonic() - t0
         detail = " / ".join(f"{a} {d * 1000:.0f}ms" for a, d in self.timings)

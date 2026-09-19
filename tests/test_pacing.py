@@ -140,7 +140,7 @@ class PacerTests(unittest.TestCase):
         self.assertTrue(all(30 * p.FLOOR <= d <= 30 * p.CEIL for d in delays))
 
     def test_average_delay_tracks_the_target(self):
-        # clamp 式抖动会把均值压偏，平移指数分布不会——这是间隔配置还算不算数的前提
+        # 未触及上下限时，有限均匀抖动的平均值应接近目标
         p, _ = self.make()
         delays = [p.next_delay(0) for _ in range(20000)]
         self.assertAlmostEqual(30, sum(delays) / len(delays), delta=1.5)

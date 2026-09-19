@@ -94,7 +94,7 @@ class PaymentAlertTests(unittest.TestCase):
         (title, body, url), kw = self.fire()
         self.assertIn("iPhone 18 Pro Max 256GB 银色", body)
         self.assertIn("招商银行 24 期", body)
-        self.assertIn("30 分钟", body)
+        self.assertIn("以订单页面为准", body)
 
     def test_links_to_checkout_not_the_product_page(self):
         # 点错了会跳去再买一台
@@ -110,7 +110,7 @@ class PaymentAlertTests(unittest.TestCase):
         self.w.cfg["autobuy"]["installment_months"] = 0
         (title, body, url), kw = self.fire()
         self.assertIn("招商银行", body)
-        self.assertNotIn("期", body.split("\n")[1])
+        self.assertNotIn("24 期", body)
 
 
 class WatchEnabledTests(unittest.TestCase):
@@ -219,7 +219,7 @@ class PickupCoolingDownTests(unittest.TestCase):
         self.assertIsNone(self.w.state.get("pickup:PART"))
         self.assertTrue(any("熔断中" in line for line in self.w.logs))
 
-    def test_cooling_down_falls_back_to_availability(self):
+    def test_cooling_down_does_not_increase_optional_query_rate(self):
         """静默期里 availability 要顶上，不能整轮空转。
 
         它从没被拦过（同期 89 次请求 0 次 541），是这段时间唯一的信息源。
@@ -229,8 +229,8 @@ class PickupCoolingDownTests(unittest.TestCase):
         self.w.run()
         self.w.run()
 
-        self.assertEqual(2, self.avail_calls)
-        self.assertEqual(2, len(self.buyable))
+        self.assertEqual(1, self.avail_calls)
+        self.assertEqual(1, len(self.buyable))
 
     def test_normal_round_still_skips_availability(self):
         """没熔断时 availability 照旧降频，别把预算白花一半。"""

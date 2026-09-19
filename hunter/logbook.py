@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import threading
 from datetime import date, datetime
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class DailyFile:
         self.suffix = suffix
         self.day: date | None = None
         self.fp = None
+        self.lock = threading.RLock()
         self.broken = ""   # 第一次写失败的原因，报一次就不再吵
 
     def path_for(self, day: date | None = None) -> Path:
@@ -70,6 +72,10 @@ class DailyFile:
         return self.fp
 
     def write(self, text: str) -> bool:
+        with self.lock:
+            return self._write(text)
+
+    def _write(self, text: str) -> bool:
         if not text:
             return True
         try:
@@ -83,6 +89,10 @@ class DailyFile:
             return False
 
     def close(self) -> None:
+        with self.lock:
+            self._close()
+
+    def _close(self) -> None:
         if self.fp is not None:
             try:
                 self.fp.close()
@@ -103,7 +113,16 @@ class Tee:
         self.stream = stream
         self.sink = sink
         self.echo = echo
+        self.local = threading.local()
         self.buf = ""
+
+    @property
+    def buf(self):
+        return getattr(self.local, "buffer", "")
+
+    @buf.setter
+    def buf(self, value):
+        self.local.buffer = value
 
     def write(self, s) -> int:
         s = s if isinstance(s, str) else str(s)

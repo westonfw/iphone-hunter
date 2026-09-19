@@ -8,7 +8,7 @@
   检查订单           进入 Review
   Review             确认下单 → 待付款/扫码
 
-加购必须在预热页点（atbtoken）。结账主机 secureN 是探出来的，不写死。
+加购通过页面点击生成 atbtoken；结账只走同源快车道，失败立即返回。
 绝不代付：不填支付密码、不确认 Apple Pay；信用卡路径上不点确认下单。
 """
 
@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from .apple import REGIONS
 
@@ -1323,17 +1322,15 @@ def watch_checkout_block(page, log=None, ctx=None) -> dict:
     """
     state: dict = {"hits": [], "retry_after": 0.0}
     seen: set = set()
+    hooked = []
 
     def on_resp(r):
         try:
             if CHECKOUTX_PATH not in r.url:
                 return
-            if r.status in (541, 503, 429):
-                ra = 0.0
-                try:
-                    ra = float((r.headers or {}).get("retry-after") or 0)
-                except (TypeError, ValueError):
-                    ra = 0.0
+            if r.status in (403, 541, 503, 429):
+                from .apple import parse_retry_after
+                ra = parse_retry_after((r.headers or {}).get('retry-after'))
                 state["hits"].append({"status": r.status, "url": r.url[:110],
                                       "retry_after": ra})
                 state["retry_after"] = max(state["retry_after"], ra)
@@ -1349,6 +1346,7 @@ def watch_checkout_block(page, log=None, ctx=None) -> dict:
         seen.add(id(p))
         try:
             p.on("response", on_resp)
+            hooked.append(p)
         except Exception:
             pass
 
@@ -1360,6 +1358,19 @@ def watch_checkout_block(page, log=None, ctx=None) -> dict:
             ctx.on("page", hook)      # 结账开的新标签也要接住
         except Exception:
             pass
+    def close():
+        for p in hooked:
+            try:
+                p.remove_listener('response', on_resp)
+            except Exception:
+                pass
+        if ctx is not None:
+            try:
+                ctx.remove_listener('page', hook)
+            except Exception:
+                pass
+        hooked.clear()
+    state['close'] = close
     return state
 
 
@@ -1368,19 +1379,20 @@ class OrderPlacer:
     #: 而且不报错、只是静默选不中——所以宁可不走快车道，也不拿名字去赌。
     STORE_NO = re.compile(r"^R\d{2,5}$", re.I)
 
-    def __init__(self, *, region: str = "cn", pickup_stores: list[str] | None = None,
+    def __init__(self, *, region: str = "cn",
                  store_numbers: list[str] | None = None,
                  payment: str = "支付宝", delivery: str = "pickup",
                  id_last4: str = "", last_name: str = "", first_name: str = "",
                  email: str = "", phone: str = "", installment_months: int = 0,
                  secure_host: str = "", stop_at_review: bool = False,
-                 fast_path: bool = False, place_order: bool = True,
+                 fast_path: bool = True, place_order: bool = True,
                  pickup_city: str = "上海",
                  pickup_state: str = "上海", pickup_district: str = "杨浦区",
-                 pickup_time: str = "", timeout_ms: int = 30000, log=print):
+                 pickup_time: str = "", timeout_ms: int = 30000, log=print,
+                 submit_guard=None, cancelled=None):
+        self.submit_guard = submit_guard
+        self.cancelled = cancelled
         self.region = region
-        # 可接受的取货门店，按优先级排。监控命中时会把「真有货的那几家」放在前面。
-        self.pickup_stores = [x.strip() for x in (pickup_stores or []) if x and x.strip()]
         # 只留真正长得像编号的，顺序去重
         self.store_numbers: list[str] = []
         for x in (store_numbers or []):
@@ -1399,9 +1411,7 @@ class OrderPlacer:
         self.secure_host = (secure_host or "").strip()
         #: 走到 Review 页就停，不点「立即下单」。测试整条链路时用。
         self.stop_at_review = bool(stop_at_review)
-        #: 用 6 个同源 POST 代替点页面走完向导（见 fastpath.py）。
-        #: 失败会自动退回点页面的老路，所以打开它不会让情况变糟。
-        self.fast_path = bool(fast_path)
+        # fast_path 参数仅为旧调用兼容；结账始终使用同源请求。
         #: 快车道走到 Review 后要不要直接提交。提交只创建待付款订单，
         #: 付款始终由人完成；信用卡路径在 fastpath 里还有一道硬拒。
         self.place_order_flag = bool(place_order)
@@ -1409,10 +1419,9 @@ class OrderPlacer:
         self.pickup_state = pickup_state
         self.pickup_district = pickup_district
         #: 想要哪一档取货时段：earliest（默认）/ latest / "HH:MM"。
-        #: 点页面和快车道两条路都认它，行为保持一致。
+        #: 按服务端返回的时段模型选择。
         self.pickup_time = (pickup_time or "").strip()
-        #: 快车道是否已经把订单创建出来了。place() 靠它决定还要不要再点页面——
-        #: 漏判会导致重复点「立即下单」，那比慢几秒严重得多。
+        #: 服务端是否已经确认创建订单；与 Review 和结果未知分别处理。
         self.fast_ordered = False
         #: 快车道把「立即下单」那一发**送出去了**，但没拿到明确结论。
         #: 这跟「下单失败」不是一回事：订单可能已经建好了，所以**什么都不能再点**。
@@ -1420,260 +1429,91 @@ class OrderPlacer:
         #: 这次失败值不值得下一轮再试。调用方（AutoBuy）读它来定 retriable。
         #: 「结果不明」时必须是 False——重试就是再下一单。
         self.no_retry = False
+        self.retriable = True
+        self.blocked = False
+        self.retry_after = 0.0
+        self.fast_stage = ""
+        self.fast_detail = ""
+        self.result_url = ""
         #: 撞上了「操作超时」页。跟 no_retry 正好相反：会话过期时订单**肯定没建**，
         #: 所以该重试——但得先重新登录，在死会话上重试多少次都一样。
         self.session_expired = False
         self.timeout_ms = timeout_ms
         self.log = log
-        #: watch_checkout_block() 返回的那个 dict，由 enter() 挂上。
-        #: 被拦之后所有「再试一个」的分支都要看它——换地址解决不了限流。
-        self.blocked: dict = {}
-
-    def enter(self, ctx, page) -> Any:
-        self.blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
-        xhr = try_bag_checkout_xhr(page)
-        if xhr.get("blocked"):
-            self.log(f"[下单] ⚠️ 结账接口被拦（{xhr['blocked']}），不再试其它路径")
-            self.blocked.setdefault("hits", []).append(
-                {"status": xhr["blocked"], "url": "bagx", "retry_after": 0.0})
-        if xhr.get("stk"):
-            self.log("[下单] 页面里读到了 x-aos-stk，已用同源请求试结账")
-        else:
-            self.log("[下单] 页面里没有 x-aos-stk，跳过伪造，改为直跳结账页")
-        if xhr.get("goto"):
-            self.log("[下单] 接口给出结账地址，直跳")
-            page.goto(xhr["goto"], timeout=self.timeout_ms, wait_until="domcontentloaded")
-            return page
-
-        seen = []
-        try:
-            seen = [p.url for p in ctx.pages]
-        except Exception:
-            pass
-        cands = checkout_candidates(self.region, self.secure_host, seen)
-
-        last = page
-        for i, url in enumerate(cands, 1):
-            if self.blocked and self.blocked.get("hits"):
-                # 被限流时换主机是没用的：拦截在边缘层，对所有 secureN 一视同仁。
-                # 继续把剩下几个候选撞一遍，只会把退避撞得更深。
-                self.log(f"[下单] ⚠️ 已被边缘节点拦截，停止尝试剩余 "
-                         f"{len(cands) - i + 1} 个结账地址——换主机解决不了限流")
-                break
-            self.log(f"[下单] 直跳结账（{i}/{len(cands)}，不加载购物袋页）：{url}")
-            landed = self._goto_checkout(ctx, page, url)
-            if is_sign_in(getattr(landed, "url", "")):
-                # 换主机解决不了没登录。立刻交回上层去走登录流程，
-                # 否则剩下几个候选每个都要空等 on_checkout 超时。
-                self.log("[下单] 被重定向到登录页——不是主机的问题，先去登录")
-                return landed
-            if on_checkout(landed):
-                host = secure_host_of(landed.url)
-                if host and host != self.secure_host:
-                    self.secure_host = host
-                    self.log(f"[下单] 结账主机记为 {host}")
-                return landed
-            last = landed
-        self.log("[下单] 几个结账地址都没进到向导，退回购物袋点结账")
-        return last
-
-    def _goto_checkout(self, ctx, page, url: str):
-        """跳到某个结账地址。Apple 有时会在新标签页打开，两种都接住。"""
-        try:
-            with ctx.expect_page(timeout=4000) as info:
-                page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
-            nxt = info.value
-            try:
-                nxt.wait_for_load_state("domcontentloaded", timeout=8000)
-            except Exception:
-                pass
-            return nxt
-        except Exception:
-            try:
-                page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
-            except Exception as e:
-                self.log(f"[下单] 跳转失败：{str(e)[:70]}")
-            return page
 
     def _try_fast_path(self, page) -> bool:
-        """先试发包走完向导。成功返回 True（页面已刷到 Review）。
-
-        失败一律返回 False 让调用方退回点页面——快车道是**优化**不是依赖，
-        任何一步对不上都不该让整单挂掉。
-        """
+        """唯一的结账实现；失败保留原始结论，不刷新、不点击页面。"""
         from .fastpath import FastCheckout
+        self.fast_stage = "⚠️ 快车道未完成"
+        self.fast_detail = ""
         if not self.store_numbers:
-            self.log("[快车道] 没有门店编号（配置里给的是名字？），跳过，走点页面的老路")
+            self.fast_stage = "⚠️ 缺少取货门店编号"
+            self.fast_detail = "请配置 pickup_store_numbers 或由库存监控提供门店编号。"
+            self.retriable = False
             return False
         fc = FastCheckout(
             store=self.store_numbers[0],
             id_last4=self.id_last4, last_name=self.last_name,
-            first_name=self.first_name,
-            # 只在账号没预填联系方式时才用得上，见 FastCheckout.contact_fields
-            email=self.email, phone=self.phone,
+            first_name=self.first_name, email=self.email, phone=self.phone,
             city=self.pickup_city, state=self.pickup_state,
             district=self.pickup_district, pickup_time=self.pickup_time,
             payment_label=self.payment, installment_months=self.installment_months,
-            # stop_at_review 是硬闸门：它打开时快车道走到 Review 就停，
-            # 跟点页面那条路的行为保持一致，不能出现「点页面会停、发包却下单」。
             place_order=self.place_order_flag and not self.stop_at_review,
+            submit_guard=self.submit_guard, cancelled=self.cancelled,
             log=self.log)
-        ok, stage, detail = fc.run(page)
-        self.log(f"[快车道] {stage}：{detail}")
-        self.fast_ordered = bool(
-            ok and fc.order_url and not FastCheckout.order_rejected(fc.order_url))
-        #: 提交发出去了、却没拿到明确结论。这时候**不能**退回点页面：
-        #: 2026-09-18 07:15 那单六步全 200、订单邮件都到了，而轮询 9 轮仍是
-        #: 「处理中」——按老逻辑会去点页面再下一单。
-        self.fast_unknown = bool(
-            fc.submitted and not self.fast_ordered
-            and FastCheckout.order_unknown(fc.order_url))
-        if self.fast_unknown:
-            self.fast_detail = detail
-            return False
-        if not ok:
-            # 快车道可能已经推进过服务端状态，而页面 DOM 还停在原来那一步。
-            # 不刷新就退回点页面，等于对着一个状态错位的页面点——实测会变成
-            # 「反复点同一个继续按钮、URL 一直是 Fulfillment-init」的死循环。
-            self._reload_checkout(page)
-            return False
-        if self.fast_ordered:
-            return True          # 订单已创建，后面不用再点页面
-        # 六步只改了服务端状态，页面还停在第一步——刷到 Review 让后面的流程接手
         try:
-            host = secure_host_of(page.url) or self.secure_host
-            base = f"https://{host}" if host else REGIONS.get(self.region, REGIONS["cn"])
-            page.goto(f"{base}/shop/checkout?_s=Review",
-                      timeout=self.timeout_ms, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
-        except Exception as e:
-            self.log(f"[快车道] 刷到 Review 页失败：{type(e).__name__}，退回点页面")
-            return False
-        return "review" == step_key(page.url) or "Review" in (page.url or "")
-
-    def _reload_checkout(self, page) -> None:
-        """把结账页重新加载一遍，让 DOM 跟服务端状态对齐。"""
-        try:
-            host = secure_host_of(page.url) or self.secure_host
-            base = f"https://{host}" if host else REGIONS.get(self.region, REGIONS["cn"])
-            page.goto(f"{base}/shop/checkout", timeout=self.timeout_ms,
-                      wait_until="domcontentloaded")
-            page.wait_for_timeout(1200)
-            self.log("[下单] 已重新加载结账页，让页面和服务端状态对齐")
-        except Exception as e:
-            self.log(f"[下单] 重新加载结账页失败：{type(e).__name__}: {str(e)[:60]}")
+            ok, self.fast_stage, self.fast_detail = fc.run(page)
+        finally:
+            # 即使 run 抛异常，也必须先把提交状态带回上层。
+            self.fast_ordered = bool(
+                fc.submitted and fc.order_url
+                and not FastCheckout.order_rejected(fc.order_url))
+            if self.fast_ordered:
+                self.result_url = urljoin(page.url, fc.order_url)
+            self.fast_unknown = bool(
+                fc.submitted and not self.fast_ordered
+                and FastCheckout.order_unknown(fc.order_url))
+            self.no_retry = bool(self.fast_unknown or (fc.submitted and self.submit_guard is not None
+                                                        and not self.fast_ordered))
+            kind = getattr(fc, "failure_kind", "")
+            self.blocked = kind == "blocked"
+            self.retry_after = getattr(fc, "retry_after", 0.0)
+            self.session_expired = kind == "session_expired" and not fc.submitted
+            self.retriable = not self.no_retry and kind != "blocked"
+        self.log(f"[快车道] {self.fast_stage}：{self.fast_detail}")
+        if ok and not self.fast_ordered:
+            # 仅把已经完成的 Review 展示给人，不自动接管页面操作。
+            fc.show_review(page)
+        return ok
 
     def place(self, page, t0: float) -> tuple[bool, str, str, str]:
-        if self.fast_path:
+        if is_session_expired(page.url):
+            self.session_expired = True
+            return False, "⚠️ 结账会话已过期", (
+                "会话已失效（interactionMs 是页面的交互期限），请重新登录后再尝试。"), ""
+        if is_sign_in(page.url):
+            return False, "⚠️ 卡在登录页", "请先在浏览器里完成登录。", ""
+        if self.delivery != "pickup":
+            self.retriable = False
+            return False, "⚠️ 快车道仅支持到店取货", "delivery 必须为 pickup。", ""
+        try:
+            ok = self._try_fast_path(page)
+        except Exception as e:
+            ok = False
+            self.fast_stage = "⚠️ 快车道异常，已停止"
+            self.fast_detail = f"{type(e).__name__}: {e}"
+        if self.fast_unknown:
+            self.no_retry = True
+            return False, "⚠️ 下单结果不明，已停手", (
+                self.fast_detail + " 订单可能已经创建，请查看订单列表；不会再次提交。"), ""
+        if self.fast_ordered:
+            # thankyou 的导航/渲染失败不能抹掉服务端已经确认的订单结果。
             try:
-                if self._try_fast_path(page):
-                    if self.fast_ordered:
-                        # 订单已经创建，别再让点页面那条路去点一次「立即下单」
-                        return self._ok(t0, snapshot(page).get("order") or "")
-                    self.log(f"[快车道] 已到 Review（{time.monotonic() - t0:.1f}s）")
-                elif self.fast_unknown:
-                    # **这条路必须在这里断掉。** 「立即下单」已经发出去了，
-                    # 订单可能已经建好；再往下走点页面那条路，就是对着一个
-                    # 可能已经成单的会话再点一次「立即下单」。
-                    self.no_retry = True
-                    self.log("[下单] 提交已送出但结果不明，停手不再点页面，"
-                             "以免重复下单")
-                    return False, "⚠️ 下单结果不明，已停手", (
-                        getattr(self, "fast_detail", "")
-                        or "提交发出去了但没拿到结论，订单可能已经创建。"
-                    ), ""
-            except Exception as e:
-                self.log(f"[快车道] 异常，退回点页面：{type(e).__name__}: {str(e)[:70]}")
-                if self.fast_unknown:
-                    # 异常发生在提交之后，同样不能重试
-                    self.no_retry = True
-                    return False, "⚠️ 下单结果不明，已停手", (
-                        f"提交之后出错（{type(e).__name__}），订单可能已经创建，"
-                        f"请去邮箱或订单列表确认。"), ""
-        deadline = time.monotonic() + max(180.0, self.timeout_ms / 1000 * 4)
-        last = "还在结账向导里"
-        last_key = None
-        acted_at = 0.0
-        #: 同一步连续点了多少次还没翻页。点不动就是点不动，空转到 180s 超时
-        #: 只会让人盯着日志干等，还可能把同一个动作重复提交给服务端。
-        stuck = 0
-        #: 冷却提到 12s 之后，5 次就是 60s 的空转，太久。真点不动 3 次足够判定。
-        STUCK_LIMIT = 3
-
-        first = True
-        while time.monotonic() < deadline:
-            # 第一轮不睡：进到这里时页面已经是结账向导了，白等 400ms 没有意义
-            if not first:
-                try:
-                    page.wait_for_timeout(POLL_MS)
-                except Exception:
-                    pass
-            first = False
-            snap = snapshot(page)
-            key = snap.get("key") or ""
-
-            if snap.get("expired"):
-                # 会话作废了。**这一页上什么都别点**：连登录框都没有，
-                # 每一次点击只是对着一个死掉的会话空转。交给上层去重新登录。
-                self.session_expired = True
-                return False, "⚠️ 结账会话已过期", (
-                    f"被扔到「操作超时」页（{snap.get('url', '')[:60]}）。"
-                    f"Apple 的结账会话 5 分钟没交互就作废（模型里的 interactionMs=300000），"
-                    f"要重新登录、从购物袋重新走一遍。"), ""
-            if snap.get("signIn"):
-                return False, "⚠️ 卡在登录页", "结账被登录墙拦住，先在这个 Chrome 里登录 Apple ID。", ""
-            if looks_unpaid(snap):
-                return self._ok(t0, snap.get("order") or "")
-
-            # 刚点过这一步，等 URL 切到下一步，避免连点
-            if key == last_key and acted_at and \
-                    time.monotonic() - acted_at < STEP_COOLDOWN_S:
-                continue
-
-            if key in ("fulfillment", ""):
-                last = self._step_fulfillment(page, snap)
-                if last.startswith("⚠️"):
-                    return False, last, (
-                        "没能切到到店取货，已停住——再往下点会下成送货订单。"
-                        "请在页面上手动选「我要取货 → 门店」。"), ""
-            elif key == "pickupcontact":
-                ok, last = self._step_contact(page, snap)
-                if not ok:
-                    return False, "⚠️ 卡在取货人信息", last, ""
-            elif key in ("billing", "invoice"):
-                last = self._step_billing(page, snap)
-                if last.startswith("⚠️"):
-                    return False, last, "请改选支付宝或微信后再点检查订单。", ""
-            elif key == "review" and self.stop_at_review:
-                return True, "已到 Review 页（按配置停住，未下单）", (
-                    f"stop_at_review=true，没有点「立即下单」，购物袋里的货还在。"
-                    f"要真下单把 config.json 的 autobuy.stop_at_review 改回 false。"
-                    f"总耗时 {time.monotonic() - t0:.1f}s"), ""
-            elif key == "review":
-                last = self._step_review(page, snap)
-                if last.startswith("⚠️"):
-                    return False, last, "当前不像扫码支付，确认下单会走卡授权，已停住。", ""
-            else:
-                last = self._step_unknown(page, snap, key)
-
-            stuck = stuck + 1 if key == last_key else 0
-            if stuck >= STUCK_LIMIT:
-                return False, "⚠️ 卡在同一步点不动", (
-                    f"同一步连点 {stuck} 次仍然没翻页（{last}，_s="
-                    f"{snap.get('step') or key or '?'}）。页面和服务端状态很可能对不上，"
-                    f"请手动接管这个结账页。"), ""
-            last_key = key
-            acted_at = time.monotonic()
-            self.log(f"[下单] {last}  （_s={snap.get('step') or key or '?'}）")
-
-        snap = snapshot(page)
-        if looks_unpaid(snap):
-            return self._ok(t0, snap.get("order") or "")
-        return False, "⚠️ 没能创建订单", (
-            f"{last}。请在打开的结账页手动走完："
-            f"自提 → 身份证后四位 → 付款方式 → 检查订单 → 确认下单。"
-            f"当前 {snap.get('url', '')[:90]}"
-        ), ""
+                order = snapshot(page).get("order") or ""
+            except Exception:
+                order = ""
+            return self._ok(t0, order)
+        return ok, self.fast_stage, self.fast_detail, ""
 
     def _ok(self, t0: float, order_id: str) -> tuple[bool, str, str, str]:
         return True, "已创建待付款订单", (
@@ -1681,362 +1521,3 @@ class OrderPlacer:
             f"请在付款窗口内自己扫码支付（约 30 分钟，以页面倒计时为准）。"
             f"总耗时 {time.monotonic() - t0:.1f}s"
         ), order_id
-
-    def _step_fulfillment(self, page, snap: dict) -> str:
-        if self.delivery != "pickup":
-            hit = click_continue(page)
-            return f"送货后点了「{hit or snap.get('continueText') or '继续'}」"
-
-        state = self._switch_to_pickup(page)
-        if state == "gone":
-            # 分段控件不在了 = 已经不在这一步。什么都别点，让外层循环重新判步骤；
-            # 在下一步的页面上乱点会把流程弹回来。
-            return "已离开配送步骤，等下一轮重新判断"
-        if state != "ok":
-            # 绝不能往下点「继续」：那个按钮还是送货那栏的，
-            # 一点就把订单推成了 3-5 个工作日送货，而且不会报错。
-            return "⚠️ 没能切到「我要取货」"
-
-        picked = self._click_store(page)
-        self._pick_time_slot(page)
-        hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "fulfillment")
-        where = f"门店「{picked}」" if picked else "门店（未自动选中）"
-        if hit == MOVED_ON:
-            return f"已选好{where}，页面已进入下一步"
-        if not hit:
-            return f"⚠️ 选好{where}了，但没等到可点的「继续」按钮"
-        return f"自提 + {where} 后点了「{hit or snap.get('continueText') or '继续'}」"
-
-    def _switch_to_pickup(self, page) -> str:
-        """切到「我要取货」并等门店列表渲染出来。返回 ok / gone / fail。
-
-        点击本身是生效的（实测 el.click() 有用），慢的是它后面那个异步请求：
-        门店列表要 ~1.5s 才出来。原来点完不等就往下走，「继续」抓到的还是
-        送货那栏的按钮，一点就把订单推成送货，二十轮全卡在这个竞态上。
-
-        gone = 分段控件不在了，说明已经翻页到下一步，调用方什么都别点。
-        """
-        deadline = time.monotonic() + PICKUP_READY_MS / 1000
-        st: dict = {}
-        acted_at = 0.0
-        toggles = 0
-        while time.monotonic() < deadline:
-            try:
-                st = page.evaluate(JS_PICKUP_STATE)
-            except Exception:
-                page.wait_for_timeout(250)
-                continue
-            if not st.get("hasSeg"):
-                return "gone"
-            if st.get("listed"):
-                self.log("[下单] 已切到「我要取货」，门店列表已就绪")
-                return "ok"
-
-            idle = time.monotonic() - acted_at
-            if not st.get("on") and idle > 2.5:
-                # 还没切过去，点一下。点了就生效，别连点——会打断它的异步加载。
-                page.evaluate(JS_SEG_CLICK, "我要取货")
-                acted_at = time.monotonic()
-            elif st.get("on") and idle > 3.5 and toggles < 2:
-                # 样式显示已选中、门店列表却一直不来：页面刚加载完就被点过，
-                # 视觉状态变了但那次点击没触发取门店的请求。来回切一次逼它重发。
-                self.log("[下单] 取货已选中但门店列表没来，切回送货再切回来试一次")
-                page.evaluate(JS_SEG_CLICK, "为我送货")
-                page.wait_for_timeout(900)
-                page.evaluate(JS_SEG_CLICK, "我要取货")
-                acted_at = time.monotonic()
-                toggles += 1
-            page.wait_for_timeout(250)
-
-        self.log(f"[下单] ⚠️ {PICKUP_READY_MS / 1000:.0f}s 内没能切到取货态"
-                 f"（选中={st.get('on')} 列表={st.get('listed')}），"
-                 "已停住不往下点——继续点会变成送货订单")
-        return "fail"
-
-    def _click_store(self, page) -> str:
-        """按优先级挨个试，点中第一家就停。绝不「兜底选第一家」——选错店比没选更糟。
-
-        门店条目是 <label for=radio>，而且 innerText 为空、只有 textContent 有内容，
-        所以不能用通用的 click_text，得单独按 textContent 匹配。
-        标着「目前不可取货」的门店会跳过，选中了也结不了账。
-        """
-        if not self.pickup_stores:
-            return ""
-        try:
-            r = page.evaluate(JS_PICK_STORE, list(self.pickup_stores)) or {}
-        except Exception as e:
-            self.log(f"[下单] 选门店出错：{str(e)[:80]}")
-            return ""
-
-        if r.get("clicked"):
-            how = "本来就选中的" if r.get("already") else "已点选"
-            self.log(f"[下单] 取货门店「{r['clicked']}」（{how}）")
-            return r["clicked"]
-        if r.get("skipped"):
-            self.log(f"[下单] ⚠️「{r['skipped']}」当前标着不可取货，没有选它")
-        seen = r.get("seen") or []
-        self.log(f"[下单] 没找到这几家里的任何一家：{'、'.join(self.pickup_stores)}"
-                 + (f"（页面上有 {len(seen)} 家：{seen[:3]}）" if seen else "（页面上没有门店列表）"))
-        return ""
-
-    def _pick_time_slot(self, page) -> str:
-        """选取货时段。返回选中的那档（没有这一步就返回空串）。
-
-        2026-09-17 起自提要选具体时间，不选就点不动「继续」——外层只会看到
-        「没等到可点的继续按钮」，完全看不出是缺了这一步。
-
-        下拉框是选完门店之后由服务端那一趟回来才渲染的，所以要等；但**不能傻等满**：
-        没有这一步的流程（2026-09-14 之前就是）里它永远不会出现，等满就是在放货
-        那一刻白扔几秒。所以「页面上连日期单选都没有、而继续已经可点」就立刻不等了。
-        """
-        deadline = time.monotonic() + SLOT_WAIT_MS / 1000
-        switched = 0
-        while time.monotonic() < deadline:
-            try:
-                r = page.evaluate(JS_PICK_TIMESLOT, self.pickup_time) or {}
-            except Exception as e:
-                self.log(f"[下单] 选取货时段出错：{str(e)[:80]}")
-                return ""
-            if r.get("picked"):
-                how = "本来就选中的" if r.get("already") else "已选"
-                self.log(f"[下单] 取货时段「{r['picked'].strip()}」（{how}）")
-                return r["picked"].strip()
-            if r.get("switched"):
-                # 这一天排满了，JS 已经点到下一天，等它重渲染再看。
-                switched += 1
-                if switched > 4:
-                    self.log("[下单] ⚠️ 连着几天都没有可选的取货时段，交给页面")
-                    return ""
-                page.wait_for_timeout(600)
-                continue
-            if r.get("none"):
-                self.log("[下单] ⚠️ 这家店没有可选的取货时段——它当下排不上取货")
-                return ""
-            # absent：还没渲染出来，或者这一版流程根本不用选时段。
-            # 日期单选都没有 + 继续已经可点 = 没有这一步，别再等了。
-            # 反过来，日期单选在就说明有这一步，哪怕继续看着可点也得等下拉出来——
-            # 不选就点继续，校验不过又不报错，外层要等满一个 12s 冷却才会重来。
-            try:
-                if not r.get("hasDays") and snapshot(page).get("continueEnabled"):
-                    return ""
-            except Exception:
-                pass
-            page.wait_for_timeout(250)
-        self.log(f"[下单] ⚠️ {SLOT_WAIT_MS / 1000:.0f}s 内没等到取货时段的下拉框，"
-                 f"当作没有这一步继续往下走")
-        return ""
-
-    def _step_contact(self, page, snap: dict) -> tuple[bool, str]:
-        # 别信刚翻页时那一眼的 snapshot：字段是异步渲染的，早读一步就是「没有」，
-        # 于是身份证没填就点了继续，校验默默不过，外层只好一轮轮重试。
-        state = wait_for_field(page, ID_NATIONAL, STEP_WAIT_MS)
-        if state == "empty":
-            if not re.fullmatch(r"[0-9]{3}[0-9X]", self.id_last4):
-                return False, (
-                    "取货需要身份证后四位。在 config.json 的 autobuy.id_last4 填 4 位"
-                    "（最后一位可以是 X），再跑一次。"
-                )
-            if not fill_field(page, ID_NATIONAL, self.id_last4, log=self.log):
-                return False, "找到了身份证后四位输入框，但没能填进去，请在页面上手动填。"
-            self.log("[下单] 已填身份证后四位")
-        elif state == "missing":
-            self.log("[下单] 这一步没有身份证后四位字段，跳过")
-
-        # config 里的姓名/邮箱/手机只是**兜底**：账号已经带出来的那份才是 Apple
-        # 认的（取货还要跟证件对得上），页面上已经有值就别去顶掉它。
-        # 快车道那条路同样的规矩，见 FastCheckout.contact_fields。
-        for elem_id, val in ((ID_LAST_NAME, self.last_name),
-                             (ID_FIRST_NAME, self.first_name),
-                             (ID_EMAIL, self.email),
-                             (ID_PHONE, self.phone)):
-            if val and wait_for_field(page, elem_id, FIELD_PEEK_MS) == "empty":
-                fill_field(page, elem_id, val, log=self.log)
-
-        hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "pickupcontact")
-        if hit == MOVED_ON:
-            return True, "取货人信息已填好，页面已进入下一步"
-        if not hit:
-            snap2 = snapshot(page)
-            if snap2.get("continueEnabled") is False:
-                return False, (
-                    "「继续」是灰的：姓名/电话/身份证后四位可能没填全。"
-                    "可在 autobuy 里补 pickup_last_name / pickup_first_name / pickup_phone。"
-                )
-        return True, f"取货人信息后点了「{hit or '继续'}」"
-
-    def _step_billing(self, page, snap: dict) -> str:
-        """选付款方式 + 期数，然后点「检查订单」。
-
-        这一步最容易出现「我以为点了、系统认为没点」：选中银行会触发一次
-        重渲染，把刚点上的期数冲掉；DOM 里 radio 是 checked 的，提交时却按
-        没选处理，页面纹丝不动只在上方冒一条「请从以下支付方式中选择一种
-        进行付款。」。所以每次点完都复核，并且以页面的提示为准重试。
-        """
-        why = ""
-        for attempt in range(3):
-            # 第二轮起强制「弹开再选回来」：DOM 已经是选中的，再点一次不会
-            # 派发 change，应用层收不到任何信号，光重选是没用的。
-            if not self._fill_billing(page, force_change=attempt > 0):
-                return "⚠️ 没能选中付款方式"
-
-            if card_would_charge(snapshot(page), self.payment):
-                return "⚠️ 停在付款页（信用卡会立刻扣款）"
-
-            # 必须**先提交再读提示**。页面上那条「请选择付款方式」是上一次
-            # 提交失败留下的，不重新提交它就一直在——只读不交会一直读到旧消息，
-            # 三轮全在原地打转。
-            hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "billing")
-            if hit == MOVED_ON:
-                return "付款方式已选好，页面已进入下一步"
-            why = self._billing_error(page)
-            if not why:
-                return f"付款方式后点了「{hit or '检查订单'}」"
-            self.log(f"[下单] 提交后页面提示「{why}」"
-                     f"（第 {attempt + 1}/3 次），重新选一遍再交")
-            page.wait_for_timeout(600)
-        return f"⚠️ 付款方式没能提交：{why}"
-
-    def _fill_billing(self, page, force_change: bool = False) -> bool:
-        """选银行 + 选期数，两个都复核到真的选中为止。"""
-        if not self._click_payment(page, force_change=force_change):
-            return False
-        # 选中银行会展开它那一组期数并重渲染；不等稳就点期数，会被冲掉
-        wait_settled(page, log=self.log)
-        if self.installment_months:
-            ok, why = self._choose_installment(page, force_change=force_change)
-            if not ok:
-                self.log(f"[下单] ⚠️ {why}")
-                return False
-        return True
-
-    def _billing_error(self, page) -> str:
-        try:
-            return page.evaluate(JS_FORM_ERROR, list(BILLING_COMPLAINTS)) or ""
-        except Exception:
-            return ""
-
-    def _select(self, page, elem_id: str, label: str, already: bool,
-                kind: str = "", force_change: bool = False) -> bool:
-        """选中一个 radio 并确认它真的留住了。最多试 3 次。
-
-        每次点之前都先等页面安静。重渲染途中点下去，DOM 上会变成 checked、
-        应用层却完全没收到——表现就是「两个都显示已选中，页面还说没选」。
-
-        force_change=True 时，即使 DOM 上已经是选中的也要**弹开再选回来**：
-        对一个已经 checked 的 radio 再点一次不会派发 change 事件，应用层
-        收不到任何信号。这是上一条症状唯一的解法。
-        """
-        for attempt in range(3):
-            if already and attempt == 0 and not force_change \
-                    and self._stays_checked(page, elem_id):
-                self.log(f"[下单] 「{label}」本来就选中的")
-                return True
-            wait_settled(page, log=self.log)
-            if force_change or already:
-                self._bounce(page, elem_id, kind, label)
-            if not click_label(page, elem_id, self.timeout_ms // 3 or 8000):
-                self.log(f"[下单] 点不到「{label}」的选项（第 {attempt + 1} 次）")
-                continue
-            if self._stays_checked(page, elem_id):
-                return True
-            self.log(f"[下单] 「{label}」点上又被冲掉了，等稳再点（第 {attempt + 1} 次）")
-            already = False
-        return False
-
-    def _bounce(self, page, elem_id: str, kind: str, label: str) -> None:
-        """先选同组里的另一个选项，制造一次真实的 change。"""
-        if not kind:
-            return
-        try:
-            other = page.evaluate(JS_SIBLING_OPTION, [elem_id, kind])
-        except Exception:
-            other = ""
-        if not other:
-            return
-        if click_label(page, other, 4000):
-            self.log(f"[下单] 「{label}」已选中但没提交上去，先弹到别的选项再选回来")
-            page.wait_for_timeout(500)
-
-    def _stays_checked(self, page, elem_id: str, ms: int = 1500) -> bool:
-        """点完之后盯一会儿，确认这个 radio 没被重渲染冲掉。"""
-        if not elem_id:
-            return True
-        deadline = time.monotonic() + ms / 1000
-        while time.monotonic() < deadline:
-            page.wait_for_timeout(250)
-            try:
-                st = page.evaluate(JS_IS_CHECKED, elem_id)
-            except Exception:
-                return False
-            if st is not True:
-                return False
-        return True
-
-    def _click_payment(self, page, force_change: bool = False) -> str:
-        """选付款方式。先试配置指定的那个，再回落到扫码付名单。
-
-        不能把两者并成一次匹配：匹配是按 DOM 顺序取第一个命中的，
-        支付宝排在最前面，一起传就等于永远选支付宝。
-        """
-        wait_for_field(page, "checkout.billing.billingoptions.alipay",
-                       STEP_WAIT_MS)
-        for wants in ([self.payment], [w for w in SCAN_PAY if w != self.payment]):
-            try:
-                r = page.evaluate(JS_PICK_PAYMENT, list(wants)) or {}
-            except Exception as e:
-                self.log(f"[下单] 选付款方式出错：{str(e)[:80]}")
-                return ""
-            if r.get("refusedCard"):
-                self.log(f"[下单] ⚠️「{r['refusedCard']}」匹配到的是信用卡选项，"
-                         "没有点它——那条是即时扣款")
-                return ""
-            if r.get("clicked"):
-                if not self._select(page, r["id"], r["clicked"], r.get("already"),
-                                    kind="pay", force_change=force_change):
-                    return ""
-                self.log(f"[下单] 支付方式：{r['clicked']}")
-                return r["clicked"]
-            self.log(f"[下单] 没匹配到「{'、'.join(wants)}」，"
-                     f"页面上有：{r.get('seen')}")
-        return ""
-
-    def _choose_installment(self, page, force_change: bool = False) -> tuple[bool, str]:
-        """选分期期数。返回 (能不能往下走, 说明)。
-
-        银行分期**必须**选期数：默认一个都不选，不选就点「检查订单」页面
-        纹丝不动，而且不报错。所以这里选不中要挡住，不能放过去。
-        """
-        want = self.installment_months
-        try:
-            r = page.evaluate(JS_PICK_TERM, str(want)) or {}
-        except Exception as e:
-            return False, f"选分期期数出错：{str(e)[:70]}"
-
-        if r.get("none"):
-            return True, ""   # 这个付款方式没有分期期数（比如支付宝），正常
-        if r.get("clicked"):
-            if not self._select(page, r["id"], r["clicked"][:10], r.get("already"),
-                                kind="term", force_change=force_change):
-                return False, f"「{want} 期」反复被重置，页面可能还在加载"
-            self.log(f"[下单] 分期期数：{r['clicked']}")
-            return True, ""
-        return False, (f"没找到「{want} 期」，这家银行只有：{r.get('seen')}。"
-                       "改 config.json 的 autobuy.installment_months")
-
-    def _step_review(self, page, snap: dict) -> str:
-        if card_would_charge(snap, self.payment):
-            return "⚠️ 停在下单页（信用卡会立刻扣款）"
-        hit = continue_when_ready(page, STEP_WAIT_MS, self.log, "review")
-        if hit == MOVED_ON:
-            return "Review 页已翻过去"
-        return f"Review 确认下单：{hit or '没等到可点的下单按钮'}"
-
-    def _step_unknown(self, page, snap: dict, key: str) -> str:
-        if snap.get("hasCheckOrder"):
-            hit = click_text(page, "检查订单") or click_continue(page)
-            return f"未知步骤 {key or '?'}，点了检查订单：{hit}"
-        if snap.get("hasPlace"):
-            hit = click_text(page, "立即下单", "现在下单", "确认下单") or click_continue(page)
-            return f"未知步骤 {key or '?'}，点了确认下单：{hit}"
-        hit = click_continue(page)
-        return f"未知步骤 {key or '?'}，点了继续：{hit or '无按钮'}"

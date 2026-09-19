@@ -100,8 +100,8 @@ class OptionLookupTests(unittest.TestCase):
     def test_finds_requested_installment(self):
         self.assertEqual(24, placer().find_installment(MONTHS["json"], 24))
 
-    def test_falls_back_to_longest_when_requested_absent(self):
-        self.assertEqual(24, placer().find_installment(MONTHS["json"], 36))
+    def test_refuses_to_change_months_when_requested_absent(self):
+        self.assertEqual(0, placer().find_installment(MONTHS["json"], 36))
 
     def test_zero_when_no_options(self):
         self.assertEqual(0, placer().find_installment({}, 24))
@@ -233,11 +233,11 @@ class StalledStepTests(unittest.TestCase):
         self.assertIn("billing", detail)
         self.assertEqual(4, len(page.calls))
 
-    def test_detail_tells_caller_to_reload(self):
-        """状态可能已经被改过，调用方必须重新加载页面再接管。"""
+    def test_detail_reports_stop_without_page_fallback(self):
+        """状态不一致就停止，不再通过刷新和点击尝试挽救。"""
         page = FakePage([FUL, FUL, FUL, BANKS, MONTHS, REVIEW])
         _, _, detail = placer().run(page)
-        self.assertIn("重新加载", detail)
+        self.assertIn("本次尝试已停止", detail)
 
     def test_happy_path_passes_the_same_check(self):
         page = FakePage(list(HAPPY))
@@ -485,7 +485,7 @@ class BagToCheckoutTests(unittest.TestCase):
     """跳过加载购物袋页直接进结账。服务端侧这一段只要 ~2.2s，
     而「加载 259KB 购物袋页 → 等安静 → 找按钮 → 点」要 ~8s。
     请求体带着每单不同的购物车条目 id，没法写死，所以发空体试——
-    响应会明确说成没成，不成就退回点页面，不用猜。"""
+    响应会明确说成没成，不成就停止，不用猜。"""
 
     class Page:
         def __init__(self, stk, result):
@@ -519,7 +519,7 @@ class BagToCheckoutTests(unittest.TestCase):
         self.assertEqual("", bag_to_checkout(p, log=lambda *a: None))
 
     def test_bails_when_url_is_not_checkout(self):
-        """别把随便一个跳转当成功——退回点页面是安全的，跳错地方不是。"""
+        """别把随便一个跳转当成功——停止本次尝试是安全的，跳错地方不是。"""
         from hunter.fastpath import bag_to_checkout
         p = self.Page("CARTTOKEN", {"status": 200, "head": 302,
                                     "url": "https://www.apple.com.cn/shop/bag"})
@@ -594,7 +594,7 @@ class CartVerifyTests(unittest.TestCase):
         self.assertFalse(p.posted)
 
     def test_refuses_when_sku_unreadable(self):
-        """读不出型号就别赌——退回点页面是安全的。"""
+        """读不出型号就别赌——停止本次尝试是安全的。"""
         url, p = self._run(self.state(1, []), "MG6W4CH/A")
         self.assertEqual("", url)
         self.assertFalse(p.posted)
@@ -602,40 +602,6 @@ class CartVerifyTests(unittest.TestCase):
     def test_no_want_part_skips_model_check(self):
         url, _ = self._run(self.state(1, ["ANYTHING/A"]), "")
         self.assertIn("/shop/checkout", url)
-
-
-class BaggedPartTests(unittest.TestCase):
-    """只记「加过了」不够，必须记**加的是哪个 part**。
-
-    监控盯着十几个配置：A 色放货、加购后失败重试，下一轮命中的可能是 B 色。
-    这时如果只看「加过了」就跳过清袋和加购，等于拿 A 色去给 B 色结账。
-    """
-
-    @staticmethod
-    def _ab(bagged):
-        from hunter.autobuy import AutoBuy
-        ab = AutoBuy.__new__(AutoBuy)
-        ab.bagged_part = bagged
-        return ab
-
-    @staticmethod
-    def _bagged_ok(ab, want):
-        # 跟 _drive 里那个判断保持一致
-        return bool(ab.bagged_part) and (not want or ab.bagged_part == want)
-
-    def test_same_part_skips_readd(self):
-        self.assertTrue(self._bagged_ok(self._ab("MG6W4CH/A"), "MG6W4CH/A"))
-
-    def test_different_part_forces_clear_and_readd(self):
-        """这就是会买错颜色的那条路。"""
-        self.assertFalse(self._bagged_ok(self._ab("MG704CH/A"), "MG6W4CH/A"))
-
-    def test_empty_bag_forces_add(self):
-        self.assertFalse(self._bagged_ok(self._ab(""), "MG6W4CH/A"))
-
-    def test_unknown_target_trusts_existing_bag(self):
-        """拿不到目标 part（比如没传 url）时不强行重来，保持原行为。"""
-        self.assertTrue(self._bagged_ok(self._ab("MG6W4CH/A"), ""))
 
 
 class PrepareBagTests(unittest.TestCase):
@@ -722,7 +688,7 @@ class PrepareBagTests(unittest.TestCase):
         self.assertFalse(r["kept"])
         self.assertEqual([], p.deleted)
 
-    def test_reports_failure_so_caller_falls_back_to_clicking(self):
+    def test_reports_failure_so_caller_stops(self):
         p = self.Page(self.st(["item-a"], ["MG704CH/A"]),
                       delete={"status": 500})
         r = self._run(p)

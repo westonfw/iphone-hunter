@@ -313,6 +313,58 @@ class Broadcaster:
                 self.log(f"[通知] {ch.name} 发送失败: {e}")
 
 
+class AsyncBroadcaster:
+    """通知不占用库存/购买线程；待付款通知使用独立通道。"""
+
+    def __init__(self, broadcaster, capacity=128):
+        import queue
+        import threading
+        self.broadcaster = broadcaster
+        self.queues = [queue.Queue(capacity), queue.Queue(capacity)]
+        self.closed = threading.Event()
+        self.threads = [threading.Thread(target=self._run, args=(q,), daemon=True,
+                                        name=f'notification-{i}')
+                        for i, q in enumerate(self.queues)]
+        for thread in self.threads:
+            thread.start()
+
+    def send(self, *args, **kwargs):
+        import queue
+        q = self.queues[bool(kwargs.get('wake'))]
+        try:
+            q.put_nowait((args, kwargs))
+        except queue.Full:
+            # 保留最新消息，不能用网络或队列等待拖慢抢购。
+            try:
+                q.get_nowait()
+                q.task_done()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait((args, kwargs))
+            except queue.Full:
+                self.broadcaster.log('[通知] 队列已满，消息未入队')
+
+    def _run(self, q):
+        import queue
+        while not self.closed.is_set() or not q.empty():
+            try:
+                args, kwargs = q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self.broadcaster.send(*args, **kwargs)
+            except Exception as e:
+                self.broadcaster.log(f'[通知] 发送失败：{e}')
+            finally:
+                q.task_done()
+
+    def close(self, timeout=5):
+        self.closed.set()
+        for thread in self.threads:
+            thread.join(timeout / len(self.threads))
+
+
 def open_in_browser(url: str, log=_p) -> None:
     """把购买页直接推到用户面前。Windows（原生或 WSL）用系统默认浏览器打开。"""
     if not url:

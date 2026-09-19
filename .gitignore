@@ -9,3 +9,7 @@ logs*/
 
 # HAR 里有 cookie / 身份证 / 手机号明文，绝不能进仓库
 *.har
+
+.purchase.lock
+order-attempt.json
+launch-state.json

@@ -273,9 +273,6 @@ def cmd_buy(args) -> int:
     ab = dict(cfg.get("autobuy") or {})
     if args.stop_at_review:
         ab["stop_at_review"] = True
-    # 拿来做 A/B：同一条链路分别用发包和点页面各跑一次，才知道快车道到底快不快。
-    if args.no_fast_path:
-        ab["fast_path"] = False
     if args.store:
         ab["pickup_store_numbers"] = [args.store.upper()]
     if not args.confirm:
@@ -447,14 +444,17 @@ def cmd_fastpath(args) -> int:
             district=args.district or str(ab.get("pickup_district") or "杨浦区"),
             pickup_time=args.time or str(ab.get("pickup_time") or ""),
             payment_label=str(ab.get("payment_method") or "招商银行"),
-            installment_months=int(ab.get("installment_months") or 24),
+            installment_months=int(ab.get("installment_months", 24)),
             # 默认只走到 Review。真要下单必须显式 --confirm——这条命令是拿来
             # 验链路的，别让人手一滑就创建了真实订单。
             place_order=bool(args.confirm),
         )
         if not args.confirm:
             print("（只走到 Review，不下单。要真下单加 --confirm）\n")
-        ok, stage, detail = fc.run(page)
+        from .purchase_guard import PurchaseGuard
+        with PurchaseGuard(ROOT) as guard:
+            fc.submit_guard = guard
+            ok, stage, detail = fc.run(page)
         print(f"\n{'✅' if ok else '❌'} {stage}\n   {detail}")
         if ok and not args.confirm:
             # 别让人自己刷：标签页的 URL 还挂着上一步的 _s= 锚点，F5 等于带着
@@ -464,6 +464,16 @@ def cmd_fastpath(args) -> int:
             else:
                 print(f"\n没能把标签页带过去，自己开 {FastCheckout.review_url(page)} 看。")
         return 0 if ok else 1
+
+
+def cmd_order_state(args) -> int:
+    from .purchase_guard import PurchaseGuard
+    with PurchaseGuard(ROOT, inspect=True) as guard:
+        print(json.dumps(guard.record or {'status': 'none'}, ensure_ascii=False, indent=2))
+        if args.resolve:
+            guard.finish('resolved')
+            print('已确认人工核对订单，解除自动购买保护。')
+    return 0
 
 
 def cmd_har(args) -> int:
@@ -533,6 +543,11 @@ def main(argv=None) -> int:
     sw.add_argument("--sprint", action="store_true", help="冲刺模式，用更短的轮询间隔")
     sw.set_defaults(func=cmd_watch)
 
+    so = sub.add_parser('order-state', help='查看订单提交记录')
+    so.add_argument('--resolve', action='store_true',
+                    help='已人工核对订单、确认允许下一次购买后解除保护')
+    so.set_defaults(func=cmd_order_state)
+
     scn = sub.add_parser("connect", help="诊断能否挂到你已登录的 Chrome")
     scn.add_argument("--port", type=int, help=f"调试端口，默认 {DEFAULT_CDP_PORT}")
     scn.add_argument("--launch", action="store_true",
@@ -548,8 +563,6 @@ def main(argv=None) -> int:
     sb = sub.add_parser("buy", help="立刻加购并创建待付款订单（真会下单，需 --confirm）")
     sb.add_argument("--part", help="目标 part number，默认取监控列表第一个")
     sb.add_argument("--slug", help="机型页面标识")
-    sb.add_argument("--no-fast-path", action="store_true",
-                    help="本次不走发包快车道，改点页面（用来对比两条路的耗时）")
     sb.add_argument("--store", default="",
                     help="本次指定取货门店编号，如 R359；不给就用配置里的优先级")
     sb.add_argument("--stop-at-review", action="store_true",

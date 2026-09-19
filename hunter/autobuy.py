@@ -32,7 +32,7 @@ from .apple import REGIONS
 from .checkout import (BTN_SIGN_IN, ID_ACCOUNT, ID_PWD, JS_FILL, OrderPlacer,
                        goto_buy_page, login_state, watch_checkout_block,
                        click_id, eval_in_frames, fill_field, frame_for_id,
-                       is_session_expired, is_sign_in, read_field, wait_settled)
+                       is_session_expired, is_sign_in, read_field)
 
 DEFAULT_CDP_PORT = 9222
 
@@ -54,18 +54,8 @@ JS_SOLD_OUT = """
 """
 SEL_SECTION = '[data-analytics-section="{}"]'
 
-# 购物袋页进入结账的按钮，Apple 改过几次名字，按顺序试。
-# Apple 对 iPhone 有限购（iPhone 18 Pro 购买页注明 Pro / Pro Max 各限 2 部）。
-# 袋里超量时点结账既不跳转也不报错，只是静默不动——必须主动识别。
+# 购物袋只读诊断使用的限购提示。
 LIMIT_PATTERNS = ("最多可购买", "请调整订单", "超出购买上限", "限购", "购买数量")
-
-CHECKOUT_SELECTORS = [
-    '[data-autom="checkout"]',
-    '[data-autom="proceed"]',
-    '[data-autom="bagCheckoutButton"]',
-    'button:has-text("结账")',
-    'a:has-text("结账")',
-]
 
 
 _PART_IN_URL = re.compile(r"/([A-Z0-9]{4,}[A-Z]{2}/A)(?:[/?#]|$)", re.I)
@@ -97,6 +87,8 @@ class BuyResult:
     #: 这次失败值不值得下一轮再试。货被别人买走了就别再试了——
     #: 页面会一直是「无法购买」，重试只是每轮白烧几十秒。
     retriable: bool = True
+    order_created: bool = False
+    retry_after: float = 0.0
 
 
 #: Apple ID 密码从这个环境变量读，**不从 config.json 读**。
@@ -192,6 +184,8 @@ class AutoBuy:
         self.cfg = cfg or {}
         self.log = log
         self.root = root
+        self.submit_guard = None
+        self.cancelled = lambda: False
         self.mode = self.cfg.get("mode", "auto")
         self.cdp_url = self.cfg.get("cdp_url", "")
         self.cdp_port = int(self.cfg.get("cdp_port", DEFAULT_CDP_PORT))
@@ -200,7 +194,7 @@ class AutoBuy:
         self.trade_in_text = self.cfg.get("trade_in", "不折抵")
         self.applecare_text = self.cfg.get("applecare", "不加 AppleCare")
         self.timeout = int(self.cfg.get("timeout_ms", 30000))
-        # 到店取货：只做「尽力尝试 + 大声提醒」，见 _choose_pickup 的说明。
+        # 到店取货门店偏好。实际结账用门店编号。
         # 可以给一串门店——哪家真有货是放货那一刻才知道的，写死一家等于
         # 另外几家放货时白白卡在选店那一步。
         self.pickup_stores = _store_list(self.cfg.get("pickup_stores"),
@@ -232,8 +226,9 @@ class AutoBuy:
         self.secure_host = (self.cfg.get("checkout_host") or "").strip()
         # 测试用：一路走到 Review 页就停，不点「立即下单」
         self.stop_at_review = bool(self.cfg.get("stop_at_review", False))
-        # 结账快车道：6 个同源 POST 代替点页面（fastpath.py）。失败自动退回点页面。
-        self.fast_path = bool(self.cfg.get("fast_path", False))
+        # 旧配置里的 fast_path 不再控制路径；快车道是唯一结账实现。
+        if self.cfg.get("fast_path") is False:
+            self.log("[自动下单] fast_path=false 已废弃，结账仅使用快车道")
         #: 快车道要的是门店**编号**（R581），而 pickup_stores 存的是名字（五角场）。
         #: 这两者不能混：selectStore=五角场 服务端不认，而且不会报错、只是选不中。
         #: 放货那一刻优先用监控报上来的「真有货的那几家」，它们本来就是编号。
@@ -276,7 +271,11 @@ class AutoBuy:
             ) from e
         self._pwctx = sync_playwright()
         self._pw = self._pwctx.__enter__()
-        self._ctx, self._attached = self._launch(self._pw)
+        try:
+            self._ctx, self._attached = self._launch(self._pw)
+        except Exception:
+            self.stop()
+            raise
 
     def stop(self) -> None:
         if self._pwctx is not None:
@@ -285,6 +284,7 @@ class AutoBuy:
             except Exception:
                 pass
         self._pwctx = self._pw = self._ctx = self._page = None
+        self._login_page = None
         self.warmed = False
 
     @property
@@ -296,7 +296,9 @@ class AutoBuy:
         直接返回、永远不再预热，等到真放货才在 fire() 里抛「页面没预热好」。
         监控日志一路正常，下单静默哑火，最坏的一种失败。
         """
-        if not self.warmed or self._page is None:
+        if (not self.warmed or self._page is None
+                or time.monotonic() - getattr(self, "warmed_at", time.monotonic())
+                > float(self.cfg.get("warm_max_age", 180))):
             return False
         try:
             if self._page.is_closed():
@@ -359,7 +361,36 @@ class AutoBuy:
         self.log(f"[预热] ⚠️ 自动登录没成功：{why}")
         return f"⚠️ 未登录：{why}"
 
-    def warm(self, url: str) -> str:
+    def prepare(self):
+        """监控启动时检查登录并保持连接；此操作不清袋、不加购。"""
+        from .purchase_guard import PurchaseGuard
+        with PurchaseGuard(self.root):
+            self.start()
+            check = getattr(self, '_login_page', None)
+            if check is None or check.is_closed():
+                check = self._ctx.new_page()
+                self._login_page = check
+                check.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,
+                           wait_until='domcontentloaded')
+                self._settle(check)
+            if _is_sign_in(check.url) and self._sign_in_blocked(check):
+                return self._sign_in_blocked(check)
+            note = self._preflight_login(check)
+            self.log(f'[购买就绪检查] {note}')
+            if self.signed_in is True:
+                check.close()
+                self._login_page = None
+            # 验证码/登录失败时保留页面，让用户完成验证。
+            return note
+
+    def warm(self, url: str):
+        from .purchase_guard import PurchaseGuard
+        with PurchaseGuard(self.root):
+            result = self._warm_inner(url)
+            self.warmed_at = time.monotonic()
+            return result
+
+    def _warm_inner(self, url: str) -> str:
         """开卖前把产品页加载好、必选项选好，标签页一直留着。
 
         这才是慢网下真正的解法：放货那一刻不需要再加载 700KB 的产品页、
@@ -399,10 +430,19 @@ class AutoBuy:
             st = self.bag_state(chk)
             self.bag_over_limit = st.get("limitMsg") or ""
             if st.get("items") and self.clear_bag:
-                n = self._empty_bag(chk)
+                from .fastpath import prepare_bag
+                prepared = prepare_bag(chk, want_origin=REGIONS[self.region], log=self.log)
+                if not prepared.get("ok"):
+                    raise AutoBuyUnavailable(prepared.get("reason") or "购物袋准备失败")
+                n = prepared.get("removed", 0)
                 self.log(f"[预热] 购物袋已清空（移除 {n} 件）")
                 state += f"；已清空购物袋（{n} 件）"
                 self.bag_over_limit = ""
+                if n:
+                    self._page.goto(url, timeout=self.timeout * 2, wait_until='domcontentloaded')
+                    self._page.wait_for_timeout(2500)
+                    self._pick(self._page, 'tradein', self.trade_in_text)
+                    self._pick(self._page, 'applecare', self.applecare_text)
             elif self.bag_over_limit:
                 self.log(f"[预热] ⚠️ 购物袋已超限购：{self.bag_over_limit}"
                          f"——现在就清空，否则开卖时结不了账")
@@ -412,6 +452,10 @@ class AutoBuy:
                          f"抢购前建议清空（iPhone 限购 2 台）")
                 state += f"；购物袋已有 {st['items']} 件，建议清空"
         except Exception as e:
+            from .fastpath import Blocked
+            if isinstance(e, Blocked):
+                self.warmed = False
+                raise
             self.log(f"[预热] 购物袋体检跳过：{type(e).__name__}")
         finally:
             try:
@@ -424,7 +468,7 @@ class AutoBuy:
         """这一单该按什么顺序试门店。
 
         真有货的排前面——配置里的偏好顺序只在「都有货」时才有意义，
-        而放货那一刻通常只有一两家有。白名单为空 = 有货的都能下。
+        名称只影响展示，实际候选限制使用门店编号。
         """
         allow = self.pickup_stores
         hot = [s.strip() for s in (in_stock or []) if s and s.strip()]
@@ -434,14 +478,9 @@ class AutoBuy:
             return list(allow)
         first = [s for s in allow if any(s in h or h in s for h in hot)]
         rest = [s for s in allow if s not in first]
-        # 有货却不在白名单里 = 这一单大概率白跑：程序会去试几家没货的。
-        # 静默丢掉最坑人，所以明确吭一声，指到该改的那个配置键上。
-        dropped = [h for h in hot if not any(a in h or h in a for a in allow)]
-        if dropped:
-            self.log(f"[自动下单] ⚠️ {'、'.join(dropped)} 有货，但不在 "
-                     f"autobuy.pickup_stores 白名单（{'、'.join(allow)}）里，"
-                     f"本单不会去这几家——要么把它们加进去，要么把该键留空表示不限")
-        return first + rest
+        # 名称仅保留显示偏好；不能否决库存接口给出的门店编号。
+        unmatched = [h for h in hot if not any(a in h or h in a for a in allow)]
+        return first + unmatched + rest
 
     def fire(self, url: str = "", in_stock: list[str] | None = None,
              in_stock_numbers: list[str] | None = None) -> BuyResult:
@@ -493,6 +532,14 @@ class AutoBuy:
 
         what = "排练" if dry_run else "抢购"
         self.log(f"[自动下单] {what}模式启动：{url}")
+
+        if getattr(self, 'managed', False):
+            self.start()
+            if self._page is None or self._page.is_closed():
+                self._page = self._ctx.new_page()
+            self.warmed = False
+            return self._drive(self._ctx, self._page, url, dry_run,
+                               in_stock, in_stock_numbers)
 
         with sync_playwright() as pw:
             ctx, attached = self._launch(pw)
@@ -551,64 +598,76 @@ class AutoBuy:
                 last = e
         raise AutoBuyUnavailable(f"浏览器启动失败：{last}")
 
-    def _drive(self, ctx, page, url: str | None, dry_run: bool,
+    def _drive(self, ctx, page, url, dry_run, in_stock=None, in_stock_numbers=None):
+        from .purchase_guard import PurchaseGuard, PurchaseBusy, PendingOrder
+        from .fastpath import Blocked
+        if dry_run:
+            return self._drive_inner(ctx, page, url, True, in_stock, in_stock_numbers)
+        try:
+            with PurchaseGuard(self.root) as guard:
+                self.submit_guard = guard
+                guard.part = _part_of(url or page.url)
+                if self.cancelled():
+                    return BuyResult(False, '已停止', page.url, retriable=False)
+                return self._drive_inner(ctx, page, url, False, in_stock, in_stock_numbers)
+        except Blocked as e:
+            return BuyResult(False, "⚠️ 购买链路被限流，已停止", page.url, str(e),
+                             retriable=False, retry_after=max(120, e.retry_after))
+        except PendingOrder as e:
+            self.order_placed = True
+            return BuyResult(False, '已有订单提交记录', page.url, str(e), retriable=False)
+        except PurchaseBusy as e:
+            return BuyResult(False, '另一购买流程正在运行', page.url, str(e))
+        finally:
+            cleanup = getattr(self, "_checkout_cleanup", None)
+            if cleanup:
+                cleanup()
+            self._checkout_cleanup = None
+            self.submit_guard = None
+
+    def _drive_inner(self, ctx, page, url: str | None, dry_run: bool,
                in_stock: list[str] | None = None,
                in_stock_numbers: list[str] | None = None) -> BuyResult:
         t0 = time.monotonic()
-        want_part = _part_of(url or "")
+        want_part = _part_of(url or page.url)
+        if not dry_run and not want_part:
+            return BuyResult(False, "缺少明确的目标型号", page.url,
+                             "购买链接需要包含 part number；请补全 model_slug 和 part。",
+                             retriable=False)
         # 「袋里已经是这次要买的那台」才允许跳过清袋和加购。型号不同就得重来，
         # 哪怕上一轮确实加购成功过。
-        bagged_ok = bool(self.bagged_part) and (
-            not want_part or self.bagged_part == want_part)
+        bagged_ok = False
         if self.bagged_part and want_part and self.bagged_part != want_part:
             self.log(f"[自动下单] 袋里是上一轮的 {self.bagged_part}，这次要 {want_part}"
                      f"——重新清袋加购")
         stores = self.store_candidates(in_stock)
         if stores:
-            self.log(f"[自动下单] 取货门店优先级：{' > '.join(stores)}")
+            self.log(f"[自动下单] 取货门店名称（显示参考）：{' > '.join(stores)}")
+        product_url = url or page.url
         if url is not None:
-            # 顺序很要紧：**先清空购物袋，再打开产品页**。
-            # 反过来做（开着产品页、另开标签页去清袋、再回来加购）既多一个标签页，
-            # 也不是人的操作路径；而且清袋那一下会让产品页的会话状态过期。
-            #
-            # 但走接口清空是个例外，而且必须这么排：`_run` 给过来的是一个**全新
-            # 的空白标签**，在 about:blank 上发 fetch("/shop/bag") 只会失败，
-            # 然后被当成「袋子是空的」——实测就是这样跳过清空、又加一台，
-            # 最后袋里两台。所以接口清空要等产品页加载完（有了主站 origin）再做。
-            api_cleared = False
-            if not dry_run and not bagged_ok and self.clear_bag and not self.fast_path:
-                self._clear_bag_now(page)
-
-            page.goto(url, timeout=self.timeout * 2, wait_until="domcontentloaded")
+            page.goto(product_url, timeout=self.timeout * 2, wait_until="domcontentloaded")
             page.wait_for_timeout(2500)
-
-            if not dry_run and not bagged_ok and self.clear_bag and self.fast_path:
-                from .fastpath import prepare_bag
-                r = prepare_bag(page, want_part=want_part,
-                                want_origin=REGIONS.get(self.region) or "",
-                                log=self.log)
-                if not r.get("ok"):
-                    self.log(f"[快车道] 接口清空没成（{r.get('reason')}），改点页面")
-                    self._clear_bag_now(page)
-                    page.goto(url, timeout=self.timeout * 2,
-                              wait_until="domcontentloaded")
-                    page.wait_for_timeout(2500)
-                elif r.get("kept"):
-                    bagged_ok = True
-                    self.bagged_part = want_part
-                elif r.get("removed"):
-                    # 真删了东西才需要重开产品页：删购物袋会动服务端的会话状态，
-                    # 而加购要的 atbtoken 是这页 JS 现算的，别拿过期的去点。
-                    api_cleared = True
-                    page.goto(url, timeout=self.timeout * 2,
-                              wait_until="domcontentloaded")
-                    page.wait_for_timeout(2500)
-
-            if not bagged_ok:
-                self._pick(page, "tradein", self.trade_in_text)
-                self._pick(page, "applecare", self.applecare_text)
-            if api_cleared:
-                self.log("[快车道] 清空后已重开产品页，必选项重新选过")
+        api_cleared = False
+        if not dry_run and self.clear_bag:
+            from .fastpath import prepare_bag
+            prepared = prepare_bag(page, want_part=want_part,
+                                   want_origin=REGIONS[self.region], log=self.log)
+            if not prepared.get("ok"):
+                return BuyResult(False, "购物袋准备失败", page.url,
+                                 prepared.get("reason") or "无法确认购物袋状态")
+            bagged_ok = bool(prepared.get("kept"))
+            self.bagged_part = want_part if bagged_ok else ""
+            self.bag_over_limit = ""
+            if prepared.get("removed"):
+                # 预热和普通路径都必须在清袋后重建产品页状态及必选项。
+                page.goto(product_url, timeout=self.timeout * 2, wait_until="domcontentloaded")
+                page.wait_for_timeout(2500)
+                api_cleared = True
+        if not bagged_ok and (url is not None or api_cleared):
+            self._pick(page, "tradein", self.trade_in_text)
+            self._pick(page, "applecare", self.applecare_text)
+        if api_cleared:
+            self.log("[快车道] 清空后已重开产品页，必选项重新选过")
 
         # 已经超限就别再加了——加了也结不了账，只会让袋子更难收拾
         if self.bag_over_limit and not dry_run and not bagged_ok:
@@ -633,19 +692,21 @@ class AutoBuy:
             return BuyResult(True, "排练通过（未加购）", page.url,
                              f"耗时 {el:.1f}s，选择器有效")
 
+        if self.cancelled():
+            return BuyResult(False, "已停止，未加购", page.url, retriable=False)
+
         if not bagged_ok:
             # 用 locator 而不是先前抓到的句柄——locator 每次操作都会重新定位
             page.locator(SEL_ADD_TO_CART).first.click(timeout=self.timeout)
-            self.bagged_part = want_part or "?"
+            self.bagged_part = ""
             # 只等加购请求出门，不加载 700KB 购物袋页（等 URL 变化最坏会烧掉数秒）
             page.wait_for_timeout(600)
-            self.log(f"[自动下单] 已加入购物袋（{time.monotonic() - t0:.1f}s），不加载购物袋页")
+            self.log(f"[自动下单] 已点击加购（{time.monotonic() - t0:.1f}s），随后复核购物袋")
         else:
             self.log(f"[自动下单] 购物袋里已经是 {self.bagged_part}，跳过加购，直接结账")
 
         placer = OrderPlacer(
             region=self.region,
-            pickup_stores=stores,
             # 真有货的那几家**编号**排最前。原来这里传的是 in_stock（门店名），
             # 而 OrderPlacer 用 R\d+ 过滤，名字会被整个丢掉——于是快车道永远
             # 拿配置里的第一家（R581 五角场），哪怕有货的是静安。
@@ -661,56 +722,26 @@ class AutoBuy:
             installment_months=self.installment_months,
             secure_host=self.secure_host,
             stop_at_review=self.stop_at_review,
-            fast_path=self.fast_path,
             place_order=self.place_order,
             pickup_city=self.pickup_city,
             pickup_state=self.pickup_state,
             pickup_district=self.pickup_district,
             pickup_time=self.pickup_time,
             timeout_ms=self.timeout,
+            submit_guard=self.submit_guard, cancelled=self.cancelled,
             log=self.log,
         )
-        # 跟着页面走：加购后按页面上的「结账」按钮，让 Apple 自己把你带到
-        # 它给这个会话分配的那台 secureN 上。自己拼地址跳转既容易跳错主机，
-        # 也是最典型的机器行为特征。直跳只在这条路走不通时兜底。
+        # 优先接口入口；仅在目标已核对、入口未建立时允许购物袋页面建立会话。
+        from .fastpath import Blocked
         blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
-        # 先试从购物袋接口直接拿结账地址：省掉加载 259KB 购物袋页 + 渲染 + 找按钮
-        # 那 ~6s。拿不到就照常走点页面，不影响正确性。
-        if self.fast_path:
-            from .fastpath import CartMismatch, SessionExpired, bag_to_checkout
-            direct = ""
-            try:
-                direct = bag_to_checkout(
-                    page, want_part=want_part, want_qty=1,
-                    want_origin=REGIONS.get(self.region) or "", log=self.log)
-            except SessionExpired as e:
-                # 会话作废了。**别退回点页面**——那条路会在同一个死会话上
-                # 从头点一遍，每一步都撞同一堵墙。先重新登录。
-                note = self._recover_session(page)
-                if note:
-                    return BuyResult(False, "⚠️ 结账会话已过期", page.url,
-                                     f"{e}。{note}")
-                self.log(f"[自动下单] {e}——已重新登录，这一轮重新走")
-                page = self._checkout_via_bag(ctx, page)
-            except CartMismatch as e:
-                # 正常路径上这里不该触发：上面已经按 part 决定过清袋和加购。
-                # 真触发了说明清袋或加购静默失败了，退回点页面那条路——它会
-                # 自己加载购物袋页，该报的限购/空袋问题由它来报。
-                self.log(f"[自动下单] ⚠️ {e} 退回点页面")
-            if direct:
-                try:
-                    page.goto(direct, timeout=self.timeout,
-                              wait_until="domcontentloaded")
-                except Exception as e:
-                    self.log(f"[快车道] 跳转结账地址失败：{type(e).__name__}，退回点页面")
-                    direct = ""
-            if not direct:
-                page = self._checkout_via_bag(ctx, page)
-        else:
-            page = self._checkout_via_bag(ctx, page)
-        if "/shop/checkout" not in (page.url or "") and not _is_sign_in(page.url):
-            self.log("[自动下单] 页面上的结账按钮没走通，退回直跳结账地址")
-            page = placer.enter(ctx, page)
+        self._checkout_cleanup = blocked.get("close")
+        try:
+            page = self._enter_checkout(ctx, page, want_part)
+        except Blocked:
+            raise  # 包括页面入口抛出的限流，统一由 _drive 转换为冷却结果。
+        except Exception as e:
+            return BuyResult(False, "⚠️ 结账入口失败，已停止", page.url,
+                             f"{type(e).__name__}: {e}")
         if self._page is not None:
             self._page = page
         # 登录页不用等它「稳定」，认出来就直接去登录，省掉那几秒
@@ -718,12 +749,8 @@ class AutoBuy:
             self._settle(page)
 
         if _is_expired(page.url):
-            # 「操作超时」页上没有登录框，也没有任何能点的东西——先离开它。
-            # _recover_session 会重新登录并回到购物袋，之后照常往下走。
-            note = self._recover_session(page)
-            if note:
-                return BuyResult(False, "⚠️ 结账会话已过期", page.url, note)
-            page = self._checkout_via_bag(ctx, page)
+            return BuyResult(False, "⚠️ 结账会话已过期", page.url,
+                             "请重新登录；本次快车道尝试已停止。")
 
         if _is_sign_in(page.url):
             self.log(f"[自动下单] 被拦在登录页（{time.monotonic() - t0:.1f}s），尝试自动登录")
@@ -735,8 +762,16 @@ class AutoBuy:
             self.log(f"[自动下单] 登录完成（{time.monotonic() - t0:.1f}s）")
             self._settle(page)
             if "/shop/checkout" not in (page.url or ""):
-                # 登录后 Apple 未必自动回结账，按页面路径再走一次
-                page = self._checkout_via_bag(ctx, page)
+                # 登录完成后重新建立结账会话，保持同一目标型号。
+                try:
+                    page.goto(f"{REGIONS[self.region]}/shop/bag", timeout=self.timeout,
+                              wait_until="domcontentloaded")
+                    page = self._enter_checkout(ctx, page, want_part)
+                except Blocked:
+                    raise
+                except Exception as e:
+                    return BuyResult(False, "⚠️ 登录后结账失败，已停止", page.url,
+                                     f"{type(e).__name__}: {e}")
 
         if "/shop/checkout" not in page.url:
             st = self.bag_state(page)
@@ -754,26 +789,63 @@ class AutoBuy:
                     f"结账页加载正常，但它的 {len(blocked['hits'])} 个 XHR 被边缘节点拦了"
                     f"（{blocked['hits'][0]['status']}），前端把你重定向到了 /shop/404。\n"
                     f"这是限流不是封号，**别再重试**——Akamai 按累计速率判，"
-                    f"越撞退避越深。" + (f"对方要求等 {ra:.0f}s。" if ra else "先停手等它自己解。"))
+                    f"越撞退避越深。" + (f"对方要求等 {ra:.0f}s。" if ra else "先停手等它自己解。"),
+                    retriable=False, retry_after=max(120, ra))
             return BuyResult(False, "⚠️ 没能进入结账页", page.url,
                              f"加购后没能走到结账页（{time.monotonic() - t0:.1f}s），请手动接管。")
 
         if not self.place_order:
-            pickup_note = self._choose_pickup(page, stores)
             return BuyResult(True, "已到结账页", page.url,
-                             (pickup_note + "\n" if pickup_note else "")
-                             + f"place_order=false，停在结账页。总耗时 {time.monotonic() - t0:.1f}s")
+                             f"place_order=false，未选择门店或提交订单。总耗时 {time.monotonic() - t0:.1f}s")
 
         # 把探到的结账主机记回来，同一进程里后续几轮直接命中
         if placer.secure_host:
             self.secure_host = placer.secure_host
 
-        result = self._wrap(placer, page.url, *placer.place(page, t0))
-        if getattr(placer, "session_expired", False):
-            # 会话过期时订单**肯定没建**，所以这一轮该重试——但得先重新登录，
-            # 在死会话上重试多少次都是一样的结果。
-            self._recover_session(page)
-        return result
+        outcome = placer.place(page, t0)
+        return self._wrap(placer, placer.result_url or page.url, *outcome)
+
+    def _enter_checkout(self, ctx, page, want_part):
+        """登录前后共用一个入口，页面入口异常与接口异常按同样方式传递。"""
+        from .fastpath import EntryUnavailable, bag_to_checkout
+        try:
+            direct = bag_to_checkout(page, want_part=want_part, want_qty=1,
+                                     want_origin=REGIONS[self.region], log=self.log)
+        except EntryUnavailable:
+            return self._checkout_via_bag(ctx, page, want_part)
+        if not direct:
+            raise AutoBuyUnavailable('购物袋接口未给出有效结账地址')
+        page.goto(direct, timeout=self.timeout, wait_until='domcontentloaded')
+        return page
+
+    def _checkout_via_bag(self, ctx, page, want_part):
+        """仅用于建立结账会话；进入快车道后绝不再调用。"""
+        from .fastpath import JS_CART_STATE, CartMismatch, raise_if_blocked
+        page.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,
+                  wait_until='domcontentloaded')
+        state = page.evaluate(JS_CART_STATE) or {}
+        raise_if_blocked(state, "购物袋页面")
+        if (state.get('count') != 1 or state.get('qty') != [1]
+                or [str(p).upper() for p in state.get('skus', [])] != [want_part.upper()]):
+            raise CartMismatch('购物袋页面无法确认目标型号和数量，未点击结账')
+        opened = []
+        ctx.on('page', opened.append)
+        try:
+            # 只点一次，兼容同页跳转和新标签；不等待必然发生的 popup。
+            button = page.locator('[data-autom="checkout"]:visible, [data-autom="proceed"]:visible, '
+                                  '[data-autom="bagCheckoutButton"]:visible, '
+                                  'button:has-text("结账"):visible, a:has-text("结账"):visible')
+            button.first.click(timeout=self.timeout)
+            deadline = time.monotonic() + self.timeout / 1000
+            while time.monotonic() < deadline:
+                for candidate in [page] + opened:
+                    if '/shop/checkout' in candidate.url or _is_sign_in(candidate.url):
+                        candidate.wait_for_load_state('domcontentloaded', timeout=self.timeout)
+                        return candidate
+                page.wait_for_timeout(100)
+            raise AutoBuyUnavailable('点击结账后未得到结账或登录页')
+        finally:
+            ctx.remove_listener('page', opened.append)
 
     def _wrap(self, placer, url: str, ok: bool, stage: str, detail: str,
               order_id: str) -> BuyResult:
@@ -790,7 +862,11 @@ class AutoBuy:
             self.order_placed = True
             return BuyResult(ok, stage, url, detail, order_id=order_id,
                              retriable=False)
-        return BuyResult(ok, stage, url, detail, order_id=order_id)
+        return BuyResult(ok, stage, url, detail, order_id=order_id,
+                         retriable=getattr(placer, "retriable", True),
+                         order_created=bool(getattr(placer, "fast_ordered", False)),
+                         retry_after=max(120, getattr(placer, "retry_after", 0))
+                         if getattr(placer, "blocked", False) is True else 0)
 
     def _recover_session(self, page) -> str:
         """从「操作超时」页里爬出来：重新登录，然后回到购物袋。
@@ -896,136 +972,6 @@ class AutoBuy:
             return f"{hit} —— 验证码在你手机上，请在浏览器里输入，脚本不代劳"
         return f"登录被拒：{hit}"
 
-    def _clear_bag_now(self, page) -> None:
-        """在**当前标签页**里打开购物袋并清空。失败不阻断，只是记一笔。
-
-        用当前页而不是另开一个：多开标签页既不像人的操作，也容易让后面
-        「加购 → 点结账」跟错页面。
-        """
-        base = REGIONS.get(self.region) or REGIONS["cn"]
-        try:
-            page.goto(f"{base}/shop/bag", timeout=self.timeout,
-                      wait_until="domcontentloaded")
-            page.wait_for_timeout(1800)
-            st = self.bag_state(page)
-            if st.get("items"):
-                n = self._empty_bag(page)
-                self.log(f"[自动下单] 加购前已清空购物袋（移除 {n} 件）")
-            else:
-                self.log("[自动下单] 购物袋本来就是空的")
-            self.bag_over_limit = self.bag_state(page).get("limitMsg") or ""
-        except Exception as e:
-            self.log(f"[自动下单] 清购物袋跳过：{type(e).__name__}: {str(e)[:60]}")
-
-    def _checkout_via_bag(self, ctx, page):
-        """走到结账页：打开购物袋 → 点「结账」。
-
-        **不点导航栏那个购物袋图标。** 它弹的是浮层，不是跳转：浮层要动画
-        几秒、期间整页发卡，而且它盖在页面上——这时候去找「结账」按钮，
-        很容易抓到浮层背后那个被遮住的，点下去要么没反应要么点错。
-
-        直接打开 /shop/bag 反而更接近人的操作结果：同一个页面、同一个
-        结账按钮，没有浮层这一层。这跟「别自己拼 secureN 地址」不冲突——
-        购物袋页是个正常的、用户看得见的地址，结账主机仍然由 Apple 决定。
-        """
-        base = REGIONS.get(self.region) or REGIONS["cn"]
-        try:
-            page.goto(f"{base}/shop/bag", timeout=self.timeout,
-                      wait_until="domcontentloaded")
-        except Exception as e:
-            self.log(f"[自动下单] 打开购物袋失败：{str(e)[:60]}")
-            return page
-
-        # 等页面真安静，而不是盲等 1200ms
-        wait_settled(page, log=self.log)
-
-        el = self._find_checkout_button(page)
-        if el is None:
-            self.log("[自动下单] 购物袋页上没找到可点的「结账」按钮")
-            return page
-        return self._click_checkout(ctx, page, el)
-
-    def _find_checkout_button(self, page):
-        """找购物袋页上那个**可见且可点**的结账按钮。
-
-        原来用 query_selector 直接取第一个匹配的，它不判可见性——浮层背后
-        或者折叠区域里的同名按钮照样会被取到，点了等于没点。
-        """
-        for sel in CHECKOUT_SELECTORS:
-            try:
-                loc = page.locator(sel)
-                for i in range(min(loc.count(), 5)):
-                    one = loc.nth(i)
-                    if one.is_visible() and one.is_enabled():
-                        return one.element_handle()
-            except Exception:
-                continue
-        return None
-
-    def _empty_bag(self, page, passes: int = 5) -> int:
-        """清空购物袋，返回移除的件数。**清到真的空为止。**
-
-        Apple 限购 iPhone 每人 2 台，袋里的存货会顶掉抢购名额，而且超限时
-        点结账**既不跳转也不弹错**，只是静默卡住。所以加购前先清干净，
-        比事后诊断可靠得多。
-
-        袋里通常不止一件，而且每移除一件整块都会重绘——重绘那一瞬间抓不到
-        「移除」按钮，光靠「点不动了就收工」会提前退出、留下残货。所以这里
-        每轮结束都用 bag_state 复核，没清干净就重新加载购物袋再来一轮。
-        """
-        removed = 0
-        for attempt in range(passes):
-            removed += self._remove_once(page)
-            st = self.bag_state(page)
-            if not st.get("items"):
-                return removed
-            if attempt < passes - 1:
-                self.log(f"[自动下单] 购物袋还剩 {st['items']} 件，重载后再清一轮")
-                try:
-                    page.reload(wait_until="domcontentloaded", timeout=self.timeout)
-                    page.wait_for_timeout(1600)
-                except Exception:
-                    break
-        st = self.bag_state(page)
-        if st.get("items"):
-            self.log(f"[自动下单] ⚠️ 清了 {passes} 轮购物袋里还有 {st['items']} 件，"
-                     "请手动清空——超过限购会让结账静默卡住")
-        return removed
-
-    def _remove_once(self, page) -> int:
-        """把当前这一屏能点到的都移除掉，返回件数。"""
-        removed = 0
-        misses = 0
-        for _ in range(30):
-            try:
-                clicked = page.evaluate(r"""() => {
-                    for (const el of document.querySelectorAll(
-                            '[data-autom*="remove"], button, a')) {
-                        const r = el.getBoundingClientRect();
-                        if (!r.width || !r.height || el.offsetParent === null) continue;
-                        const t = ((el.innerText || '') + ' ' +
-                                   (el.getAttribute('aria-label') || ''));
-                        if (/移除|删除/.test(t) && !/收藏|稍后/.test(t)) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""")
-            except Exception:
-                break
-            if not clicked:
-                # 可能只是正在重绘，再等一拍；连续两次抓不到才算清完
-                misses += 1
-                if misses >= 2:
-                    break
-                page.wait_for_timeout(900)
-                continue
-            misses = 0
-            removed += 1
-            page.wait_for_timeout(1200)
-        return removed
-
     def bag_state(self, page) -> dict:
         """查购物袋：几件商品、是否已触发限购。
 
@@ -1051,44 +997,6 @@ class AutoBuy:
             }""", list(LIMIT_PATTERNS))
         except Exception as e:
             return {"items": None, "limitMsg": None, "err": str(e)[:70]}
-
-    def _click_checkout(self, ctx, page, el):
-        """点「结账」并切到真正承载结账流程的页面。
-
-        Apple 通常在**新标签页**打开 secureN.../shop/checkout。用
-        expect_page 精确捕获这次新开的页面——早先按「不在旧列表里」判断，
-        会被之前遗留的结账标签页干扰，白等到超时。
-
-        没开新标签页就是本页跳转，回退到等本页 URL 变成结账页。
-        """
-        try:
-            # 4s 足够：真要开新标签页，点完马上就开。原来给 15s，而被重定向到
-            # 登录页时是本页跳转、根本不开新标签，这 15 秒就是纯等超时。
-            with ctx.expect_page(timeout=4000) as info:
-                el.click()
-            newpage = info.value
-            try:
-                newpage.wait_for_load_state("domcontentloaded", timeout=10000)
-            except Exception:
-                pass
-            self.log("[自动下单] 结账开在新标签页，已切过去")
-            return newpage
-        except Exception:
-            pass  # 没有新标签页，按本页跳转处理
-
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline:
-            try:
-                u = page.url
-            except Exception:
-                u = ""
-            if _is_sign_in(u):
-                return page          # 登录页不用再 settle，直接交给上层去登录
-            if "/shop/checkout" in u:
-                break
-            time.sleep(0.2)
-        self._settle(page)
-        return page
 
     def _settle(self, page, quiet_ms: int = 700, max_ms: int = 8000) -> None:
         """等页面导航稳定：URL 连续 quiet_ms 不变才算落定。
@@ -1154,91 +1062,6 @@ class AutoBuy:
                 return False, f"SOLD_OUT:{gone}"
             page.wait_for_timeout(300)
         return False, last
-
-    def _choose_pickup(self, page, stores: list[str] | None = None) -> str:
-        """尽力在结账页选中「到店取货」和门店（按 stores 的顺序试）。
-
-        **这一步没能在真实结账流程里验证过。** 门店选择只出现在登录后的
-        结账流程里（secure.apple.com.cn），产品页和购物袋页都没有这个控件，
-        所以我没法在不动你真实订单的前提下把选择器坐实。
-
-        因此这里的原则是：
-          - 只在文本**精确包含**候选门店名时才点，绝不「兜底选第一家」
-            ——选错门店比没选更糟。
-          - 无论成功失败都返回一句话，由调用方推送给你。失败时明确说
-            「请手动选」，绝不静默假装成功。
-        """
-        wants = stores if stores is not None else self.pickup_stores
-        wants = [w for w in wants if w]
-        if not wants:
-            return ""
-
-        want = "/".join(wants)
-        # 守卫：不在结账页就别点。购物袋页上也有「五角场」字样，
-        # 在那儿乱点会报成功但什么都没选中。
-        try:
-            cur = page.url
-        except Exception:
-            cur = ""
-        if "/shop/checkout" not in cur:
-            self.log(f"[自动下单] 当前不在结账页（{cur[:60]}），跳过取货选择")
-            return f"⚠️ 没走到结账页，请手动选「到店取货 → {want}」"
-        picked, err = None, None
-        for attempt in range(3):
-            try:
-                picked = self._pickup_eval(page, wants)
-                err = None
-                break
-            except Exception as e:
-                err = e
-                # 多半是又跳了一次页面，等稳再试
-                self._settle(page)
-        if err is not None:
-            self.log(f"[自动下单] 取货选择出错：{err}")
-            return f"⚠️ 没能自动选取货门店，请手动选「到店取货 → {want}」"
-
-        page.wait_for_timeout(1200)
-        if picked and picked.get("store"):
-            got = picked["store"]
-            self.log(f"[自动下单] 已尝试选中取货门店「{got}」——**请在页面上再确认一眼**")
-            return f"已尝试选「到店取货 → {got}」，付款前请确认页面上确实是这家店"
-        if picked and picked.get("switched"):
-            self.log(f"[自动下单] 切到了取货，但没找到「{want}」——请手动选门店")
-            return f"⚠️ 已切到取货，但没找到「{want}」，请手动选门店"
-        self.log(f"[自动下单] 结账页没找到取货选项——请手动选「到店取货 → {want}」")
-        return f"⚠️ 没找到取货选项，请手动选「到店取货 → {want}」"
-
-    def _pickup_eval(self, page, wants: list[str]) -> dict:
-        """返回 {switched, store}。store 是选中的门店名，没选中就是空串。"""
-        return page.evaluate(
-                """(wants) => {
-                    const hit = (el) => (el.innerText || '') + ' ' +
-                                        (el.getAttribute('aria-label') || '');
-                    const SEL = 'button,[role=radio],[role=button],label,input';
-                    // 第一步：切到「到店取货」
-                    let switched = false;
-                    for (const el of document.querySelectorAll(SEL)) {
-                        if (/我要取货|到店取货|零售店取货|门店取货/.test(hit(el))) {
-                            el.click(); switched = true; break;
-                        }
-                    }
-                    // 第二步：按优先级挨个试。「Apple 五角场」这种全称优先于裸店名，
-                    // 因为门店列表里带着地址，裸「浦东」会命中别家店的「浦东新区」。
-                    let store = '';
-                    outer:
-                    for (const want of wants) {
-                        for (const needle of ['Apple ' + want, want]) {
-                            for (const el of document.querySelectorAll(SEL)) {
-                                if (hit(el).includes(needle)) {
-                                    el.click(); store = want; break outer;
-                                }
-                            }
-                        }
-                    }
-                    return {switched, store};
-                }""",
-            wants,
-        )
 
     def _pick(self, page, section: str, keyword: str) -> bool:
         """在某个选项分区里选中标签含关键词的那一项。

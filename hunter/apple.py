@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import json
+import math
+from email.utils import parsedate_to_datetime
 import random
 import re
 import time
@@ -208,12 +210,20 @@ _NET_ERRORS = tuple(e for e in (requests.RequestException, CurlError) if e is no
 
 
 def _retry_after(resp) -> float:
-    """把 Retry-After 头解析成秒。对方明说了要等多久，就别自己猜。"""
-    raw = (resp.headers.get("Retry-After") or "").strip()
+    return parse_retry_after(resp.headers.get('Retry-After') or resp.headers.get('retry-after'))
+
+
+def parse_retry_after(raw) -> float:
+    """Retry-After 的秒数和 HTTP-date 共用同一解析逻辑。"""
+    raw = str(raw or '').strip()
     try:
-        return max(0.0, float(raw))
+        value = float(raw)
     except ValueError:
-        return 0.0  # HTTP-date 形式的很少见，忽略即可
+        try:
+            value = parsedate_to_datetime(raw).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+    return max(0.0, value) if math.isfinite(value) else 0.0
 
 
 class AppleClient:
@@ -226,6 +236,8 @@ class AppleClient:
         self.timeout = timeout
         self.proxy = proxy
         self.requests_made = 0        # 供 Pacer 记账用
+        self.before_request = None
+        self.observed_at = {}
         self.browser = random.choice(BROWSERS)
         # 熔断按 path 分家：541 是端点级的（实测 pickup 被拦时 availability 照样
         # 通），一个端点出事没有理由把另一个也停掉。
@@ -318,6 +330,8 @@ class AppleClient:
         if not br.ready():
             raise CoolingDown(path.split("?", 1)[0], br.left())
 
+        if self.before_request is not None:
+            self.before_request()
         self.requests_made += 1
         rec: dict = {"n": self.requests_made, "url": url}
         if params:
@@ -334,13 +348,17 @@ class AppleClient:
         rec["ms"] = round((time.monotonic() - t0) * 1000)
         rec["status"] = r.status_code
         rec["bytes"] = len(r.content)
+        for name in ("Age", "Date", "Cache-Control"):
+            value = r.headers.get(name)
+            if isinstance(value, str) and value:
+                rec[name.lower()] = value
         rec["ua"] = _ua_tag(self.browser["ua"])
         if r.history:
             rec["final"] = r.url          # 被重定向了，落地在哪很关键（如跳回落地页）
         try:
             out = self._decode(r, url, want_json, missing_means_not_live)
         except Blocked as e:
-            e.cooldown = br.trip()
+            e.cooldown = br.trip(e.retry_after)
             rec["error"] = f"{type(e).__name__}: {e}"[:300]
             rec["cooldown"] = round(e.cooldown)
             raise
@@ -348,7 +366,13 @@ class AppleClient:
             rec["error"] = f"{type(e).__name__}: {e}"[:300]
             raise
         else:
-            br.ok()   # 这个端点通了就立刻满速，封禁一过就没有理由再慢
+            br.ok()
+            try:
+                age = float(r.headers.get("Age", 0))
+                age = max(0., age) if math.isfinite(age) else 0.
+            except (ValueError, TypeError):
+                age = 0.
+            self.observed_at[path] = t0 - age
             return out
         finally:
             log_request(**rec)
