@@ -346,6 +346,44 @@ class ContactHarvestTests(unittest.TestCase):
         self.assertIn("id_last4", detail)
 
 
+class InterruptedSubmitTests(unittest.TestCase):
+    """Ctrl+C 正落在「立即下单」那一发上：请求已经出门，订单可能已经建好。
+
+    2026-09-18 23:50 就是这么丢的——六步走完 4 秒后按了 Ctrl+C，而那台机器每发
+    要 8～10 秒，中断落在提交途中。订单真建了，日志里却连「已提交」都没有。
+    KeyboardInterrupt 是 BaseException，`except Exception` 接不住，于是专门为
+    这一刻置的 submitted 标志没有任何人去读。"""
+
+    class Interrupting(FakePage):
+        """跑到第 stop_at 个 POST 时按下 Ctrl+C。"""
+
+        def __init__(self, responses, stop_at):
+            super().__init__(responses)
+            self.stop_at = stop_at
+
+        def evaluate(self, js, arg=None):
+            if arg is not None and len(self.calls) == self.stop_at:
+                raise KeyboardInterrupt
+            return super().evaluate(js, arg)
+
+    def test_shouts_before_dying(self):
+        logs = []
+        page = self.Interrupting(list(HAPPY), stop_at=6)   # 六步走完，第 7 发被打断
+        fc = placer(place_order=True, log=logs.append)
+        with self.assertRaises(KeyboardInterrupt):
+            fc.run(page)
+        self.assertTrue(fc.submitted)                      # 请求已经出门
+        self.assertTrue(any("订单可能已经创建" in m for m in logs), logs)
+
+    def test_stays_quiet_when_nothing_went_out(self):
+        """还没提交就被打断，就别吓唬人。"""
+        logs = []
+        page = self.Interrupting(list(HAPPY), stop_at=0)   # 第 1 步就被打断
+        with self.assertRaises(KeyboardInterrupt):
+            placer(place_order=True, log=logs.append).run(page)
+        self.assertFalse(any("订单可能已经创建" in m for m in logs), logs)
+
+
 class ShowReviewTests(unittest.TestCase):
     """六步只改服务端状态，标签页还停在原来那一步——得把它带过去。
 

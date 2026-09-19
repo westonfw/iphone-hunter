@@ -1147,6 +1147,19 @@ class FastCheckout:
                     return True, "✅ 待付款订单已创建", (
                         f"跳转到 {final}。"
                         f"请在约 30 分钟内自己扫码支付——**本工具不代付款**。")
+        except KeyboardInterrupt:
+            # KeyboardInterrupt 是 BaseException，下面的 except Exception 接不住它——
+            # 而最该喊一嗓子的恰恰是这一刻。submitted 在发包**之前**就置位，为的
+            # 就是这种「请求已经离开本机、进程马上要死」的时候还能说清楚。
+            #
+            # 2026-09-18 23:50 实测：六步走完 4 秒后按了 Ctrl+C，那台机器每发要
+            # 8～10 秒，中断正落在「立即下单」那一发的途中。请求照样到了 Apple，
+            # 订单真的建好了，而日志里连「已提交」都没有——人以为没走到那步。
+            if self.submitted:
+                self.log("[快车道] ⚠️ 中断时「立即下单」那一发**已经送出去了**，"
+                         "订单可能已经创建：去 apple.com.cn/shop/order/list 或邮箱"
+                         "确认，别急着再下一单。")
+            raise
         except SessionExpired as e:
             return False, "⚠️ 结账会话已过期", (
                 f"{e}。**在这条链路上重试没有意义**——要重新登录、"
