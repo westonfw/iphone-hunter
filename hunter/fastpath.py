@@ -330,6 +330,29 @@ def atb_add_url(buy_url: str, part: str, token: str) -> str:
     return urlunsplit((u.scheme, u.netloc, u.path.lower(), q, ""))
 
 
+#: 页面内发「加购」那个 GET，不导航。加购是服务端在这个 GET 上就做完的动作，
+#: 用不上返回的 HTML——`page.goto` 却要等重定向后的产品页 domcontentloaded，
+#: 实测 1.2~4.3 秒，最慢一次 28 秒。fetch 只等请求本身回来（redirect:manual
+#: 连产品页都不下载），加购照样发生，几百毫秒。cookie 靠 credentials 带上，
+#: 目标是绝对地址所以跟当前页 origin 无关。成功与否一律以 prepare_bag 复核为准。
+JS_ATB_ADD = r"""
+async (url) => {
+    try {
+        await fetch(url, {credentials: "include", redirect: "manual",
+                          cache: "no-store", signal: AbortSignal.timeout(15000)});
+        return {ok: true};
+    } catch (e) { return {ok: false, error: String(e).slice(0, 80)}; }
+}
+"""
+
+
+def atb_add_fetch(page, add_url: str) -> None:
+    """在当前页里发一次加购 fetch。抛异常就说明连 evaluate 都没跑成，调用方退回导航。"""
+    r = page.evaluate(JS_ATB_ADD, add_url) or {}
+    if not r.get("ok"):
+        raise RuntimeError(r.get("error") or "atb fetch 没成")
+
+
 def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> dict:
     """确保购物袋里**只有**这次要买的那台。返回 {ok, kept, removed, reason}。
 
@@ -720,9 +743,18 @@ class FastCheckout:
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
                  pickup_time: str = "", stk_timeout_ms: int = 15000, log=print,
                  submit_guard=None, cancelled=None, stores=None, allow=None,
-                 require_slot: bool = True, stages=None):
+                 require_slot: bool = True, stages=None,
+                 still_live=None, search_retries: int = 1,
+                 search_retry_wait: float = 0.4):
         self.submit_guard = submit_guard
         self.cancelled = cancelled or (lambda: False)
+        #: 「这个型号监控还认为有货吗」。search 头一枪返回「全不可取」时用它决定
+        #: 要不要再打一枪——Apple 放货后第一次 search 有时还没 populate，而监控
+        #: 的公开接口已经看到了（2026-09-20 三次失败，同一秒监控都在报有货）。
+        #: None = 问不出，那就按 search_retries 打固定次数（dunhuo 的「2 枪」）。
+        self.still_live = still_live
+        self.search_retries = max(0, int(search_retries))
+        self.search_retry_wait = max(0.0, float(search_retry_wait))
         self.store = (store or "").strip()
         #: 备选门店，第 2 步排不上取货时**就地**换下一家，不必把整条链路重来。
         #: 抢手时这一步最要命：一趟重来是十几秒 + 一次重新加购，而换店只是
@@ -1055,14 +1087,31 @@ class FastCheckout:
         带着空时段撞进一个必死的第 3 步。
         """
         first = self.store
-        data = self.step2_store(page)
-        self.store_used = self.store
-        try:
-            self.take_slot(data)
-            return data
-        except Stalled as e:
-            # except 的变量在块结束时会被 Python 删掉，得换个名字留住它
-            first_miss, first_data = e, data
+        first_miss = first_data = None
+        # **首枪 search 返回「全不可取」时再打一枪。** 放货那一刻 Apple 的
+        # fulfillment search 有时还没把新库存 populate，而监控的公开接口已经看到
+        # 了——2026-09-20 三次失败全是这个形状（同一秒监控在报有货）。只要监控
+        # 还认为有货就再打，最多 search_retries 次；问不出就打固定次数。
+        for attempt in range(1 + self.search_retries):
+            data = self.step2_store(page)
+            self.store_used = self.store
+            try:
+                self.take_slot(data)
+                return data
+            except Stalled as e:
+                first_miss, first_data = e, data
+            avail = self.store_availability(data)
+            ready = [sid for sid, ok, _ in avail if ok]
+            if ready or not avail:
+                break               # 有货可换 / 响应没带库存，交给下面
+            last = attempt + 1 > self.search_retries
+            if last or not self._search_worth_retry():
+                break               # 打完了还是全无，或监控已说没了
+            self.log(f"[快车道] 结账侧 {len(avail)} 家全不可取，监控仍报有货，"
+                     f"{self.search_retry_wait:.1f}s 后再打一枪 search")
+            if self.cancelled():
+                raise Stalled("已取消")
+            time.sleep(self.search_retry_wait)
         avail = self.store_availability(data)
 
         ready = [sid for sid, ok, _ in avail if ok]
@@ -1112,6 +1161,16 @@ class FastCheckout:
                      f"按结账侧库存改选）")
             return data
         return self._no_store_left(first, first_data, first_miss)
+
+    def _search_worth_retry(self) -> bool:
+        """再打一枪值不值：监控明说没货了就别打，其余（有货 / 问不出）都打。"""
+        probe = self.still_live
+        if not callable(probe):
+            return True             # 问不出就打（dunhuo 的固定「2 枪」）
+        try:
+            return probe() is not False
+        except Exception:
+            return True
 
     def _no_store_left(self, store: str, data: dict, why: Stalled) -> dict:
         """一家都没排上时的收场。

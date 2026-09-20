@@ -1442,6 +1442,7 @@ class OrderPlacer:
     def __init__(self, *, region: str = "cn",
                  store_numbers: list[str] | None = None,
                  allow_stores: list[str] | None = None,
+                 still_live=None,
                  payment: str = "支付宝", delivery: str = "pickup",
                  id_last4: str = "", last_name: str = "", first_name: str = "",
                  email: str = "", phone: str = "", installment_months: int = 0,
@@ -1453,6 +1454,7 @@ class OrderPlacer:
                  submit_guard=None, cancelled=None):
         self.submit_guard = submit_guard
         self.cancelled = cancelled
+        self.still_live = still_live
         self.region = region
         # 只留真正长得像编号的，顺序去重
         #: 硬限制的门店编号，空 = 不限。换店时不许越过它。
@@ -1531,6 +1533,7 @@ class OrderPlacer:
             payment_label=self.payment, installment_months=self.installment_months,
             place_order=self.place_order_flag and not self.stop_at_review,
             submit_guard=self.submit_guard, cancelled=self.cancelled,
+            still_live=self.still_live,
             log=self.log)
         try:
             ok, self.fast_stage, self.fast_detail = fc.run(page)

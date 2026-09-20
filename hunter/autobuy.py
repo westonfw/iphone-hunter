@@ -1072,6 +1072,9 @@ class AutoBuy:
             pickup_time=self.pickup_time,
             timeout_ms=self.timeout,
             submit_guard=self.submit_guard, cancelled=self.cancelled,
+            # search 头一枪空手时，靠它决定要不要再打一枪：监控明说没货才不打。
+            still_live=(lambda p=want_part: self.stock_live(p)) if (
+                self.abort_when_gone and callable(self.stock_live)) else None,
             log=self.log,
         )
         if self._gone(want_part, "进结账"):
@@ -1480,21 +1483,28 @@ class AutoBuy:
         放货那一刻一次袋状态读要 2.5 秒，那是整趟 21 秒里的一大块。
         状态可能为 None（读法变了、或者固件没带），那时候它自己重读，只是慢一点。
         """
-        from .fastpath import atb_add_url, prepare_bag
+        from .fastpath import atb_add_fetch, atb_add_url, prepare_bag
         t0 = time.monotonic()
+        url = atb_add_url(product_url, want_part, token)
+        how = "fetch"
         try:
-            page.goto(atb_add_url(product_url, want_part, token),
-                      timeout=self.timeout, wait_until="domcontentloaded")
+            atb_add_fetch(page, url)          # 页面内发，不导航、不等产品页
         except Exception as e:
-            self.log(f"[自动下单] 快加购请求失败（{type(e).__name__}），走产品页")
-            return False, None
+            # 连 fetch 都发不出去（页面被关、JS 出错）才退回导航那条老路。
+            how = "导航"
+            self.log(f"[自动下单] 快加购 fetch 没发成（{type(e).__name__}），改用导航")
+            try:
+                page.goto(url, timeout=self.timeout, wait_until="domcontentloaded")
+            except Exception as e2:
+                self.log(f"[自动下单] 快加购请求失败（{type(e2).__name__}），走产品页")
+                return False, None
         # 复核：这一步不能省，加购失败没有任何显式信号
         st = prepare_bag(page, want_part=want_part,
                          want_origin=REGIONS[self.region], log=self.log)
         ok = bool(st.get("ok") and st.get("kept"))
         el = (time.monotonic() - t0) * 1000
         self.log(f"[自动下单] {'快加购成功' if ok else '⚠️ 快加购没进袋（原因见日志上一条）'}"
-                 f"（{el:.0f}ms，未加载产品页）")
+                 f"（{el:.0f}ms，{how}，未加载产品页）")
         return ok, (st.get("state") if ok else None)
 
     def _await_options(self, page, cap_ms: int = 8000, step_ms: int = 100) -> float:

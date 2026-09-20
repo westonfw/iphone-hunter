@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from hunter.autobuy import AutoBuy
 
@@ -281,3 +281,136 @@ class BoundaryIsAppliedEverywhereTests(unittest.TestCase):
         from hunter.__main__ import cmd_fastpath
         self.assertIn('allow = [store] if args.store else stores',
                       inspect.getsource(cmd_fastpath))
+
+
+class SearchRefireTests(unittest.TestCase):
+    """search 头一枪返回「全不可取」时再打一枪。
+
+    放货那一刻 Apple 的 fulfillment search 有时还没把新库存 populate，而监控的
+    公开接口已经看到了——2026-09-20 三次失败全是这个形状（同一秒监控在报有货）。
+    dunhuo 的经验也是「早退通常 2 枪」：第一枪空手不代表没货。
+    """
+
+    def _search(self, avail):
+        return {'retailStores': [
+            {'storeId': sid, 'availability': {'availableNowForAllLines': ok,
+                                              'storeAvailability': '店内取货' if ok else '目前不可取货'}}
+            for sid, ok in avail]}
+
+    def fc(self, still_live=None, retries=1, **kw):
+        from hunter.fastpath import FastCheckout
+        base = dict(store='R581', stores=['R581'], id_last4='1', last_name='张',
+                    first_name='三', log=Mock(), still_live=still_live,
+                    search_retries=retries, search_retry_wait=0.0)
+        base.update(kw)
+        return FastCheckout(**base)
+
+    def drive(self, fc, seq, good=()):
+        """seq 是每次 step2 返回的 avail 列表；take_slot 只在 good 门店成。"""
+        from hunter.fastpath import Stalled
+        calls = {'n': 0}
+
+        def step2(page):
+            i = min(calls['n'], len(seq) - 1); calls['n'] += 1
+            return self._search(seq[i])
+
+        def take_slot(d):
+            live = {sid for sid, ok, _ in fc.store_availability(d) if ok}
+            if fc.store in good and fc.store in live:
+                return {}
+            raise Stalled('排不上')
+
+        fc.step2_store = step2
+        fc.take_slot = take_slot
+        try:
+            fc.select_store(Mock())
+        except Stalled:
+            pass
+        return calls['n']
+
+    def test_all_unavailable_fires_a_second_search(self):
+        fc = self.fc(retries=1)
+        n = self.drive(fc, [[('R581', False)], [('R581', False)]])
+        self.assertEqual(2, n, '全不可取时没有再打一枪')
+
+    def test_the_second_search_can_win(self):
+        """第二枪 populate 出来了，就该正常下这一单。"""
+        fc = self.fc(retries=1)
+        n = self.drive(fc, [[('R581', False)], [('R581', True)]], good=('R581',))
+        self.assertEqual(2, n)
+        self.assertEqual('R581', fc.store_used)
+
+    def test_a_known_gone_model_does_not_refire(self):
+        """监控明说没货了，就别再白烧一枪 10 秒的 search。"""
+        fc = self.fc(still_live=lambda: False, retries=1)
+        n = self.drive(fc, [[('R581', False)], [('R581', False)]])
+        self.assertEqual(1, n, '监控说没货了还在重打')
+
+    def test_a_still_live_model_does_refire(self):
+        fc = self.fc(still_live=lambda: True, retries=2)
+        n = self.drive(fc, [[('R581', False)]] * 3)
+        self.assertEqual(3, n)
+
+    def test_retries_are_bounded(self):
+        fc = self.fc(retries=1)
+        n = self.drive(fc, [[('R581', False)]] * 5)
+        self.assertEqual(2, n, '重试没有被 search_retries 封住')
+
+    def test_first_shot_with_stock_does_not_refire(self):
+        """首枪就有货，一枪就够。"""
+        fc = self.fc(retries=1)
+        n = self.drive(fc, [[('R581', True)]], good=('R581',))
+        self.assertEqual(1, n)
+
+    def test_no_refire_when_disabled(self):
+        fc = self.fc(retries=0)
+        n = self.drive(fc, [[('R581', False)], [('R581', False)]])
+        self.assertEqual(1, n)
+
+
+class FastAddFetchTests(unittest.TestCase):
+    """快加购走页面内 fetch，不再 page.goto 等产品页 DOM。
+
+    page.goto 要等重定向后的产品页 domcontentloaded，实测 1.2~4.3 秒、最慢 28 秒；
+    加购是服务端在那个 GET 上就做完的，用不上返回的 HTML。fetch 只等请求出门。
+    """
+
+    def buyer(self):
+        from types import SimpleNamespace
+        from hunter.autobuy import AutoBuy
+        ab = AutoBuy.__new__(AutoBuy)
+        ab.timeout = 15000
+        ab.region = 'cn'
+        ab.log = Mock()
+        return ab
+
+    def test_it_uses_the_in_page_fetch_not_navigation(self):
+        ab = self.buyer()
+        page = Mock()
+        with patch('hunter.fastpath.atb_add_fetch') as fetch, \
+             patch('hunter.fastpath.prepare_bag',
+                   return_value={'ok': True, 'kept': True, 'state': {'x': 1}}):
+            ok, st = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
+        self.assertTrue(ok)
+        fetch.assert_called_once()
+        page.goto.assert_not_called()
+
+    def test_it_falls_back_to_navigation_when_fetch_cannot_fire(self):
+        ab = self.buyer()
+        page = Mock()
+        with patch('hunter.fastpath.atb_add_fetch', side_effect=RuntimeError('boom')), \
+             patch('hunter.fastpath.prepare_bag',
+                   return_value={'ok': True, 'kept': True, 'state': None}):
+            ok, _ = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
+        self.assertTrue(ok)
+        page.goto.assert_called_once()
+
+    def test_verification_still_decides_success(self):
+        """fetch 发出去不等于进袋——一律以 prepare_bag 复核为准。"""
+        ab = self.buyer()
+        with patch('hunter.fastpath.atb_add_fetch'), \
+             patch('hunter.fastpath.prepare_bag',
+                   return_value={'ok': True, 'kept': False}):
+            ok, st = ab._fast_add(Mock(), 'https://x/p', 'MJ/A', 'tok')
+        self.assertFalse(ok)
+        self.assertIsNone(st)

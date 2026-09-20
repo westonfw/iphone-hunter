@@ -349,16 +349,19 @@ class HotStockRegressions(unittest.TestCase):
 
     def test_checkout_saying_every_store_is_out_stops_immediately(self):
         from hunter.fastpath import FastCheckout, Stalled
+        # search_retries=0：关掉「再打一枪」，验的是全不可取时不带空时段硬撞第 3 步。
+        # （再打一枪那条由 SearchRefireTests 覆盖。）
         fc = FastCheckout(store='R001', stores=['R001', 'R002'],
-                          id_last4='1234', last_name='张', first_name='三', log=Mock())
+                          id_last4='1234', last_name='张', first_name='三',
+                          search_retries=0, log=Mock())
         calls = []
         avail = self._search([('R001', False), ('R002', False)])
         fc.step2_store = lambda page: (calls.append(1), avail)[1]
         fc.take_slot = lambda data: (_ for _ in ()).throw(Stalled('排不上'))
         with self.assertRaises(Stalled) as cm:
             fc.select_store(Mock())
-        self.assertIn('目前不可取货', str(cm.exception))
-        self.assertEqual(1, len(calls))               # 只发了一次 search
+        self.assertIn('不可取货', str(cm.exception))
+        self.assertEqual(1, len(calls))               # 关了重试，只发一次 search
 
     def test_old_flow_can_still_be_forced_through(self):
         from hunter.fastpath import FastCheckout, Stalled
@@ -779,9 +782,10 @@ class FastAddToCartRegressions(unittest.TestCase):
                    [{'ok': True, 'kept': False},        # 购物袋页上：空袋
                     {'ok': True, 'kept': True}])        # 快加购后复核：进袋了
         gone = [c.args[0] for c in page.goto.call_args_list]
-        # 页面本来就在主站上，连购物袋页都不用去——袋子是 fetch 出来的
-        self.assertEqual(1, len(gone), gone)
-        self.assertIn('add-to-cart=add-to-cart', gone[0])
+        # 加购现在走页面内 fetch（page.evaluate），产品页一次都不碰、也不导航
+        ev = [c.args[1] for c in page.evaluate.call_args_list
+              if len(c.args) > 1 and isinstance(c.args[1], str)]
+        self.assertTrue(any('add-to-cart=add-to-cart' in u for u in ev), ev)
         self.assertNotIn(self.URL, gone)                 # 产品页一次都没碰
         ab._pick.assert_not_called()                     # 必选项也不用点
         page.locator.assert_not_called()                 # 更没有点加购按钮
@@ -793,8 +797,10 @@ class FastAddToCartRegressions(unittest.TestCase):
                    [{'ok': True, 'kept': False},
                     {'ok': True, 'kept': False}])       # 复核：没进袋
         gone = [c.args[0] for c in page.goto.call_args_list]
-        self.assertTrue(any('add-to-cart=add-to-cart' in g for g in gone))
-        self.assertIn(self.URL, gone)                    # 老实退回产品页
+        ev = [c.args[1] for c in page.evaluate.call_args_list
+              if len(c.args) > 1 and isinstance(c.args[1], str)]
+        self.assertTrue(any('add-to-cart=add-to-cart' in u for u in ev))  # 快加购发过
+        self.assertIn(self.URL, gone)                    # 复核没进袋，老实退回产品页
         ab._pick.assert_called()
 
     def test_no_token_goes_straight_to_the_product_page(self):
