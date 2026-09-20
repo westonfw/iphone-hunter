@@ -117,11 +117,15 @@ SIGNIN_WAIT = {"pwd": 2500, "account": 4000, "pwd_after_account": 8000}
 
 
 def _apple_password(cfg: dict, log=print) -> str:
-    """取 Apple ID 密码。只认环境变量。"""
+    """取 Apple ID 密码。只认环境变量。
+
+    一台机器跑多个账号时，每个账号在 config 里写自己的 `pwd_env`（环境变量的
+    **名字**，不是值），各读各的。不写就还是那个公共的 HUNTER_APPLE_PWD。
+    """
     if cfg.get("pwd"):
         log(f"⚠️ config.json 里还留着 autobuy.pwd —— 已忽略，请删掉它。"
             f"密码改用环境变量 {PWD_ENV}。")
-    return os.environ.get(PWD_ENV, "")
+    return os.environ.get(str(cfg.get("pwd_env") or "").strip() or PWD_ENV, "")
 
 
 def _on_main(url: str, region: str) -> bool:

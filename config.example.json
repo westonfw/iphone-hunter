@@ -40,6 +40,13 @@
       "iphone-18-pro"
     ]
   },
+  "link": {
+    "id": "a",
+    "buyer_offset": 0,
+    "port": 48711,
+    "peers": [],
+    "allow": []
+  },
   "pickup": {
     "enabled": true,
     "location": "",
