@@ -69,6 +69,45 @@ def verify(payload: dict, mac: str, key: bytes) -> bool:
 
 
 @dataclass(frozen=True)
+class Enlist:
+    """子程序报到：我在，我的转发口在这个端口上。
+
+    **不带自己的 IP。** 主程序从 UDP 包的源地址取——子程序不用去猜自己在内网里
+    叫什么，多网卡、容器、WSL 这些场景下那个猜测经常是错的。
+
+    `direct=True` 表示这台跟主程序同一个出口 IP，借它的口出去等于绕回自己，
+    白搭一跳。这个由人在 config 里标（`link.same_exit_as_master`）——子程序
+    自己问不出公网 IP，而为了问它去连第三方回显服务，代价比收益大。
+    """
+
+    id: str
+    proxy_port: int
+    direct: bool = False
+    at: float = 0.0
+    src: str = ""
+
+    def payload(self) -> dict:
+        return {"v": VERSION, "kind": "enlist", "id": self.id,
+                "proxy_port": int(self.proxy_port), "direct": bool(self.direct),
+                "at": round(self.at, 3), "src": self.src}
+
+    @classmethod
+    def parse(cls, d: dict) -> "Enlist | None":
+        if not isinstance(d, dict) or d.get("v") != VERSION or d.get("kind") != "enlist":
+            return None
+        who = str(d.get("id") or "").strip()
+        try:
+            port = int(d.get("proxy_port") or 0)
+            at = float(d.get("at") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not who or not (0 < port < 65536):
+            return None
+        return cls(id=who, proxy_port=port, direct=bool(d.get("direct")),
+                   at=at, src=str(d.get("src") or who))
+
+
+@dataclass(frozen=True)
 class Sighting:
     """一次「某型号在某门店有货」的观察。
 
@@ -101,8 +140,8 @@ class Sighting:
                    name=str(d.get("name") or ""), at=at, src=str(d.get("src") or ""))
 
 
-def encode(s: Sighting, key: bytes, nonce: str = "") -> bytes:
-    """打包成一个待广播的 UDP 载荷。"""
+def encode(s, key: bytes, nonce: str = "") -> bytes:
+    """打包成一个待广播的 UDP 载荷。Sighting 和 Enlist 都走这里。"""
     body = s.payload()
     body["nonce"] = nonce or uuid.uuid4().hex
     return json.dumps({"body": body, "mac": sign(body, key)},
@@ -141,6 +180,9 @@ class Decoder:
     seen: Seen = field(default_factory=Seen)
     #: 只收自己人发的；留空表示不限。用来把「另一台机器」和「网上邻居」分开。
     allow: tuple = ()
+    #: 只认这几种消息。买手不关心 enlist，主程序两种都要——各自只开自己用得上的，
+    #: 能处理的消息种类越少，能出错的地方越少。
+    kinds: tuple = ("seen",)
 
     def decode(self, raw: bytes) -> tuple["Sighting | None", str]:
         """返回 (信号, 拒绝理由)。收下了理由是空串。"""
@@ -158,7 +200,10 @@ class Decoder:
         nonce = str(body.get("nonce") or "")
         if not nonce:
             return None, "缺 nonce，挡不住重放"
-        s = Sighting.parse(body)
+        kind = str(body.get("kind") or "")
+        if kind not in self.kinds:
+            return None, f"不收 {kind!r} 这种消息"
+        s = (Sighting if kind == "seen" else Enlist).parse(body)
         if s is None:
             return None, "字段不认识（版本不一致？）"
         if self.allow and s.src not in self.allow:
@@ -222,8 +267,10 @@ class Receiver:
     """
 
     def __init__(self, key: bytes, on_sighting, port: int = DEFAULT_PORT,
-                 allow: tuple = (), log=print, clock=time.time):
-        self.decoder = Decoder(key=key, allow=tuple(allow), clock=clock)
+                 allow: tuple = (), log=print, clock=time.time,
+                 kinds: tuple = ("seen",)):
+        self.decoder = Decoder(key=key, allow=tuple(allow), clock=clock,
+                               kinds=tuple(kinds))
         self.on_sighting, self.port, self.log = on_sighting, port, log
         self.sock = None
         self.thread = None
@@ -262,7 +309,8 @@ class Receiver:
             self.taken += 1
             self._last_reason = ""
             try:
-                self.on_sighting(s)
+                # 回调拿得到源地址：enlist 要靠它得知子程序的内网 IP
+                self.on_sighting(s, addr[0])
             except Exception as e:
                 self.log(f"[总线] 处理信号出错：{type(e).__name__}: {e}")
 

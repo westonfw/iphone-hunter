@@ -130,8 +130,8 @@ class LinkedWatcher(StockWatcher):
 
     # ---------- 入 ----------
 
-    def _heard(self, s: Sighting) -> None:
-        """别人看到货了。构造成本地的 Offer 喂给买手。
+    def _heard(self, s: Sighting, ip: str = "") -> None:
+        """别人看到货了。构造成本地的 Offer 喂给买手。（ip 是包的源地址，这里用不上）
 
         **不碰 pacer 的冲刺**：冲刺是给自己的轮询提速用的，而这条信号已经到手了，
         再提速只会多烧配额。冲刺仍然由本机自己看到货时触发。

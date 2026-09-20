@@ -125,7 +125,7 @@ class ShapeTests(unittest.TestCase):
         raw = json.dumps({'body': body, 'mac': sign(body, KEY)}).encode()
         got, why = Decoder(key=KEY, clock=lambda: 1000.0).decode(raw)
         self.assertIsNone(got)
-        self.assertIn('不认识', why)
+        self.assertIn('gone', why)      # 连这种消息都不收
 
     def test_an_unknown_version_is_refused(self):
         body = {'v': 99, 'kind': 'seen', 'part': 'P', 'store': 'S',
@@ -158,7 +158,8 @@ class WireTests(unittest.TestCase):
     def test_a_sighting_crosses_the_wire(self):
         port = self._free_port()
         got = []
-        rx = Receiver(key=KEY, on_sighting=got.append, port=port, log=lambda *a: None)
+        rx = Receiver(key=KEY, on_sighting=lambda s, ip: got.append(s),
+                      port=port, log=lambda *a: None)
         rx.start()
         try:
             tx = Sender(key=KEY, src='sensor-a', port=port,
@@ -210,3 +211,55 @@ class WireTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EnlistTests(unittest.TestCase):
+    """子程序报到。它**不带自己的 IP**——主程序从 UDP 包的源地址取，
+    因为多网卡 / 容器 / WSL 下子程序对自己内网地址的猜测经常是错的。"""
+
+    def enlist(self, **kw):
+        from hunter2.bus import Enlist
+        base = dict(id='b', proxy_port=48712, direct=False, at=1000.0, src='b')
+        base.update(kw)
+        return Enlist(**base)
+
+    def decoder(self, **kw):
+        base = dict(key=KEY, clock=lambda: 1000.0, kinds=('seen', 'enlist'))
+        base.update(kw)
+        return Decoder(**base)
+
+    def test_it_round_trips(self):
+        got, why = self.decoder().decode(encode(self.enlist(), KEY))
+        self.assertEqual('', why)
+        self.assertEqual('b', got.id)
+        self.assertEqual(48712, got.proxy_port)
+        self.assertFalse(got.direct)
+
+    def test_the_same_exit_flag_survives(self):
+        got, _ = self.decoder().decode(encode(self.enlist(direct=True), KEY))
+        self.assertTrue(got.direct)
+
+    def test_it_carries_no_ip_of_its_own(self):
+        """带 IP 的话就得让子程序去猜自己叫什么，那个猜测经常是错的。"""
+        body = self.enlist().payload()
+        self.assertFalse([k for k in body if 'ip' in k.lower() or 'addr' in k.lower()])
+
+    def test_a_nonsense_port_is_refused(self):
+        from hunter2.bus import Enlist, sign
+        for port in (0, -1, 70000):
+            body = dict(self.enlist().payload(), proxy_port=port, nonce='n')
+            raw = json.dumps({'body': body, 'mac': sign(body, KEY)}).encode()
+            self.assertIsNone(self.decoder().decode(raw)[0], port)
+
+    def test_a_forged_enlist_is_refused(self):
+        """伪造的报到会让主程序把流量转给攻击者的机器。"""
+        got, why = self.decoder().decode(encode(self.enlist(), b'wrong'))
+        self.assertIsNone(got)
+        self.assertIn('签名', why)
+
+    def test_a_buyer_refuses_enlist_by_default(self):
+        """能处理的消息种类越少，能出错的地方越少。"""
+        got, why = Decoder(key=KEY, clock=lambda: 1000.0).decode(
+            encode(self.enlist(), KEY))
+        self.assertIsNone(got)
+        self.assertIn('enlist', why)

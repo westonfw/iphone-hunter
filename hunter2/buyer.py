@@ -107,8 +107,8 @@ class Buyer:
         return (self.urls.buy_url(slug, part) if slug
                 else self.urls.base + "/shop/buy-iphone")
 
-    def heard_of(self, s: Sighting) -> None:
-        """探针说某个型号在某店有货。
+    def heard_of(self, s: Sighting, ip: str = "") -> None:
+        """探针说某个型号在某店有货。（ip 是包的源地址，买手用不上；主程序靠它认出子程序）
 
         **「探针还活着」要在过滤之前记。** 哪怕报的是我们不买的型号，它也证明
         了探针在说话——而那正是急刹敢不敢踩的前提。记在过滤之后的话，只盯一个
