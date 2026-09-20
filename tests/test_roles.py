@@ -257,3 +257,96 @@ class BuyOnlyKeepaliveTests(unittest.TestCase):
         import inspect
         src = inspect.getsource(Buyer.__init__)
         self.assertIn('probe_url=', src)
+
+
+class EndToEndTests(unittest.TestCase):
+    """真实 UDP 走一遍：探针的发送路径 → 总线 → 买手的接收路径。
+
+    单元测试各自用 Mock 把对面掐掉了，这一条是唯一能证明两端真的对得上的。
+    不碰 Apple 接口、不开浏览器。
+    """
+
+    KEY = b'e2e-key'
+    PART, STORE = 'MJYA4CH/A', 'R359'
+
+    def setUp(self):
+        import socket as _s
+        s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        s.bind(('', 0))
+        self.port = s.getsockname()[1]
+        s.close()
+
+        b = Buyer.__new__(Buyer)
+        b.lock = __import__('threading').Lock()
+        b.heard, b.any_signal = {}, 0.0
+        b.fresh, b.blind_after = 15.0, 45.0
+        b.parts, b.only_stores, b.offset = [self.PART, 'MJY64CH/A'], [self.STORE], 0
+        b.note_of, b.slug_of = {}, {self.PART: 'iphone-18-pro'}
+        b.urls = Mock()
+        b.urls.buy_url.return_value = f'https://www.apple.com.cn/x/{self.PART}'
+        b.urls.base = 'https://www.apple.com.cn'
+        b.worker = Mock()
+        self.buyer = b
+
+        from hunter2.bus import Receiver, Sender
+        self.rx = Receiver(key=self.KEY, on_sighting=b.heard_of, port=self.port,
+                           log=lambda *a: None)
+        self.rx.start()
+        self.addCleanup(self.rx.close)
+
+        s2 = Sensor.__new__(Sensor)
+        s2.log, s2.bus_id, s2.only_stores = lambda *a: None, 'sensor-a', [self.STORE]
+        s2.client = Mock()
+        s2.client.observed_at = {}
+        s2.sender = Sender(key=self.KEY, src='sensor-a', port=self.port,
+                           peers=('127.0.0.1',), log=lambda *a: None)
+        self.addCleanup(s2.sender.close)
+        self.sensor = s2
+
+    def shout(self):
+        with patch('hunter.monitor.StockWatcher._check_pickup'):
+            Sensor._check_pickup(self.sensor, self.PART, [store(self.STORE)])
+        for _ in range(60):
+            if self.buyer.worker.observe.called:
+                return
+            time.sleep(0.05)
+
+    def test_a_sighting_travels_from_sensor_to_buyer(self):
+        self.shout()
+        self.buyer.worker.observe.assert_called_once()
+        part, offers = self.buyer.worker.observe.call_args.args[:2]
+        self.assertEqual(self.PART, part)
+        self.assertEqual(self.STORE, offers[0].store)
+        self.assertIn(self.PART, offers[0].url)
+
+    def test_the_observation_time_survives_the_wire(self):
+        self.shout()
+        got = self.buyer.worker.observe.call_args.args[1][0]
+        self.assertLess(time.monotonic() - got.observed, 3.0)
+
+    def test_the_heartbeat_drives_the_brake(self):
+        self.shout()
+        self.assertTrue(self.buyer.stock_live(self.PART))
+        self.assertFalse(self.buyer.stock_live('MJY64CH/A'))
+
+    def test_a_replayed_packet_is_refused_on_the_wire(self):
+        from hunter2.bus import Sighting as S, encode
+        raw = encode(S(part=self.PART, store=self.STORE, at=time.time(), src='x'),
+                     self.KEY)
+        self.sensor.sender.open()          # socket 是懒开的
+        before = self.rx.taken
+        for _ in range(2):
+            self.sensor.sender.sock.sendto(raw, ('127.0.0.1', self.port))
+            time.sleep(0.3)
+        self.assertEqual(1, self.rx.taken - before)
+
+    def test_a_forged_packet_is_refused_on_the_wire(self):
+        from hunter2.bus import Sighting as S, encode
+        self.sensor.sender.open()
+        taken, refused = self.rx.taken, self.rx.refused
+        self.sensor.sender.sock.sendto(
+            encode(S(part=self.PART, store=self.STORE, at=time.time(), src='x'),
+                   b'wrong-key'), ('127.0.0.1', self.port))
+        time.sleep(0.3)
+        self.assertEqual(taken, self.rx.taken)
+        self.assertGreater(self.rx.refused, refused)
