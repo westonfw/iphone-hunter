@@ -1576,3 +1576,70 @@ class OneFetchLessRegressions(unittest.TestCase):
                 pass
         self.assertIsNone(ab._bag_state)
         self.assertEqual(1, b.call_args.kwargs['state']['count'])
+
+
+class StallHintsRegressions(unittest.TestCase):
+    """2026-09-20 08:57 走到了第 6 步，请求体跟 HAR 逐字段一致却被拒，
+    而日志只会说「没有 review 这一节」——下次得能看到服务端的说法。"""
+
+    def hints(self, data, **kw):
+        from hunter.fastpath import stall_hints
+        return stall_hints(data, **kw)
+
+    def test_it_digs_error_text_out_of_a_nested_response(self):
+        got = self.hints({'body': {'checkout': {'billing': {'d': {
+            'errorMessage': '所选分期方式当前不可用'}}}}})
+        self.assertIn('所选分期方式当前不可用', got)
+
+    def test_it_looks_at_several_key_spellings(self):
+        for key in ('error', 'errorMessage', 'errors', 'message',
+                    'validationText', 'warningText', 'alertMsg', 'reason'):
+            with self.subTest(key=key):
+                self.assertIn('坏了', self.hints({'a': {key: '坏了'}}), key)
+
+    def test_it_ignores_unrelated_strings(self):
+        self.assertEqual('', self.hints({'title': '结账', 'label': '继续'}))
+
+    def test_whitespace_is_collapsed_and_长文本被截断(self):
+        got = self.hints({'errorMessage': '  行一\n\n   行二  ' + 'x' * 300})
+        self.assertNotIn('\n', got)
+        self.assertLess(len(got), 160)
+
+    def test_duplicates_are_reported_once(self):
+        got = self.hints({'a': {'error': '同一句'}, 'b': {'message': '同一句'}})
+        self.assertEqual(1, got.count('同一句'))
+
+    def test_it_never_walks_forever_on_a_cycle(self):
+        d = {'error': '有错'}
+        d['self'] = d
+        self.assertIn('有错', self.hints(d))
+
+    def test_a_silent_rejection_says_so(self):
+        from hunter.fastpath import FastCheckout, Stalled
+        fc = FastCheckout(store='R581', id_last4='0000', last_name='张',
+                          first_name='三', log=Mock())
+        page = Mock()
+        page.evaluate.return_value = {
+            'status': 200,
+            'json': {'head': {'status': 200},
+                     'body': {'checkout': {'billing': {'d': {}}}}}}
+        fc.stk = 'TOK'
+        with self.assertRaises(Stalled) as cm:
+            fc._post(page, '/shop/checkoutx/billing', 'continueFromBillingToReview',
+                     'checkout.billing', [])
+        self.assertIn('服务端没说为什么', str(cm.exception))
+
+    def test_a_spoken_rejection_is_carried_into_the_error(self):
+        from hunter.fastpath import FastCheckout, Stalled
+        fc = FastCheckout(store='R581', id_last4='0000', last_name='张',
+                          first_name='三', log=Mock())
+        page = Mock()
+        page.evaluate.return_value = {
+            'status': 200,
+            'json': {'head': {'status': 200}, 'body': {'checkout': {
+                'billing': {'d': {'errorMessage': '分期额度不足'}}}}}}
+        fc.stk = 'TOK'
+        with self.assertRaises(Stalled) as cm:
+            fc._post(page, '/shop/checkoutx/billing', 'continueFromBillingToReview',
+                     'checkout.billing', [])
+        self.assertIn('分期额度不足', str(cm.exception))

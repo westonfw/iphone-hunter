@@ -532,6 +532,45 @@ class Blocked(Exception):
         self.retry_after = parse_retry_after(retry_after)
 
 
+#: 响应里可能藏着拒绝原因的键。Apple 的结账模型没有统一的错误位置，
+#: 所以按键名捞——捞到什么都比「返回 200 但没有 review 这一节」强。
+_ERR_KEYS = ("error", "errormessage", "errors", "message", "messages",
+             "validation", "warning", "alert", "reason")
+
+
+def stall_hints(data, limit: int = 4) -> str:
+    """从没推进的响应里把像「拒绝原因」的文字捞出来。
+
+    2026-09-20 08:57 走到了第 6 步（前五步全过、取货时段都拿到了），
+    continueFromBillingToReview 返回 200 却停在 billing。请求体跟 HAR 里
+    手动走通的那次**逐字段一致**，所以不是我们写错了——是服务端拒绝了，
+    而我们当时完全看不到原因。这个函数就是为了下次能看到。
+
+    只捞短文本，不落盘整个响应体：那里面有姓名、手机、地址。
+    """
+    out, seen, walked = [], set(), set()
+    stack = [data]
+    while stack and len(out) < limit:
+        cur = stack.pop()
+        # 结账模型里有自引用（companionBar 之间互指），不记访问过的会原地打转
+        if id(cur) in walked:
+            continue
+        walked.add(id(cur))
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                kl = str(k).lower()
+                if isinstance(v, str) and v.strip() and any(e in kl for e in _ERR_KEYS):
+                    txt = " ".join(v.split())[:120]
+                    if txt not in seen:
+                        seen.add(txt)
+                        out.append(f"{k}={txt}")
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            stack.extend(x for x in cur if isinstance(x, (dict, list)))
+    return "；".join(out[:limit])
+
+
 def raise_if_blocked(response: dict, action: str) -> None:
     if response.get('status') in BLOCK_CODES:
         raise Blocked(f"{action}被拦（{response['status']}）", response.get('retry_after'))
@@ -750,9 +789,12 @@ class FastCheckout:
         if want:
             got = ((data.get("body") or {}).get("checkout") or {})
             if want not in got:
+                hints = stall_hints(data)
                 raise Stalled(
                     f"{action} 返回 200，但响应里没有 `{want}` 这一节"
-                    f"（实际有：{', '.join(list(got)[:8]) or '空'}）——这一步没生效")
+                    f"（实际有：{', '.join(list(got)[:8]) or '空'}）——这一步没生效"
+                    + (f"。响应里捞到的说法：{hints}" if hints
+                       else "。响应里没有任何错误文字，服务端没说为什么"))
         seg = r.get("ms") or {}
         net = r.get("net") or {}
         extra = f"（等服务端 {seg.get('head', '?')}ms / 收包 {seg.get('body', '?')}ms"
