@@ -494,7 +494,10 @@ class AutoBuy:
         st = prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
                          log=self.log)
         if not st.get('kept'):
-            return f"探路加购没进袋（{st.get('reason') or 'token 多半已用过'}）"
+            # 别乱猜原因：2026-09-20 实测 5 次「没进袋」全都是**掉登录**，而这句
+            # 原来咬定「token 用过了」，紧跟着的回退探针又打「⚠️ 没登录」，两行
+            # 自相矛盾。真正的结论由那条探针给，这里只说没进袋。
+            return f"探路加购没进袋（{st.get('reason') or '原因见随后的登录检查'}）"
         before = _pages(ctx)
         try:
             landed = self._enter_checkout(ctx, page, part)
@@ -555,17 +558,27 @@ class AutoBuy:
                 return self._sign_in_blocked(check)
             # 结账预热本身就是最权威的登录验证——它撞的正是下单要的那一级鉴权。
             # 开着它的时候不用再去翻订单页，那一趟纯属多余的导航。
-            note, self.signed_in = '', None
-            if self.warm_checkout and probe_url:
+            def warm():
+                if not (self.warm_checkout and probe_url):
+                    return ''
                 try:
-                    note = self.warm_checkout_session(self._ctx, check, probe_url)
+                    return self.warm_checkout_session(self._ctx, check, probe_url)
                 except Exception as e:
-                    note = f'结账预热出错：{type(e).__name__}'
+                    return f'结账预热出错：{type(e).__name__}'
+
+            def add(note, more):
+                return f'{note}；{more}' if note and more else (note or more)
+
+            note, self.signed_in = '', None
+            note = warm()
             if self.signed_in is None:
                 # 预热关着、或者它没能给出结论（读不到 token、探路加购没进袋）：
                 # 退回订单页探针，那是不下单也能问出登录态的唯一办法。
-                probe = self._preflight_login(check)
-                note = f'{note}；{probe}' if note else probe
+                note = add(note, self._preflight_login(check))
+                if self.signed_in is True:
+                    # 刚补登成功 = 这一轮的结账墙还立着。立刻补一次，别等下一轮。
+                    # 2026-09-20 07:20 掉线、07:27 放货，正好撞上，白付 21 秒。
+                    note = add(note, warm())
             if self.signed_in is True and self.clear_bag and self.preclear_bag:
                 try:
                     check.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,

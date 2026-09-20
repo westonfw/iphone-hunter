@@ -472,6 +472,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.pickup_stores` | 门店名显示偏好，兼容老字段 `pickup_store_name`；不限制快车道候选。限制取货门店请配置 `pickup.stores` / `autobuy.pickup_store_numbers` 编号 |
 | `autobuy.pickup_time` | 自提要选的取货时段：`earliest`（默认，最早可选）/ `latest`（最早那天里最晚的一档）/ `"HH:MM"`（当天第一档不早于它的）。见[自提要选「具体时间」了](#自提要选具体时间了2026-09-17-起) |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
+| `autobuy.preflight_interval` | 保活间隔（秒），默认 `300`。实测登录态约**每 2 小时掉一次**，而且是绝对寿命——每 10 分钟的真实导航也续不动。掉线到下一次保活之间就是裸奔窗口，这个值决定它有多长 |
 | `autobuy.preflight_warm_checkout` | 空闲期把结账那道登录墙提前撞掉，默认 `false`。**会往购物袋里加一台再清掉**，所以要你明确打开。实测墙一次付清后面全免（跨清袋、跨型号、跨门店），有效期 12~45 分钟，由 10 分钟一次的保活维持；换掉的是放货时 5~20 秒的登录。开着它就**不再翻订单页**——结账页认了你，那是比订单页更硬的登录证据 |
 | `autobuy.preflight_clear_bag` | 空闲期就把袋子清空，默认 `true`。放货那一刻的清袋 + 重开产品页是关键路径上最大的一块固定开销，提前做掉 |
 | `autobuy.login_warn_days` | 登录凭证剩余天数低于它就提前推送，默认 `3`。到期要人工过双重认证，脚本代不了劳 |

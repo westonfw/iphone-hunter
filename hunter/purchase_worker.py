@@ -191,7 +191,11 @@ class PurchaseWorker:
 
     def _run(self):
         warm_after = 0
-        check_interval = max(120, float(getattr(self.buyer, 'cfg', {}).get('preflight_interval', 600)))
+        # 默认 300 秒。实测（2026-09-20，两台机器各自独立的 cookie jar）登录态
+        # 大约每 2 小时掉一次，而且是**绝对寿命**——我们每 10 分钟就有真实导航，
+        # 续不动它。掉线到下一次保活之间就是裸奔窗口，600 秒太长：07:20 掉线、
+        # 07:27 放货，正好撞上，白付 21 秒的登录。
+        check_interval = max(120, float(getattr(self.buyer, 'cfg', {}).get('preflight_interval', 300)))
         try:
             self._preflight()
             check_after = self.clock() + check_interval

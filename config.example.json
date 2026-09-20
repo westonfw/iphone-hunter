@@ -58,7 +58,7 @@
     "pickup_stores": [],
     "warm": false,
     "preflight": true,
-    "preflight_interval": 600,
+    "preflight_interval": 300,
     "preflight_clear_bag": true,
     "preflight_warm_checkout": false,
     "login_warn_days": 3,

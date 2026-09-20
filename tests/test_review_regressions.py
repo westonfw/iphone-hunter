@@ -1120,3 +1120,98 @@ class QuotaIsCumulativeRegressions(unittest.TestCase):
             with self.assertRaises(PendingOrder):          # 但挡住一切
                 with self.guard(root, max_orders=2):
                     pass
+
+
+class RelogThenRewarmRegressions(unittest.TestCase):
+    """掉登录补回来之后，那一轮的结账墙还立着——必须立刻补撞，别等下一轮。
+
+    2026-09-20 07:20 掉线、07:27 放货，正好撞在裸奔窗口里，白付 21 秒登录。
+    """
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+
+    def buyer(self, **cfg):
+        ab = AutoBuy({'preflight_warm_checkout': True, **cfg},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab.start, ab._settle = Mock(), Mock()
+        ab.preflight_clear_bag = Mock(return_value='清空了')
+        p = Mock(); p.url = 'https://www.apple.com.cn/shop/bag'
+        p.is_closed.return_value = False
+        ab._login_page, ab._ctx = p, Mock()
+        return ab
+
+    def test_rewarms_right_after_a_successful_relogin(self):
+        ab = self.buyer()
+        calls = []
+
+        def warm(*a):
+            calls.append(ab.signed_in)
+            if ab.signed_in is True:          # 补登之后这一次
+                return '结账登录墙已撞掉'
+            return '探路加购没进袋（原因见随后的登录检查）'
+
+        def relogin(_page):
+            ab.signed_in = True
+            return '已登录（预热时补登）'
+
+        ab.warm_checkout_session = warm
+        ab._preflight_login = relogin
+        note = ab.prepare(self.URL)
+        self.assertEqual(2, len(calls))                  # 预热跑了两次
+        self.assertEqual([None, True], calls)
+        self.assertIn('已撞掉', note)
+
+    def test_no_rewarm_when_the_relogin_also_failed(self):
+        ab = self.buyer()
+        calls = []
+        ab.warm_checkout_session = Mock(
+            side_effect=lambda *a: calls.append(1) or '探路加购没进袋')
+
+        def fail(_page):
+            ab.signed_in = False
+            return '⚠️ 未登录'
+
+        ab._preflight_login = fail
+        ab.prepare(self.URL)
+        self.assertEqual(1, len(calls))                  # 没必要再撞一次
+
+    def test_a_conclusive_warmup_never_triggers_the_order_page(self):
+        ab = self.buyer()
+
+        def warm(*a):
+            ab.signed_in = True
+            return '结账会话已就绪'
+
+        ab.warm_checkout_session = warm
+        ab._preflight_login = Mock()
+        ab.prepare(self.URL)
+        ab._preflight_login.assert_not_called()
+
+    def test_the_failure_note_does_not_guess_the_cause(self):
+        """原来咬定「token 多半已用过」，紧跟着的探针又打「⚠️ 没登录」，自相矛盾。"""
+        ab = AutoBuy({'preflight_warm_checkout': True},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab._ctx = Mock()
+        ab._ctx.cookies.return_value = [{'name': 'as_atb', 'value': '1.0|x|' + 'd' * 40}]
+        ab._ctx.pages = []
+        page = Mock(); page.url = 'https://www.apple.com.cn/shop/bag'
+        page.goto.side_effect = lambda u, **kw: setattr(page, 'url', u)
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': False}):
+            note = ab.warm_checkout_session(ab._ctx, page, self.URL)
+        self.assertIn('没进袋', note)
+        self.assertNotIn('token 多半已用过', note)
+
+
+class PreflightIntervalRegressions(unittest.TestCase):
+    def test_default_is_five_minutes(self):
+        """登录态约每 2 小时掉一次且续不动，掉线到下次保活之间就是裸奔窗口。"""
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.buyer = SimpleNamespace(cfg={})
+        self.assertEqual(
+            300.0, max(120, float(w.buyer.cfg.get('preflight_interval', 300))))
+
+    def test_config_can_still_override(self):
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.buyer = SimpleNamespace(cfg={'preflight_interval': 900})
+        self.assertEqual(
+            900.0, max(120, float(w.buyer.cfg.get('preflight_interval', 300))))
