@@ -16,11 +16,26 @@ import secrets
 from hunter.__main__ import ROOT, load_config
 
 from .bus import KEY_ENV, bus_key
+from .buyer import Buyer
 from .link import LinkedWatcher
+from .sensor import Sensor
 
 
 def cmd_watch(args) -> int:
+    """又盯又买（单机也能跑）。想把两件事拆到不同进程/机器上，用 sense / buy。"""
     LinkedWatcher(load_config(), ROOT, sprint=args.sprint).loop()
+    return 0
+
+
+def cmd_sense(args) -> int:
+    """只盯不买。不需要账号，所以可以按出口 IP 随便加。"""
+    Sensor(load_config(), ROOT, sprint=args.sprint).loop()
+    return 0
+
+
+def cmd_buy(args) -> int:
+    """只买不盯。一个请求都不花在巡检上，库存全靠探针喂。"""
+    Buyer(load_config(), ROOT).loop()
     return 0
 
 
@@ -67,9 +82,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m hunter2", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    w = sub.add_parser("watch", help="盯库存并自动下单，同时接入局域网总线")
+    w = sub.add_parser("watch", help="又盯又买（单机模式），同时接入总线")
     w.add_argument("--sprint", action="store_true", help="冲刺模式（开卖前十分钟）")
     w.set_defaults(func=cmd_watch)
+
+    se = sub.add_parser("sense", help="只盯不买——不需要账号，按出口 IP 加")
+    se.add_argument("--sprint", action="store_true", help="冲刺模式")
+    se.set_defaults(func=cmd_sense)
+
+    b = sub.add_parser("buy", help="只买不盯——库存全靠探针喂，按账号加")
+    b.set_defaults(func=cmd_buy)
 
     k = sub.add_parser("key", help="生成总线密钥")
     k.set_defaults(func=cmd_key)

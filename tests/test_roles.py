@@ -1,0 +1,190 @@
+"""探针和买手彻底分开之后的两件要紧事：
+
+  探针：看到货每一轮都广播（买手拿它当心跳，不只在状态翻转时发）
+  买手：一个请求都不巡检，而它的急刹必须分清「没货」和「我瞎了」
+"""
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+from hunter.apple import Stock, StorePickup
+from hunter2.bus import Sighting
+from hunter2.buyer import Buyer
+from hunter2.sensor import Sensor
+
+
+def store(num='R359', state=Stock.AVAILABLE, name='南京东路'):
+    # UNKNOWN 必须带 reason，否则 StorePickup 会拒绝——「不知道」退化成
+    # 「没货」正是它要防的事
+    kw = {'reason': '接口没返回'} if state is Stock.UNKNOWN else {}
+    return StorePickup('MJYA4CH/A', num, name, state=state, **kw)
+
+
+class SensorTests(unittest.TestCase):
+    def sensor(self, only=()):
+        s = Sensor.__new__(Sensor)
+        s.log, s.sender, s.bus_id = Mock(), Mock(), 'sensor-a'
+        s.sender.send.return_value = 1
+        s.only_stores = list(only)
+        s.client = Mock()
+        s.client.observed_at = {}
+        return s
+
+    def shout(self, s, part='MJYA4CH/A', stores=()):
+        # 调真实实现，但把父类那一套掐掉（它要状态文件和通知渠道）
+        with patch('hunter.monitor.StockWatcher._check_pickup'):
+            Sensor._check_pickup(s, part, list(stores))
+
+    def test_it_shouts_every_round_not_only_on_change(self):
+        """买手拿这个当心跳：一直收到 = 货还在。只在翻转时发的话，买手会以为货没了。"""
+        s = self.sensor()
+        for _ in range(3):
+            self.shout(s, stores=[store()])
+        self.assertEqual(3, s.sender.send.call_count)
+
+    def test_it_says_nothing_when_there_is_no_stock(self):
+        s = self.sensor()
+        self.shout(s, stores=[store(state=Stock.UNAVAILABLE)])
+        s.sender.send.assert_not_called()
+
+    def test_unknown_state_is_not_a_sighting(self):
+        s = self.sensor()
+        self.shout(s, stores=[store(state=Stock.UNKNOWN)])
+        s.sender.send.assert_not_called()
+
+    def test_stores_we_do_not_go_to_are_not_shouted(self):
+        s = self.sensor(only=['R581'])
+        self.shout(s, stores=[store('R359'), store('R581')])
+        self.assertEqual(1, s.sender.send.call_count)
+        self.assertEqual('R581', s.sender.send.call_args.args[0].store)
+
+    def test_a_send_failure_never_stops_the_round(self):
+        s = self.sensor()
+        s.sender.send.side_effect = OSError('网络没了')
+        self.shout(s, stores=[store()])          # 不抛
+
+    def test_without_a_key_it_just_watches(self):
+        s = self.sensor()
+        s.sender = None
+        self.shout(s, stores=[store()])          # 不抛
+
+    def test_the_sighting_carries_the_stores_number_and_name(self):
+        s = self.sensor()
+        self.shout(s, stores=[store('R359', name='南京东路')])
+        got = s.sender.send.call_args.args[0]
+        self.assertEqual('R359', got.store)
+        self.assertEqual('南京东路', got.name)
+
+
+class BuyerBrakeTests(unittest.TestCase):
+    """急刹必须分清三种状态，尤其是「探针全挂」——那时候刹车等于自断手脚。"""
+
+    def buyer(self, fresh=15.0, blind=45.0):
+        b = Buyer.__new__(Buyer)
+        b.lock = __import__('threading').Lock()
+        b.heard, b.any_signal = {}, 0.0
+        b.fresh, b.blind_after = fresh, blind
+        return b
+
+    def test_a_fresh_heartbeat_means_go(self):
+        b = self.buyer()
+        now = time.monotonic()
+        b.heard['P'], b.any_signal = now - 2.0, now
+        self.assertTrue(b.stock_live('P'))
+
+    def test_silence_about_this_model_while_others_talk_means_gone(self):
+        b = self.buyer()
+        b.any_signal = time.monotonic()          # 探针还在说话
+        self.assertFalse(b.stock_live('P'))      # 但很久没提这个型号
+
+    def test_a_stale_heartbeat_means_gone(self):
+        b = self.buyer(fresh=15.0)
+        now = time.monotonic()
+        b.heard['P'], b.any_signal = now - 40.0, now
+        self.assertFalse(b.stock_live('P'))
+
+    def test_no_sensor_at_all_means_blind_not_gone(self):
+        """探针全挂的时候刹车会把自己废掉——那恰恰是最该老实往下走的时候。"""
+        self.assertIsNone(self.buyer().stock_live('P'))
+
+    def test_sensors_going_quiet_flips_back_to_blind(self):
+        b = self.buyer(blind=45.0)
+        b.any_signal = time.monotonic() - 60.0   # 一分钟没动静了
+        self.assertIsNone(b.stock_live('P'))
+
+    def test_the_brake_is_wired_into_the_buyer(self):
+        """autobuy 的急刹要用买手这个版本，不是 worker 自带那个按轮询写的。"""
+        import inspect
+        src = inspect.getsource(Buyer.__init__)
+        self.assertIn('self.autobuy.stock_live = self.stock_live', src)
+
+
+class BuyerIntakeTests(unittest.TestCase):
+    def buyer(self, parts=('MJY64CH/A', 'MJYA4CH/A'), only=(), offset=0):
+        b = Buyer.__new__(Buyer)
+        b.lock = __import__('threading').Lock()
+        b.heard, b.any_signal = {}, 0.0
+        b.fresh, b.blind_after = 15.0, 45.0
+        b.parts, b.only_stores, b.offset = list(parts), list(only), offset
+        b.note_of, b.slug_of = {}, {}
+        b.urls = Mock()
+        b.urls.buy_url.return_value = 'https://x'
+        b.urls.base = 'https://www.apple.com.cn'
+        b.worker = Mock()
+        return b
+
+    def heard(self, b, part='MJYA4CH/A', store='R359', ago=1.0):
+        b.heard_of(Sighting(part=part, store=store, name='南京东路',
+                            at=time.time() - ago, src='s1'))
+
+    def test_a_sighting_becomes_an_offer_for_the_worker(self):
+        b = self.buyer()
+        self.heard(b)
+        b.worker.observe.assert_called_once()
+        part, offers = b.worker.observe.call_args.args[:2]
+        self.assertEqual('MJYA4CH/A', part)
+        self.assertEqual('R359', offers[0].store)
+
+    def test_the_age_is_preserved(self):
+        b = self.buyer()
+        self.heard(b, ago=9.0)
+        got = b.worker.observe.call_args.args[1][0]
+        self.assertAlmostEqual(9.0, time.monotonic() - got.observed, delta=1.0)
+
+    def test_a_model_we_do_not_buy_is_ignored(self):
+        b = self.buyer(parts=['MJY64CH/A'])
+        self.heard(b, part='MJYE4CH/A')
+        b.worker.observe.assert_not_called()
+
+    def test_a_store_we_do_not_go_to_is_ignored(self):
+        b = self.buyer(only=['R581'])
+        self.heard(b, store='R359')
+        b.worker.observe.assert_not_called()
+
+    def test_intake_feeds_the_heartbeat(self):
+        b = self.buyer()
+        self.assertIsNone(b.stock_live('MJYA4CH/A'))   # 还没听见任何动静
+        self.heard(b)
+        self.assertTrue(b.stock_live('MJYA4CH/A'))
+
+    def test_an_ignored_sighting_still_proves_sensors_are_alive(self):
+        """不买的型号也证明探针在说话。记在过滤之后的话，只盯一个子集的买手
+        会一直以为自己瞎了，急刹永远不生效。"""
+        b = self.buyer(parts=['MJY64CH/A'])
+        self.assertIsNone(b.stock_live('MJY64CH/A'))    # 什么都没听见 = 瞎
+        self.heard(b, part='MJYE4CH/A')                 # 听见了，只是不关我们的事
+        self.assertFalse(b.stock_live('MJY64CH/A'))     # 那就是它真没货
+
+    def test_the_offset_spreads_deployments(self):
+        b = self.buyer(offset=1)
+        self.heard(b, part='MJY64CH/A')
+        self.assertEqual(1, b.worker.observe.call_args.args[1][0].priority[0])
+
+    def test_only_sightings_go_in_never_absences(self):
+        b = self.buyer()
+        self.heard(b)
+        self.assertEqual(2, len(b.worker.observe.call_args.args))
+
+
+if __name__ == '__main__':
+    unittest.main()
