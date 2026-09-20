@@ -69,6 +69,9 @@ class ExitPool:
         self.sprint = sprint
         self._lock = threading.Lock()
         self._exits: dict[str, Exit] = {}
+        #: 标了同出口的子程序。它们永远进不了 _exits，所以不能拿「在不在池子里」
+        #: 当「说过没说过」——那样每 20 秒一次报到就刷一行，一天四千多行。
+        self._same: set[str] = set()
         self._turn = 0
         # 直连永远在池子里：就算一个子程序都没上线，主程序也得能干活
         d = self._make("direct", None, self.clock())
@@ -153,9 +156,13 @@ class ExitPool:
             return
         with self._lock:
             if direct:
-                if who not in self._exits:
-                    self.log(f"[出口] {who} 报到，但标了跟主程序同出口，不单独加一条")
+                self._exits.pop(who, None)   # 之前借过口、现在改标同出口了
+                if who not in self._same:
+                    self._same.add(who)
+                    self.log(f"[出口] {who} 报到，但标了跟主程序同出口，"
+                             f"不单独加一条")
                 return
+            self._same.discard(who)
             proxy = self._proxy_url(ip, port)
             cur = self._exits.get(who)
             if cur is not None and cur.proxy == proxy:

@@ -414,3 +414,52 @@ class BoostFloorTests(unittest.TestCase):
         p.blocked(e, 30.0)
         p.ok(e)
         self.assertEqual(0.0, e.floor_at, '打通了，上次退避的下限还压着')
+
+
+class SameExitLogTests(unittest.TestCase):
+    """标了同出口的子程序每 20 秒报一次到，那行提示只该出现一次。
+
+    拿「在不在池子里」当「说过没说过」是不行的——它们永远进不了池子，于是
+    每次报到都刷一行，一天四千多行，真正的出口变化被埋在里面。
+    """
+
+    def pool(self):
+        def mk(**k):
+            c = Mock()
+            c.breakers = {}
+            return c
+        for x in (patch('scout.exits.AppleClient', side_effect=mk),
+                  patch.object(ExitPool, '_proxy_url',
+                               side_effect=lambda i, p: f'http://u:k@{i}:{p}')):
+            x.start()
+            self.addCleanup(x.stop)
+        p = ExitPool({'region': 'cn'}, log=lambda *a: None)
+        self.logs = []
+        p.log = self.logs.append
+        return p
+
+    def test_it_says_so_once_not_every_beat(self):
+        p = self.pool()
+        for _ in range(10):
+            p.enlist('buyerA', '192.168.1.9', 0, True)
+        self.assertEqual(1, sum('同出口' in x for x in self.logs))
+
+    def test_it_never_becomes_an_exit(self):
+        p = self.pool()
+        p.enlist('buyerA', '192.168.1.9', 0, True)
+        self.assertEqual(1, len(p))
+
+    def test_switching_to_same_exit_removes_the_old_one(self):
+        """本来借着口，config 改成同出口之后那条出口不能还留着。"""
+        p = self.pool()
+        p.enlist('buyerA', '192.168.1.9', 48712, False)
+        self.assertEqual(2, len(p))
+        p.enlist('buyerA', '192.168.1.9', 0, True)
+        self.assertEqual(1, len(p))
+
+    def test_switching_back_says_so_again(self):
+        p = self.pool()
+        p.enlist('buyerA', '192.168.1.9', 0, True)
+        p.enlist('buyerA', '192.168.1.9', 48712, False)
+        p.enlist('buyerA', '192.168.1.9', 0, True)
+        self.assertEqual(2, sum('同出口' in x for x in self.logs))
