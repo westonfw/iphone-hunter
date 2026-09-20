@@ -1365,3 +1365,72 @@ class KeepBuyingWhileStockLastsRegressions(unittest.TestCase):
         now[0] = 60.0
         w.offers = {('A', 'R1'): self.offer('A', 'R1', observed=59.0)}
         self.assertIsNone(w._next())
+
+
+class FatalVsBlockedRegressions(unittest.TestCase):
+    """「这个型号没救了」和「全局被限流」必须分开。
+
+    限流是 IP/端点级的，跟型号无关。拿 retriable=False 判死型号，等于一次 541
+    就把那个型号从这一轮里永久排除——而冷却过了它可能正常得很。
+    """
+
+    def placer(self, **kw):
+        base = dict(no_retry=False, retriable=True, fast_ordered=False,
+                    retry_after=0, blocked=False)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def buyer(self):
+        return AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+
+    def test_being_rate_limited_never_condemns_the_model(self):
+        ab = self.buyer()
+        r = ab._wrap(self.placer(retriable=False, blocked=True),
+                     'u', False, '⚠️ 快车道入口失败', '541', '')
+        self.assertFalse(r.retriable)
+        self.assertFalse(r.fatal, '限流是全局的，不该判死型号')
+
+    def test_a_config_dead_end_does_condemn_it(self):
+        ab = self.buyer()
+        r = ab._wrap(self.placer(retriable=False, blocked=False),
+                     'u', False, '⚠️ 缺少取货门店编号', 'd', '')
+        self.assertTrue(r.fatal)
+
+    def test_a_sold_out_page_condemns_it(self):
+        """页面明写售罄：这一轮这个型号真的没了，再打是白烧几十秒。"""
+        ab = self.buyer()
+        ab._pick, ab._settle = Mock(), Mock()
+        ab._await_options = Mock(return_value=0.0)
+        ab._wait_add_button = Mock(return_value=(False, 'SOLD_OUT:已售罄'))
+        page = Mock()
+        page.url = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+        page.goto.side_effect = lambda u, **kw: setattr(page, 'url', u)
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': False}), \
+             patch('hunter.autobuy.watch_checkout_block', return_value={}):
+            r = ab._drive(Mock(), page, page.url, False)
+        self.assertTrue(r.fatal)
+        self.assertFalse(r.retriable)
+
+    def test_a_successful_order_is_never_fatal(self):
+        ab = self.buyer()
+        r = ab._wrap(self.placer(fast_ordered=True), 'u', True, '已创建待付款订单', 'd', 'W1')
+        self.assertFalse(r.fatal)
+
+    def test_an_unknown_result_is_not_fatal_either(self):
+        """它走的是整体停摆（halt_for_human），不该顺手把型号也判死。"""
+        ab = self.buyer()
+        r = ab._wrap(self.placer(no_retry=True, retriable=False),
+                     'u', False, '⚠️ 下单结果不明', 'd', '')
+        self.assertFalse(r.fatal)
+        self.assertTrue(ab.halt_for_human)
+
+    def test_the_worker_only_burns_on_fatal(self):
+        from hunter.autobuy import BuyResult
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.burned, w.log = set(), Mock()
+        for res, want in ((BuyResult(False, '限流', retriable=False), False),
+                          (BuyResult(False, '售罄', retriable=False, fatal=True), True)):
+            w.burned.clear()
+            if res.fatal:
+                w.burned.add('A')
+            self.assertEqual(want, 'A' in w.burned, res.stage)

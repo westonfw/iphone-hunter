@@ -44,7 +44,9 @@ class PurchaseWorker:
         self.epochs = {}
         #: 每个型号已经试过的门店。冒出一家没试过的 = 新机会，重试计数清零。
         self.tried = {}
-        #: 这一轮已经判死的型号（retriable=False，比如页面明写售罄）。跟次数无关，
+        #: 这一轮已经判死的型号（result.fatal，比如页面明写售罄、配置不对）。
+        #: **不含被限流**——那是全局的，由 cooldown_until 管，冷却过了还要接着打。
+        #: 跟次数无关，
         #: 不限次数时它就是唯一的刹车。卖光再补货时跟着 attempts 一起清。
         self.burned = set()
         self.cv = threading.Condition()
@@ -278,8 +280,12 @@ class PurchaseWorker:
                             self.attempts[offer.part] = 0, self.clock()
                         else:
                             count = self.attempts.get(offer.part, (0, 0))[0] + 1
-                            if not result.retriable:
+                            if result.fatal:
+                                # 只有「这个型号没救了」才判死。被限流不算——
+                                # 那是全局的，冷却过了还得接着打这个型号。
                                 self.burned.add(offer.part)
+                                self.log(f'[购买] {offer.part} 这一轮判死：'
+                                         f'{result.stage}')
                             self.attempts[offer.part] = count, self.clock()
                     self.cooldown_until = max(self.cooldown_until,
                                               self.clock() + result.retry_after)

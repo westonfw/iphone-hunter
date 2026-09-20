@@ -94,6 +94,10 @@ class BuyResult:
     wake: bool = False
     #: 已经买够 max_orders 台，收工。不是失败，也不该重试。
     quota_done: bool = False
+    #: **这个型号这一轮没救了**（页面明写售罄、配置不对）。跟 retriable=False
+    #: 不是一回事：被限流也是 retriable=False，但那是**全局**的，冷却过了还得
+    #: 接着打这个型号——拿它判死等于一次 541 就把型号永久排除。
+    fatal: bool = False
 
 
 #: Apple ID 密码从这个环境变量读，**不从 config.json 读**。
@@ -857,7 +861,7 @@ class AutoBuy:
         if not dry_run and not want_part:
             return BuyResult(False, "缺少明确的目标型号", page.url,
                              "购买链接需要包含 part number；请补全 model_slug 和 part。",
-                             retriable=False)
+                             retriable=False, fatal=True)
         # 「袋里已经是这次要买的那台」才允许跳过清袋和加购。型号不同就得重来，
         # 哪怕上一轮确实加购成功过。
         bagged_ok = False
@@ -951,7 +955,7 @@ class AutoBuy:
                     return BuyResult(
                         False, "⚠️ 已经买不到了", page.url,
                         f"页面显示「{mark}」——多半是刚被人抢走。不再重试这一单。",
-                        retriable=False)
+                        retriable=False, fatal=True)
                 return BuyResult(False, "加购按钮不可用", page.url, why)
 
         if dry_run:
@@ -1161,8 +1165,13 @@ class AutoBuy:
             self.order_placed = self._attempt_order = self.halt_for_human = True
             return BuyResult(ok, stage, url, detail, order_id=order_id,
                              retriable=False)
+        retriable = getattr(placer, "retriable", True)
         return BuyResult(ok, stage, url, detail, order_id=order_id,
-                         retriable=getattr(placer, "retriable", True),
+                         retriable=retriable,
+                         # 配置类的死局（不是自提、没有门店编号）才判死这个型号；
+                         # 被限流虽然也 retriable=False，但那是全局的，别判死。
+                         fatal=bool(not ok and not retriable
+                                    and not getattr(placer, "blocked", False)),
                          order_created=bool(getattr(placer, "fast_ordered", False)),
                          retry_after=max(120, getattr(placer, "retry_after", 0))
                          if getattr(placer, "blocked", False) is True else 0)
