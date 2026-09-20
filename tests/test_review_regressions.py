@@ -1022,7 +1022,7 @@ class ParkAfterAttemptRegressions(unittest.TestCase):
 
     def setup(self, url=CHECKOUT, placed=False):
         ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
-        ab.order_placed = placed
+        ab._attempt_order = placed        # 「这一单」可能成单，不是「历史上买过」
         p = Mock(); p.url = url
         p.is_closed.return_value = False
         p.goto.side_effect = lambda u, **kw: setattr(p, 'url', u)
@@ -1035,7 +1035,7 @@ class ParkAfterAttemptRegressions(unittest.TestCase):
         self.assertEqual(self.BAG, p.url)
 
     def test_a_possible_order_is_never_navigated_away(self):
-        """order_placed 同时覆盖「成功」和「结果不明」。那一页上有二维码和订单号。"""
+        """_attempt_order 覆盖「成功」和「结果不明」。那一页上有二维码和订单号。"""
         ab, p = self.setup(placed=True)
         ab._park_after_attempt(p)
         self.assertEqual(self.CHECKOUT, p.url)
@@ -1043,6 +1043,15 @@ class ParkAfterAttemptRegressions(unittest.TestCase):
 
     def test_an_already_expired_page_is_also_taken_away(self):
         ab, p = self.setup('https://www.apple.com.cn/shop/sorry/session_expired')
+        ab._park_after_attempt(p)
+        self.assertEqual(self.BAG, p.url)
+
+    def test_later_failures_still_get_parked_after_an_earlier_success(self):
+        """买到第一台之后 order_placed 就一直是 True。拿它当判据的话，之后每一次
+        失败尝试都会把标签留在结账页上滴答——max_orders>1 时这是常态。"""
+        ab, p = self.setup()
+        ab.order_placed = True            # 之前买到过
+        ab._attempt_order = False         # 但这一单没成
         ab._park_after_attempt(p)
         self.assertEqual(self.BAG, p.url)
 
@@ -1215,3 +1224,70 @@ class PreflightIntervalRegressions(unittest.TestCase):
         w.buyer = SimpleNamespace(cfg={'preflight_interval': 900})
         self.assertEqual(
             900.0, max(120, float(w.buyer.cfg.get('preflight_interval', 300))))
+
+
+class MaxOrdersActuallyWorksRegressions(unittest.TestCase):
+    """max_orders 大于 1 必须真的能买到第二台。
+
+    曾经不能：_wrap 成功时置 order_placed=True，而 worker 的
+    halted = bool(order_placed) 立刻停摆——设 4 的实际行为跟 1 一模一样。
+    """
+
+    def worker(self, buyer):
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.buyer, w.halted, w.locked = buyer, False, None
+        return w
+
+    def test_a_successful_order_does_not_halt_the_worker(self):
+        w = self.worker(SimpleNamespace(order_placed=True, halt_for_human=False))
+        w.halted = bool(getattr(w.buyer, 'halt_for_human', False))
+        self.assertFalse(w.halted, '成单只是「还差几台」，不该停')
+
+    def test_an_unknown_result_does_halt_the_worker(self):
+        w = self.worker(SimpleNamespace(order_placed=True, halt_for_human=True))
+        w.halted = bool(getattr(w.buyer, 'halt_for_human', False))
+        self.assertTrue(w.halted)
+
+    def test_wrap_marks_success_without_asking_for_a_human(self):
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        placer = SimpleNamespace(no_retry=False, retriable=True,
+                                 fast_ordered=True, retry_after=0)
+        r = ab._wrap(placer, 'u', True, '已创建待付款订单', 'd', 'W123')
+        self.assertTrue(r.ok)
+        self.assertTrue(ab.order_placed)       # 通知和「别动标签」要用
+        self.assertFalse(ab.halt_for_human)    # 但不是停止信号
+
+    def test_wrap_asks_for_a_human_when_the_result_is_unknown(self):
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        placer = SimpleNamespace(no_retry=True, retriable=False,
+                                 fast_ordered=False, retry_after=0)
+        r = ab._wrap(placer, 'u', False, '⚠️ 下单结果不明', 'd', '')
+        self.assertFalse(r.retriable)
+        self.assertTrue(ab.halt_for_human)
+
+    def test_the_quota_is_what_finally_stops_it(self):
+        """买够了由守卫说了算：下一单进不了守卫就抛 QuotaReached。"""
+        from hunter.purchase_guard import PurchaseGuard, QuotaReached
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for n in ('A', 'B'):
+                with PurchaseGuard(root, max_orders=2) as g:
+                    g.submitted(store='R1', part=n)
+                    g.finish('confirmed', f'/{n}')
+            with self.assertRaises(QuotaReached):
+                with PurchaseGuard(root, max_orders=2):
+                    pass
+
+    def test_four_orders_go_through_when_asked_for_four(self):
+        from hunter.purchase_guard import PurchaseGuard, QuotaReached
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for n in 'ABCD':
+                with PurchaseGuard(root, max_orders=4) as g:
+                    g.submitted(store='R1', part=n)
+                    g.finish('confirmed', f'/{n}')
+            with PurchaseGuard(root, inspect=True) as g:
+                self.assertEqual(4, len(g.bought))
+            with self.assertRaises(QuotaReached):
+                with PurchaseGuard(root, max_orders=4):
+                    pass

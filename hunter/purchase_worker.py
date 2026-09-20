@@ -158,7 +158,8 @@ class PurchaseWorker:
                 self.log(f'[购买] {e}')
                 return
             if isinstance(e, PendingOrder):
-                self.buyer.order_placed = self.halted = True
+                self.buyer.order_placed = self.buyer.halt_for_human = True
+                self.halted = True
             note = str(e)
             if note != getattr(self, '_login_note', ''):
                 self.report(BuyResult(False, '购买就绪检查未通过', '', note, wake=True),
@@ -263,9 +264,12 @@ class PurchaseWorker:
                         self.attempts[offer.part] = count, self.clock()
                     self.cooldown_until = max(self.cooldown_until,
                                               self.clock() + result.retry_after)
-                    # 买够了才停。max_orders>1 时一单成功只是「还差几台」，
-                    # 真正的上限由 PurchaseGuard 的配额说了算。
-                    self.halted = bool(self.buyer.order_placed)
+                    # 买够了才停。成功一单只是「还差几台」——真正的上限由
+                    # PurchaseGuard 的配额（max_orders）说了算，下一单进不了
+                    # 守卫就会抛 QuotaReached，那时才收工。
+                    # 用 order_placed 当停止信号是错的：它成单就置 True，于是
+                    # 一单之后全线停摆，max_orders 大于 1 永远不生效。
+                    self.halted = bool(getattr(self.buyer, 'halt_for_human', False))
                 self.log(f'[购买] {offer.part}：{result.stage}，'
                          f'耗时 {self.clock() - started:.1f}s')
                 try:

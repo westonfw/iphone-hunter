@@ -219,6 +219,13 @@ class AutoBuy:
         #: A 色放货、加购后失败重试，下一轮命中的可能是 B 色；这时如果只看
         #: 「加过了」就跳过清袋和加购，等于拿着 A 色去给 B 色结账，买错机器。
         self.bagged_part = ""
+        #: 「必须停下来等人」——只有「结果不明」和「已有未了结的提交记录」会置它。
+        #: **成功下单不置**：买够几台由 PurchaseGuard 的配额说了算（max_orders），
+        #: 拿它当停止信号的话，一单成功就全线停摆，max_orders 大于 1 永远不生效。
+        self.halt_for_human = False
+        #: 这一单是不是可能产生了订单。每次 _drive 开头清零，只用来决定收尾时
+        #: 要不要把标签带离结账页（那一页上有二维码和订单号）。
+        self._attempt_order = False
         #: 上一轮打的是哪个型号、什么时候打完的。同型号重试时用来决定要不要走
         #: 「先问购物袋」的快路。用墙上时钟，因为它要跨越很长的空闲期。
         self._last_part, self._last_at = "", 0.0
@@ -815,6 +822,7 @@ class AutoBuy:
         from .fastpath import Blocked
         if dry_run:
             return self._drive_inner(ctx, page, url, True, in_stock, in_stock_numbers)
+        self._attempt_order = False
         try:
             with PurchaseGuard(self.root, max_orders=self.max_orders) as guard:
                 self.submit_guard = guard
@@ -829,7 +837,7 @@ class AutoBuy:
             return BuyResult(False, '已买够，停止抢购', page.url, str(e),
                              retriable=False, quota_done=True)
         except PendingOrder as e:
-            self.order_placed = True
+            self.order_placed = self.halt_for_human = True
             return BuyResult(False, '已有订单提交记录', page.url, str(e), retriable=False)
         except PurchaseBusy as e:
             return BuyResult(False, '另一购买流程正在运行', page.url, str(e))
@@ -1118,11 +1126,12 @@ class AutoBuy:
         「操作超时」页**。留一个在那儿滴答，人打开浏览器只看到一个吓人的超时提示；
         而且 warm_alive 会因为 _is_expired 把预热判成作废。
 
-        **可能已经下单的一律不动**：`order_placed` 同时覆盖了「成功」和「结果
-        不明」两种（见 _wrap 里的 no_retry 分支）。那一页上有二维码和订单号，
-        导航走就找不回来了。
+        **这一单可能已经下单的一律不动**：`_attempt_order` 覆盖「成功」和「结果
+        不明」两种（见 _wrap）。那一页上有二维码和订单号，导航走就找不回来了。
+        用它而不是 order_placed——后者成单之后就一直是 True，会让之后每一次
+        失败尝试都把标签留在结账页上滴答。
         """
-        if self.order_placed:
+        if self._attempt_order:
             return
         target = getattr(self, "_page", None) or page
         try:
@@ -1145,10 +1154,11 @@ class AutoBuy:
         （2026-09-18 07:15 就是这样，订单确认邮件都到了）。重试就是再下一单。
         """
         if ok:
-            self.order_placed = True
+            # 成单了：通知和「别动这个标签」都要用它，但**不是**停止信号。
+            self.order_placed = self._attempt_order = True
         if getattr(placer, "no_retry", False):
-            # 当成「已下单」：这之后谁都别再动手，等人去看邮箱/订单列表。
-            self.order_placed = True
+            # 结果不明：这之后谁都别再动手，等人去看邮箱/订单列表。这才是停止信号。
+            self.order_placed = self._attempt_order = self.halt_for_human = True
             return BuyResult(ok, stage, url, detail, order_id=order_id,
                              retriable=False)
         return BuyResult(ok, stage, url, detail, order_id=order_id,
