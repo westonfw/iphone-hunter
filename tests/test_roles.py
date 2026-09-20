@@ -188,3 +188,72 @@ class BuyerIntakeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BuyOnlyKeepaliveTests(unittest.TestCase):
+    """只买不盯的时候，保活是这个买手**唯一**的会话来源——它不巡检、不加载
+    任何页面，登录态、结账登录墙、购物袋全靠 preflight 维持。
+
+    保活挂在 PurchaseWorker._run 里，而 Buyer 只是 start() 了它。这条接线一断
+    就是静默失效：买手看着好好的，放货那一刻才发现没登录。
+    """
+
+    def worker(self, cfg=None, **kw):
+        from hunter.purchase_worker import PurchaseWorker
+        buyer = Mock()
+        buyer.cfg = cfg if cfg is not None else {}
+        buyer.order_placed = False
+        buyer.halt_for_human = False
+        buyer.warm_alive = False
+        buyer.prepare.return_value = '已登录'
+        buyer.login_days_left.return_value = None
+        w = PurchaseWorker(buyer, Mock(), probe_url='https://x/P', log=lambda *a: None, **kw)
+        return w, buyer
+
+    def run_briefly(self, w, seconds=0.8):
+        w.start()
+        deadline = time.time() + seconds
+        while time.time() < deadline and not w.buyer.prepare.called:
+            time.sleep(0.02)
+        w.close()
+
+    def test_the_keepalive_runs_without_any_polling(self):
+        w, buyer = self.worker()
+        self.run_briefly(w)
+        buyer.prepare.assert_called()
+
+    def test_it_hands_the_probe_url_to_the_keepalive(self):
+        """结账预热要拿一个型号去探路，没有它就只剩订单页探针。"""
+        w, buyer = self.worker()
+        self.run_briefly(w)
+        self.assertEqual('https://x/P', buyer.prepare.call_args.args[0])
+
+    def test_turning_preflight_off_really_turns_it_off(self):
+        w, buyer = self.worker(cfg={'preflight': False})
+        w.start()
+        time.sleep(0.3)
+        w.close()
+        buyer.prepare.assert_not_called()
+
+    def test_a_login_failure_wakes_the_user(self):
+        """买手不盯库存，登录掉了没有别的迹象——只能靠这条推送。"""
+        w, buyer = self.worker()
+        buyer.signed_in = False
+        buyer.prepare.return_value = '⚠️ 未登录'
+        self.run_briefly(w)
+        for c in w.report.call_args_list:
+            if '登录' in c.args[0].stage:
+                self.assertTrue(c.args[0].wake)
+                return
+        self.fail('登录掉了却没有推送')
+
+    def test_the_buyer_starts_the_worker(self):
+        """Buyer.loop 要真的把 worker 拉起来，否则保活一次都不会跑。"""
+        import inspect
+        src = inspect.getsource(Buyer.loop)
+        self.assertIn('self.worker.start()', src)
+
+    def test_the_buyer_passes_a_probe_url(self):
+        import inspect
+        src = inspect.getsource(Buyer.__init__)
+        self.assertIn('probe_url=', src)
