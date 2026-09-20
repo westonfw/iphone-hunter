@@ -122,6 +122,11 @@ class Scout:
         #: 心跳间隔。轮询间隔可能被退避拉长到几分钟，心跳不能跟着一起稀——
         #: 那样买手会在一次正常的退避里误判主程序死了。
         self.beat_every = max(2.0, float(link.get("beat_every", 10) or 10))
+        #: 全部出口都被封着的起点，0 = 现在不是。持续超过 blind_after 就报出来。
+        #: 「零失明」是这套结构的承诺；承诺兑现不了的时候不能悄悄的。
+        self._blind_since = 0.0
+        self._warned_blind = False
+        self.blind_after = max(10.0, float(link.get("blind_after", 45) or 45))
 
     # ---------- 子程序报到 ----------
 
@@ -290,6 +295,38 @@ class Scout:
         slug = self.slug_of.get(part, "")
         return client.buy_url(slug, part) if slug else client.base + "/shop/buy-iphone"
 
+    # ---------- 全盲 ----------
+
+    def check_blind(self) -> None:
+        """所有出口都在熔断静默里，而且持续了一阵子：说出来。
+
+        2026-09-20 23:32 起两条出口轮流被 541 封，到停机 20 分钟一轮没打成，
+        期间还真放了一次货。日志里只有零散的「被拦」，没有一行把这个状态点破——
+        人看着心跳正常、买手也不报警，以为一切都好。
+        """
+        left = self.pool.all_blocked(PICKUP_PATH)
+        now = time.monotonic()
+        if left <= 0:
+            if self._warned_blind:
+                self.log("[主程序] ✅ 出口恢复了，重新在盯")
+                self.bc.send("✅ 主程序恢复巡检", "至少一条出口已经解封", "",
+                             critical=True)
+            self._blind_since, self._warned_blind = 0.0, False
+            return
+        if not self._blind_since:
+            self._blind_since = now
+            return
+        if self._warned_blind or now - self._blind_since < self.blind_after:
+            return
+        self._warned_blind = True
+        n = len(self.pool)
+        self.log(f"[主程序] ⚠️ {n} 条出口全在熔断静默里，已经 "
+                 f"{now - self._blind_since:.0f}s 没打成一轮，最早解封还要 {left:.0f}s")
+        self.bc.send("⚠️ 主程序全盲",
+                     f"{n} 条出口全被 541 封着，{now - self._blind_since:.0f} 秒没打成"
+                     f"一轮。这段时间放货看不见。最早解封还要 {left:.0f} 秒。",
+                     "", critical=True)
+
     # ---------- 心跳 ----------
 
     def beat(self, force: bool = False) -> None:
@@ -357,8 +394,10 @@ class Scout:
                 if e is None:
                     # 所有出口要么没到点、要么在熔断静默里。等待发生在这儿，
                     # 不在请求里——预算和退避都体现为 due_at，谁也不挡着谁。
+                    self.check_blind()
                     time.sleep(min(max(self.pool.soonest(PICKUP_PATH), 0.0), TICK))
                     continue
+                self.check_blind()
                 self.round_no += 1
                 ok, retry_after = self.poll(e)
                 if retry_after is not None:

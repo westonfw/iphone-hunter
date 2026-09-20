@@ -241,3 +241,52 @@ class BreakerTests(unittest.TestCase):
         kw = breaker_settings({"pacing": {"cooldowns": ["快一点"]}})
         self.assertNotIn("cooldowns", kw)
         self.assertEqual({}, breaker_settings({}))
+
+
+class BoostShareTests(unittest.TestCase):
+    """冲刺按出口数分摊：合并提速靠错峰，不靠每条单独超速。
+
+    2026-09-20 23:11 那一程：两条出口各自冲到 4~5s，23:17 起先后被 541 封死，
+    从 23:32 到停机 20 分钟一轮没打成。541 按（出口 IP + 端点）独立判，单条 4s
+    就是过线，几条一起过线就一起死——「零失明」反而成了全盲。
+    """
+
+    def pacer(self, share):
+        from hunter.pacing import Pacer
+        t = [0.0]
+        p = Pacer(base_interval=30, min_interval=4, boost_budget_per_hour=900,
+                  budget_per_hour=220, clock=lambda: t[0], log=lambda *a: None)
+        p.boost_share = share
+        p.boost(180)
+        return p
+
+    def test_one_exit_still_sprints_at_min_interval(self):
+        self.assertEqual(4.0, self.pacer(1).target())
+
+    def test_two_exits_each_sprint_at_twice_min_interval(self):
+        """两条各 8s，错开之后合并仍是 4s——快的部分留住，危险的部分摊薄。"""
+        self.assertEqual(8.0, self.pacer(2).target())
+
+    def test_three_exits_each_sprint_at_three_times(self):
+        self.assertEqual(12.0, self.pacer(3).target())
+
+    def test_the_sprint_budget_is_split_too(self):
+        """boost_budget 是全池的量。不分的话两条出口就是 1800/h，正是放大器。"""
+        p = self.pacer(2)
+        self.assertAlmostEqual(450.0, p.bucket.rate * 3600, places=3)
+
+    def test_the_normal_budget_is_not_split(self):
+        """常规 30s 单条是安全的，只分摊危险的那部分。"""
+        from hunter.pacing import Pacer
+        t = [0.0]
+        p = Pacer(base_interval=30, min_interval=4, budget_per_hour=220,
+                  clock=lambda: t[0], log=lambda *a: None)
+        p.boost_share = 2
+        self.assertAlmostEqual(220.0, p.bucket.rate * 3600, places=3)
+        self.assertEqual(30.0, p.target())
+
+    def test_backoff_still_wins_over_the_sprint(self):
+        """被拦过就老实按退避走，分摊不能把这条规矩弄丢。"""
+        p = self.pacer(2)
+        p.on_blocked()
+        self.assertGreater(p.target(), 8.0)

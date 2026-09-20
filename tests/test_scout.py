@@ -745,3 +745,66 @@ class MissingStoreTests(Harness, unittest.TestCase):
                                       "MJYB4CH/A": [store(state=Stock.UNAVAILABLE)]}]
         s.poll(self.direct)
         self.assertGreater(s.saw_at, 0.0)
+
+
+class BlindAlarmTests(Harness, unittest.TestCase):
+    """所有出口都被封着、持续了一阵子：主程序必须说出来。
+
+    2026-09-20 23:32 起两条出口轮流被 541 封，到停机 20 分钟一轮没打成，期间还
+    真放了一次货。日志里只有零散的「被拦」，心跳照常，买手也不报警——没有任何
+    一行把「现在一条能用的都没有」点破。
+    """
+
+    def pushes(self):
+        return [a[0] for a in self.pushed]
+
+    def test_a_short_blind_spell_is_not_reported(self):
+        s = self.scout(); s.blind_after = 10.0
+        with patch.object(s.pool, 'all_blocked', return_value=90.0):
+            s.check_blind()          # 记起点
+            s.check_blind()          # 还没到时限
+        self.assertEqual([], self.pushes())
+
+    def test_a_long_blind_spell_is_reported_once(self):
+        s = self.scout(); s.blind_after = 10.0
+        with patch.object(s.pool, 'all_blocked', return_value=90.0):
+            s.check_blind()
+            s._blind_since -= 60
+            for _ in range(5):
+                s.check_blind()
+        self.assertEqual(1, sum('全盲' in x for x in self.pushes()))
+
+    def test_recovery_is_reported_and_the_alarm_rearms(self):
+        s = self.scout(); s.blind_after = 10.0
+        with patch.object(s.pool, 'all_blocked', return_value=90.0):
+            s.check_blind(); s._blind_since -= 60; s.check_blind()
+        with patch.object(s.pool, 'all_blocked', return_value=0.0):
+            s.check_blind()
+        self.assertTrue(any('恢复' in x for x in self.pushes()))
+        with patch.object(s.pool, 'all_blocked', return_value=90.0):
+            s.check_blind(); s._blind_since -= 60; s.check_blind()
+        self.assertEqual(2, sum('全盲' in x for x in self.pushes()), '第二次全盲没再报')
+
+    def test_one_healthy_exit_is_not_blind(self):
+        s = self.scout(); s.blind_after = 10.0
+        with patch.object(s.pool, 'all_blocked', return_value=0.0):
+            s.check_blind(); s.check_blind()
+        self.assertEqual([], self.pushes())
+
+    def test_the_loop_actually_raises_the_alarm_while_idle(self):
+        """**真跑主循环**，不看源码。出口全封时 pick 一直返回 None，主循环在那条
+        空转分支里等——报警要是没接进这条分支，就是全盲 20 分钟一声不吭。"""
+        s = self.scout(); s.blind_after = 0.2
+        s.receiver = Mock()
+        with patch.object(s.pool, 'all_blocked', return_value=90.0), \
+             patch.object(s.pool, 'pick', return_value=None), \
+             patch.object(s.pool, 'soonest', return_value=0.05):
+            t = threading.Thread(target=s.loop, daemon=True)
+            t.start()
+            for _ in range(60):
+                if any('全盲' in x for x in self.pushes()):
+                    break
+                time.sleep(0.05)
+            s._stop.set()
+        self.assertTrue(any('全盲' in x for x in self.pushes()),
+                        '主循环空转了 3 秒，全盲一声没吭')

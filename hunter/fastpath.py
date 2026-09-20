@@ -1085,9 +1085,14 @@ class FastCheckout:
                 self.log(f"[快车道] 结账侧 {'、'.join(blocked[:6])} 也有货，"
                          f"但不在配置的门店里，不去")
         if avail and not ready:
+            # **别咬定「没货了」。** availableNowForAllLines 是「袋里所有条目在这家
+            # 店都有货」——袋子里多了一条时，每家店都会报不可取，而货可能好好的。
+            # 2026-09-20 三次失败全是这个形状：监控同一分钟还在报可取货，结账说
+            # 12 家全无，事后袋里清出来 2 条。结论留给紧跟着的清袋日志（带 SKU）。
             raise Stalled(
-                f"结账侧 {len(avail)} 家门店全是「目前不可取货」——这一单已经没货了"
-                f"（监控看到的是 {self.store}，结账不认）")
+                f"结账侧 {len(avail)} 家门店全是「目前不可取货」——要么真没货了，"
+                f"要么购物袋里不止一件（监控看到的是 {self.store}，结账不认；"
+                f"看随后清袋那行的 SKU）")
         if not nxt:
             return self._no_store_left(first, first_data, first_miss)
 

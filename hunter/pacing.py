@@ -156,6 +156,15 @@ class Pacer:
     #: 2026-09-19 22:43 那波实测，冲刺目标 4s，burst 的 20 个令牌只撑了 105 秒，
     #: 之后就被补充速率按在 14~17s——而那时候货还在，正是最该快的时候。
     boost_budget_per_hour: float = 900.0
+    #: 冲刺的**分摊倍数**，给多出口用：合并提速靠错峰，不靠每条单独超速。
+    #:
+    #: 2026-09-20 23:11 那一程的教训：两条出口各自冲到 4~5s，23:17 起先后被
+    #: 541 封死，从 23:32 到停机 20 分钟一轮都没打成——「零失明」反而变成了
+    #: 全盲。541 按（出口 IP + 端点）独立判，单条 4s 就是过线，几条出口一起
+    #: 过线就一起死。设成出口数 n 之后：单条冲刺 min_interval×n（两条各 8s，
+    #: 回到实测能活的区间），错峰之后合并仍是 min_interval——快的部分留住了，
+    #: 危险的部分摊薄了。冲刺预算同样除以 n：boost_budget 是全池的量。
+    boost_share: float = 1.0
     clock: object = time.monotonic
     sleeper: object = time.sleep
     calendar: object = datetime.now
@@ -226,7 +235,9 @@ class Pacer:
         if want == self._boosted_budget:
             return
         self._boosted_budget = want
-        self.bucket.set_rate(self.boost_budget_per_hour if want else self.budget_per_hour)
+        share = max(1.0, self.boost_share)
+        self.bucket.set_rate(self.boost_budget_per_hour / share if want
+                             else self.budget_per_hour)
         if not want:
             self.log(f"[节奏] 冲刺结束，预算回到 {self.budget_per_hour:.0f} 次/小时")
 
@@ -263,7 +274,9 @@ class Pacer:
             t *= self.cold_multiplier
         if self.boosting():
             # 退避优先于冲刺：被拦过就老实按退避后的间隔走，别拿冲刺去顶限流。
-            t = min(t, max(self.min_interval * self.scale, self.min_interval))
+            # 冲刺下限按 boost_share 摊薄——多出口时合并提速靠错峰，单条不超速。
+            lo = self.min_interval * max(1.0, self.boost_share)
+            t = min(t, max(lo * self.scale, lo))
         return min(max(t, self.min_interval), self.max_interval)
 
     FLOOR = 0.8

@@ -463,3 +463,97 @@ class SameExitLogTests(unittest.TestCase):
         p.enlist('buyerA', '192.168.1.9', 48712, False)
         p.enlist('buyerA', '192.168.1.9', 0, True)
         self.assertEqual(2, sum('同出口' in x for x in self.logs))
+
+
+class RebalanceTests(unittest.TestCase):
+    """出口数一变，冲刺的分摊倍数就要跟着变——加入、掉线、改标同出口都算。"""
+
+    CFG = {'region': 'cn', 'pacing': {'base_interval': 30, 'min_interval': 4,
+                                      'budget_per_hour': 220, 'burst': 20}}
+
+    def pool(self, now=None):
+        now = now or [1000.0]
+        def mk(**k):
+            c = Mock(); c.breakers = {}; return c
+        for x in (patch('scout.exits.AppleClient', side_effect=mk),
+                  patch.object(ExitPool, '_proxy_url',
+                               side_effect=lambda i, p: f'http://u:k@{i}:{p}')):
+            x.start(); self.addCleanup(x.stop)
+        return ExitPool(self.CFG, log=lambda *a: None, clock=lambda: now[0], stale=60.0)
+
+    def shares(self, p):
+        return sorted((e.id, e.pacer.boost_share) for e in p._exits.values())
+
+    def test_a_lone_exit_has_share_one(self):
+        p = self.pool(); p.boost(180)
+        self.assertEqual([('direct', 1.0)], self.shares(p))
+
+    def test_a_second_exit_splits_the_sprint_in_two(self):
+        p = self.pool()
+        p.enlist('b', '192.168.1.9', 48712, False)
+        self.assertEqual([('b', 2.0), ('direct', 2.0)], self.shares(p))
+
+    def test_sprinting_with_two_exits_keeps_each_at_twice_min(self):
+        """合并 4s，单条 8s——这才是多出口该有的用法。"""
+        p = self.pool()
+        p.enlist('b', '192.168.1.9', 48712, False)
+        p.boost(180)
+        for e in p._exits.values():
+            self.assertEqual(8.0, e.pacer.target(), e.id)
+
+    def test_a_dropped_exit_gives_the_share_back(self):
+        now = [1000.0]
+        p = self.pool(now)
+        p.enlist('b', '192.168.1.9', 48712, False)
+        now[0] = 1100.0
+        p.prune()
+        self.assertEqual([('direct', 1.0)], self.shares(p))
+
+    def test_switching_to_same_exit_gives_the_share_back(self):
+        p = self.pool()
+        p.enlist('b', '192.168.1.9', 48712, False)
+        p.enlist('b', '192.168.1.9', 0, True)
+        self.assertEqual([('direct', 1.0)], self.shares(p))
+
+    def test_the_spread_period_follows_the_fastest_exit(self):
+        """错峰周期按最快的那条算。原来取 dict 第一条（直连），直连一退避，
+        周期跟着放大，别的健康出口被越推越远。"""
+        p = self.pool()
+        p.enlist('b', '192.168.1.9', 48712, False)
+        for _ in range(3):
+            p._exits['direct'].pacer.on_blocked()
+        self.assertEqual(30.0, p._period())
+
+
+class AllBlockedTests(unittest.TestCase):
+    """「全盲」的判据：每条出口都在熔断静默里。"""
+
+    PATH = '/shop/retail/pickup-message'
+
+    def pool(self):
+        def mk(**k):
+            c = Mock(); c.breakers = {}; return c
+        for x in (patch('scout.exits.AppleClient', side_effect=mk),
+                  patch.object(ExitPool, '_proxy_url',
+                               side_effect=lambda i, p: f'http://u:k@{i}:{p}')):
+            x.start(); self.addCleanup(x.stop)
+        p = ExitPool({'region': 'cn'}, log=lambda *a: None)
+        p.enlist('b', '192.168.1.9', 48712, False)
+        return p
+
+    def block(self, p, who, left):
+        br = Mock(); br.ready.return_value = False; br.left.return_value = left
+        p._exits[who].client.breakers[self.PATH] = br
+
+    def test_nobody_blocked_is_not_blind(self):
+        self.assertEqual(0.0, self.pool().all_blocked(self.PATH))
+
+    def test_one_blocked_is_not_blind(self):
+        """一条被封另一条顶上——那正是多出口的意义，不算盲。"""
+        p = self.pool(); self.block(p, 'direct', 90.0)
+        self.assertEqual(0.0, p.all_blocked(self.PATH))
+
+    def test_everyone_blocked_is_blind_and_says_how_long(self):
+        p = self.pool()
+        self.block(p, 'direct', 90.0); self.block(p, 'b', 30.0)
+        self.assertEqual(30.0, p.all_blocked(self.PATH))

@@ -536,7 +536,18 @@ class AutoBuy:
             return '没有可用的探路型号'
         token = atb_token(ctx)
         if not token:
-            return '读不到 atbtoken，跳过结账预热'
+            # 全新的 profile 没逛过产品页，as_atb 还没种上——2026-09-20 机器 B
+            # 就是这样，每轮保活都在这儿放弃，等到放货时加购要走 11~28 秒的产品页
+            # 而不是 388ms 的接口。空闲期不差这一趟：加载一次产品页把它种上。
+            try:
+                page.goto(buy_url, timeout=self.timeout, wait_until='domcontentloaded')
+                self._settle(page)
+            except Exception as e:
+                return f'读不到 atbtoken，加载产品页种 cookie 也失败：{type(e).__name__}'
+            token = atb_token(ctx)
+            if not token:
+                return '读不到 atbtoken（加载过产品页仍没有），跳过结账预热'
+            self.log('[预热] atbtoken 原来没有，已加载一次产品页把它种上')
         try:
             page.goto(atb_add_url(buy_url, part, token), timeout=self.timeout,
                       wait_until='domcontentloaded')

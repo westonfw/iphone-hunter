@@ -90,10 +90,24 @@ class ExitPool:
                     pacer=pacer, due_at=self._spread(now, pacer), seen_at=now)
 
     def _period(self) -> float:
+        """错峰用的周期：取**最快**那条出口的目标间隔。
+
+        原来取的是 dict 里第一条（永远是直连）。直连被 541 退避到 4 倍时，这个
+        周期跟着变成 120s，_nudge 的最小间距也跟着放大，把别的健康出口越推越远。
+        """
+        ts = [e.pacer.target() for e in self._exits.values() if e.pacer]
+        return max(1.0, min(ts)) if ts else 30.0
+
+    def _rebalance(self) -> None:
+        """出口数变了，把冲刺的分摊倍数同步给每一条。调用方必须已经持有 _lock。
+
+        合并提速靠错峰，不靠每条单独超速：n 条出口时单条冲刺 min_interval×n，
+        错开之后合并仍是 min_interval。见 Pacer.boost_share。
+        """
+        n = max(1, len(self._exits))
         for e in self._exits.values():
             if e.pacer:
-                return max(1.0, e.pacer.target())
-        return 30.0
+                e.pacer.boost_share = float(n)
 
     def _spread(self, now: float, pacer) -> float:
         """新出口插进日程表里**最空的那段**，别跟现有的撞在一起。
@@ -156,7 +170,8 @@ class ExitPool:
             return
         with self._lock:
             if direct:
-                self._exits.pop(who, None)   # 之前借过口、现在改标同出口了
+                if self._exits.pop(who, None) is not None:
+                    self._rebalance()        # 之前借过口、现在改标同出口了
                 if who not in self._same:
                     self._same.add(who)
                     self.log(f"[出口] {who} 报到，但标了跟主程序同出口，"
@@ -169,6 +184,7 @@ class ExitPool:
                 cur.seen_at = now           # 心跳，位置没变
                 return
             self._exits[who] = self._make(who, proxy, now)
+            self._rebalance()
             self.log(f"[出口] {who} 加入（{ip}:{port}），"
                      f"现在共 {len(self._exits)} 条")
 
@@ -186,6 +202,8 @@ class ExitPool:
                     continue
                 self._exits.pop(who, None)
                 gone.append(who)
+            if gone:
+                self._rebalance()
         for who in gone:
             self.log(f"[出口] {who} 掉线了（{self.stale:.0f}s 没报到），先摘掉")
         return gone
@@ -250,6 +268,7 @@ class ExitPool:
         """
         now = self.clock()
         with self._lock:
+            self._rebalance()
             for e in self._exits.values():
                 if not e.pacer:
                     continue
@@ -259,6 +278,19 @@ class ExitPool:
                 floor = max(now + e.pacer.bucket.wait_for(1), e.floor_at,
                             now + e.cooldown(""))
                 e.due_at = max(min(e.due_at, now + e.pacer.target()), floor)
+
+    def all_blocked(self, path: str) -> float:
+        """所有出口都在熔断静默里的话，返回最早那条还要等多久；否则 0。
+
+        这是「全盲」的判据，跟「都没到点」不一样：后者几秒就过去，前者可能是
+        几分钟——2026-09-20 23:32 起两条出口轮流被 541 封，20 分钟一轮没打成，
+        而日志里只有零散的「被拦」，没有一行说「现在一条能用的都没有」。
+        """
+        with self._lock:
+            lefts = [e.cooldown(path) for e in self._exits.values() if e.client]
+        if not lefts or any(x <= 0 for x in lefts):
+            return 0.0
+        return min(lefts)
 
     def soonest(self, path: str) -> float:
         """最早能用的那条还要等多久。用来决定主循环睡多久。"""

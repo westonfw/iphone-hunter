@@ -875,12 +875,36 @@ class CheckoutWarmupRegressions(unittest.TestCase):
         self.assertIn('没进袋', note)
         ab._enter_checkout.assert_not_called()
 
-    def test_no_token_means_no_warmup(self):
+    def test_no_token_seeds_the_cookie_by_loading_the_product_page(self):
+        """全新 profile 没逛过产品页，as_atb 还没种。每轮保活都在这儿放弃的话，
+        放货时加购要走 11~28 秒的产品页而不是 388ms 的接口——2026-09-20 机器 B
+        就是这么跑了一晚上。空闲期不差这一趟：加载一次产品页把它种上。"""
         ab, page = self.buyer(), self.page()
+        ab._settle = Mock()
+        calls = {'n': 0}
+
+        def cookies():
+            calls['n'] += 1
+            return [] if calls['n'] == 1 else [
+                {'name': 'as_atb', 'value': '1.0|x|deadbeef', 'domain': '.apple.com.cn'}]
+
+        ab._ctx.cookies.side_effect = cookies
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}):
+            ab.warm_checkout_session(ab._ctx, page, self.URL)
+        self.assertEqual(self.URL, page.goto.call_args_list[0].args[0],
+                         '没去加载产品页种 cookie')
+        ab._enter_checkout.assert_called_once()
+
+    def test_still_no_token_after_seeding_means_no_warmup(self):
+        """种了也没有，那才是真读不到——说清楚，别再往下走。"""
+        ab, page = self.buyer(), self.page()
+        ab._settle = Mock()
         ab._ctx.cookies.return_value = []
         note = ab.warm_checkout_session(ab._ctx, page, self.URL)
         self.assertIn('atbtoken', note)
-        page.goto.assert_not_called()
+        self.assertIn('仍没有', note)
+        self.assertEqual(1, page.goto.call_count)       # 只种一次，不反复刷产品页
+        ab._enter_checkout.assert_not_called()
 
     def test_rate_limit_propagates_so_the_cooldown_applies(self):
         """限流不能被吞掉——吞了就会每 10 分钟去续一次封禁。"""
@@ -1815,3 +1839,26 @@ class StaleBagRegressions(unittest.TestCase):
         src = inspect.getsource(AutoBuy.prepare)
         self.assertNotIn('self.signed_in is True and self.clear_bag', src)
         self.assertIn('if self.clear_bag and self.preclear_bag', src)
+
+
+class SoldOutVerdictRegressions(unittest.TestCase):
+    """结账侧「全部门店不可取」不能被翻译成「没货了」。
+
+    availableNowForAllLines 是「袋里所有条目在这家店都有货」：袋子里多了一条时
+    每家店都报不可取，而货可能好好的。2026-09-20 三次失败全是这个形状。
+    """
+
+    def test_the_verdict_names_both_possibilities(self):
+        from hunter.fastpath import FastCheckout, Stalled
+        fc = FastCheckout(store='R581', stores=['R581'], id_last4='1',
+                          last_name='张', first_name='三', log=Mock())
+        avail = {'retailStores': [
+            {'storeId': 'R581', 'availability': {'availableNowForAllLines': False,
+                                                 'storeAvailability': '目前不可取货'}}]}
+        fc.step2_store = lambda page: avail
+        fc.take_slot = lambda d: (_ for _ in ()).throw(Stalled('排不上'))
+        with self.assertRaises(Stalled) as cm:
+            fc.select_store(Mock())
+        msg = str(cm.exception)
+        self.assertIn('不止一件', msg)
+        self.assertNotIn('已经没货了', msg)
