@@ -279,6 +279,11 @@ class AutoBuy:
         #: 空闲期把结账那道登录墙提前撞掉。默认关——它会往购物袋里加一台
         #: （随后清掉），这个副作用得由使用者明确同意。
         self.warm_checkout = bool(self.cfg.get("preflight_warm_checkout", False))
+        #: 发结账请求之前再问一次监控「货还在吗」，已经没了就别发。
+        self.abort_when_gone = bool(self.cfg.get("abort_when_gone", True))
+        #: 由 PurchaseWorker 注入：callable(part) -> True/False/None。
+        #: None = 问不出来，那就照常往下走，宁可白跑也不错过。
+        self.stock_live = None
         self.place_order = bool(self.cfg.get("place_order", True))
         self.payment_method = (self.cfg.get("payment_method") or "支付宝").strip()
         self.installment_months = int(self.cfg.get("installment_months") or 0)
@@ -1036,6 +1041,9 @@ class AutoBuy:
             submit_guard=self.submit_guard, cancelled=self.cancelled,
             log=self.log,
         )
+        if self._gone(want_part, "进结账"):
+            return BuyResult(False, "货已经没了，没进结账", page.url,
+                             "监控在这一刻已经报无货，再走结账只是白烧请求。")
         # 优先接口入口；仅在目标已核对、入口未建立时允许购物袋页面建立会话。
         from .fastpath import Blocked
         blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
@@ -1108,6 +1116,9 @@ class AutoBuy:
         if placer.secure_host:
             self.secure_host = placer.secure_host
 
+        if self._gone(want_part, "六步"):
+            return BuyResult(False, "货已经没了，没走六步", page.url,
+                             "结账会话已建好，但监控在这一刻已经报无货。")
         outcome = placer.place(page, t0)
         return self._wrap(placer, placer.result_url or page.url, *outcome)
 
@@ -1158,6 +1169,32 @@ class AutoBuy:
             raise AutoBuyUnavailable('点击结账后未得到结账或登录页')
         finally:
             ctx.remove_listener('page', opened.append)
+
+    def _gone(self, want_part: str, where: str) -> bool:
+        """监控是不是已经明说这个型号没货了。
+
+        2026-09-20 两台机器一共发了 17 次 search，其中 **10 次是在监控已经打出
+        「N 家门店均无货」之后 1~7 秒才发出去的——10 次全输**。而 search 一次要
+        10.8 秒、整趟要十几个 checkoutx 请求，还跟「尝试之后一分钟内掉线」强相关
+        （6 次里 4 次）。明知必输还打，赔的是会话和下一次机会。
+
+        问不出来（没注入、或者没有记录）一律放行：宁可白跑一趟，也不能因为自己
+        的判断失误错过一次真放货。
+        """
+        if not self.abort_when_gone or not want_part:
+            return False
+        probe = self.stock_live
+        if not callable(probe):
+            return False
+        try:
+            live = probe(want_part)
+        except Exception:
+            return False
+        if live is False:
+            self.log(f"[自动下单] 监控已报「{want_part} 没货了」，{where}之前停手——"
+                     f"不白烧十几个结账请求")
+            return True
+        return False
 
     def _park_after_attempt(self, page) -> None:
         """一单结束后别把标签留在结账页上。

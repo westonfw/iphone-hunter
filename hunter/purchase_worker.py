@@ -44,6 +44,9 @@ class PurchaseWorker:
         self.epochs = {}
         #: 每个型号已经试过的门店。冒出一家没试过的 = 新机会，重试计数清零。
         self.tried = {}
+        #: 每个型号**最后一次被真正查过**的时刻。只有查过才敢说「没货」——
+        #: 查询失败/熔断时根本不调 observe，那时候「看不到」只是「没去看」。
+        self.polled = {}
         #: 这一轮已经判死的型号（result.fatal，比如页面明写售罄、配置不对）。
         #: **不含被限流**——那是全局的，由 cooldown_until 管，冷却过了还要接着打。
         #: 跟次数无关，
@@ -56,6 +59,8 @@ class PurchaseWorker:
         self.thread = None
         self.buyer.cancelled = lambda: self.closed
         self.buyer.managed = True
+        # 让买家在发结账请求之前能回头问一句「货还在吗」
+        self.buyer.stock_live = self.stock_live
 
     def observe(self, part, offers, unavailable=()):
         with self.cv:
@@ -63,6 +68,7 @@ class PurchaseWorker:
             self.offers = {k: v for k, v in self.offers.items() if k[0] != part}
             for offer in offers:
                 self.offers[offer.key] = offer
+            self.polled[part] = self.clock()      # 这一轮真的查过它了
             live = {o.store for o in offers}
             tried = self.tried.get(part, set())
 
@@ -83,6 +89,31 @@ class PurchaseWorker:
                 self.epochs[part] = self.epochs.get(part, 0) + 1
                 self.log(f'[购买] {part} 新增有货门店 {fresh}，重试次数重新计')
             self.cv.notify_all()
+
+    #: 「刚刚查过」的时限。超过它就当没查过——常规巡检间隔 30~45 秒，拿那么旧的
+    #: 读数去踩刹车会误杀真放货。放货期间冲刺会把间隔压到 4~6 秒（2026-09-20
+    #: 实测 6~8 秒），所以真正要刹车的那一刻，信息一定是新鲜的。
+    FRESH_SECONDS = 15.0
+
+    def stock_live(self, part) -> bool | None:
+        """监控还看不看得到这个型号的货。True/False/None（None = 说不好）。
+
+        **只有「刚刚查过、而且没查到」才返回 False。** 查询失败、熔断静默、
+        或者上一次查询已经是半分钟前——这些情况下「看不到」只等于「没去看」，
+        一律返回 None 让买家照常往下走。宁可白跑一趟，也不能误杀一次真放货。
+
+        这是给买家用的急刹：明知没货还发 search，赔的是 10.8 秒、十几个
+        checkoutx 请求，以及那之后大概率的一次掉线。
+        """
+        with self.cv:
+            if any(k[0] == part for k in self.offers):
+                return True
+            last = self.polled.get(part)
+        fresh = float(getattr(self.buyer, 'cfg', {}).get(
+            'stock_fresh_seconds', self.FRESH_SECONDS) or self.FRESH_SECONDS)
+        if last is None or self.clock() - last > fresh:
+            return None
+        return False
 
     def _targets(self, part, now) -> list:
         """这个型号当前所有还新鲜的门店候选，按优先级排。

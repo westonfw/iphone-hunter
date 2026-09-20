@@ -420,7 +420,7 @@ class TargetChoiceAndQuotaRegressions(unittest.TestCase):
     def worker(self, **kw):
         w = PurchaseWorker.__new__(PurchaseWorker)
         w.offers, w.attempts, w.epochs = {}, {}, {}
-        w.tried, w.burned = {}, set()
+        w.tried, w.burned, w.polled = {}, set(), {}
         w.max_age, w.max_attempts, w.retry_delay = 90.0, 2, 15.0
         w.cooldown_until, w.log = 0.0, Mock()
         w.clock = kw.get('clock', lambda: 0.0)
@@ -1298,7 +1298,7 @@ class KeepBuyingWhileStockLastsRegressions(unittest.TestCase):
     def worker(self, max_attempts=2, clock=None):
         w = PurchaseWorker.__new__(PurchaseWorker)
         w.offers, w.attempts, w.epochs = {}, {}, {}
-        w.tried, w.burned = {}, set()
+        w.tried, w.burned, w.polled = {}, set(), {}
         w.max_age, w.max_attempts, w.retry_delay = 90.0, max_attempts, 15.0
         w.cooldown_until, w.log = 0.0, Mock()
         w.clock = clock or (lambda: 0.0)
@@ -1643,3 +1643,102 @@ class StallHintsRegressions(unittest.TestCase):
             fc._post(page, '/shop/checkoutx/billing', 'continueFromBillingToReview',
                      'checkout.billing', [])
         self.assertIn('分期额度不足', str(cm.exception))
+
+
+class AbortWhenGoneRegressions(unittest.TestCase):
+    """明知必输就别发 search。
+
+    2026-09-20 两台机器 17 次 search，10 次是在监控已经打出「N 家门店均无货」
+    之后 1~7 秒才发的——10 次全输。每次赔 10.8 秒、十几个 checkoutx 请求，
+    还跟「尝试之后一分钟内掉线」强相关（6 次里 4 次）。
+    """
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+    PART = 'MJT84CH/A'
+
+    def buyer(self, live, **cfg):
+        ab = AutoBuy({'pickup_store_numbers': ['R581'], **cfg},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab._pick, ab._settle = Mock(), Mock()
+        ab._wait_add_button = Mock(return_value=(True, ''))
+        ab._await_options = Mock(return_value=0.0)
+        landed = Mock()
+        landed.url = 'https://secure7.www.apple.com.cn/shop/checkout'
+        ab._enter_checkout = Mock(return_value=landed)
+        ab.stock_live = live
+        return ab
+
+    def page(self):
+        p = Mock()
+        p.url = 'https://www.apple.com.cn/shop/bag'
+        p.goto.side_effect = lambda u, **kw: setattr(p, 'url', u)
+        return p
+
+    def drive(self, ab, page):
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': True}), \
+             patch('hunter.autobuy.watch_checkout_block', return_value={}), \
+             patch('hunter.fastpath.wait_for_bag_count', return_value=0.0):
+            return ab._drive(Mock(), page, self.URL, False)
+
+    def test_it_stops_before_entering_checkout_when_the_stock_is_gone(self):
+        ab, page = self.buyer(lambda part: False), self.page()
+        r = self.drive(ab, page)
+        self.assertFalse(r.ok)
+        self.assertIn('没进结账', r.stage)
+        ab._enter_checkout.assert_not_called()
+        self.assertTrue(r.retriable, '货可能再回来，这不是判死')
+
+    def test_it_goes_ahead_when_the_stock_is_still_there(self):
+        ab, page = self.buyer(lambda part: True), self.page()
+        self.drive(ab, page)
+        ab._enter_checkout.assert_called_once()
+
+    def test_an_unanswerable_probe_never_blocks(self):
+        """问不出来就照常走——宁可白跑，也不能因为自己判断失误错过真放货。"""
+        for probe in (None, lambda part: None,
+                      lambda part: (_ for _ in ()).throw(RuntimeError())):
+            with self.subTest(probe=probe):
+                ab, page = self.buyer(probe), self.page()
+                self.drive(ab, page)
+                ab._enter_checkout.assert_called_once()
+
+    def test_the_brake_can_be_turned_off(self):
+        ab, page = self.buyer(lambda part: False, abort_when_gone=False), self.page()
+        self.drive(ab, page)
+        ab._enter_checkout.assert_called_once()
+
+    def test_it_asks_about_the_part_being_bought(self):
+        asked = []
+        ab, page = self.buyer(lambda part: asked.append(part) or True), self.page()
+        self.drive(ab, page)
+        self.assertEqual([self.PART], asked[:1])
+
+    def worker(self, now=0.0):
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.cv = __import__('threading').Condition()
+        w.offers, w.polled = {}, {}
+        w.clock = lambda: now
+        return w
+
+    def test_the_worker_says_live_while_an_offer_stands(self):
+        w = self.worker()
+        w.offers = {('A', 'R1'): Offer('A', 'R1', 'R1', 'u', 'A', 0.0, (0, 0))}
+        self.assertTrue(w.stock_live('A'))
+
+    def test_gone_only_counts_when_it_was_just_looked_at(self):
+        """常规巡检 30~45 秒一轮，拿那么旧的读数踩刹车会误杀真放货。"""
+        w = self.worker(now=100.0)
+        w.polled['A'] = 95.0                  # 5 秒前查过，没查到
+        self.assertFalse(w.stock_live('A'))
+        w.polled['A'] = 70.0                  # 30 秒前查的，不算数
+        self.assertIsNone(w.stock_live('A'))
+
+    def test_never_polled_means_dont_know(self):
+        """查询失败/熔断静默时根本不调 observe——「看不到」只等于「没去看」。"""
+        self.assertIsNone(self.worker().stock_live('A'))
+
+    def test_observe_records_that_it_looked(self):
+        w = self.worker(now=42.0)
+        w.log, w.tried, w.attempts, w.epochs, w.burned = Mock(), {}, {}, {}, set()
+        w.observe('A', [])
+        self.assertEqual(42.0, w.polled['A'])

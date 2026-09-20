@@ -480,6 +480,8 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.fast_add_to_cart` | 用 cookie 里的 `atbtoken` 发一个 GET 直接加购，默认 `true`（实测 388ms vs 走产品页 11~28s）。**只在「不折抵 + 不加 AppleCare」时生效**——那两个选项是写死在 URL 参数里的；失败会自动退回产品页 |
 | `autobuy.bag_trust_seconds` | 同型号重试时，距上次尝试多久之内还值得赌「袋里还在」，默认 `600`。赌对省掉一次产品页加载（11~26s），赌错只多花一次 `/shop/bag`（几秒）|
 | `autobuy.max_attempts_per_stock` | 一轮放货里同一型号最多打几次，**`0` = 不限**（放货期间一直买到 `max_orders` 满为止）。不限也不会打空炮：货一没监控下一轮就不报了，候选随之消失；真没救的失败（页面明写售罄、配置不对、被限流）由 `retriable=False` 直接判死，不靠次数兜 |
+| `autobuy.abort_when_gone` | 发结账请求之前回头问一次监控，已经报无货就停手，默认 `true`。2026-09-20 两台机器 17 次 `search`，10 次是在监控已经打出「N 家门店均无货」之后 1~7 秒才发的，**10 次全输**——每次赔 10.8 秒和十几个 checkoutx 请求，还跟「尝试后一分钟内掉线」强相关 |
+| `autobuy.stock_fresh_seconds` | 上一条的新鲜度门槛，默认 `15` 秒。**只有「刚刚查过、而且没查到」才刹车**；查询失败、熔断静默、或者读数已经半分钟旧，一律当「不知道」放行。常规巡检 30~45 秒一轮，放货时冲刺会压到 4~6 秒（实测 6~8 秒），所以真要刹车的那一刻信息一定是新鲜的 |
 | `autobuy.candidate_max_age` | 库存观察超过这么多秒就不再拿去下单，默认 `90`。太小会让 `max_attempts_per_stock` 形同虚设 |
 | `autobuy.pickup_store_numbers` | 快车道门店编号，如 `["R581"]`；监控命中时优先使用实际有货的门店编号。仅有门店名不能运行快车道 |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |

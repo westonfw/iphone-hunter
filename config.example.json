@@ -63,6 +63,8 @@
     "preflight_warm_checkout": false,
     "login_warn_days": 3,
     "warm_max_age": 180,
+    "abort_when_gone": true,
+    "stock_fresh_seconds": 15,
     "candidate_max_age": 90,
     "max_attempts_per_stock": 0,
     "retry_delay": 15,
