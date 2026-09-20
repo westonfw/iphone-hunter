@@ -7,6 +7,9 @@ __pycache__/
 .browser-profile/
 logs*/
 
+# 密码和总线密钥只放环境变量；.env 是给启动脚本 source 用的，绝不能进仓库
+.env
+
 # HAR 里有 cookie / 身份证 / 手机号明文，绝不能进仓库
 *.har
 

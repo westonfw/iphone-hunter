@@ -45,7 +45,8 @@
     "buyer_offset": 0,
     "port": 48711,
     "peers": [],
-    "allow": []
+    "allow": [],
+    "blind_after": 45
   },
   "pickup": {
     "enabled": true,
