@@ -69,6 +69,46 @@ def verify(payload: dict, mac: str, key: bytes) -> bool:
 
 
 @dataclass(frozen=True)
+class Alive:
+    """主程序的心跳。
+
+    **没有它，主程序挂了没人知道。** 没货的时候本来就没有 seen 消息，所以买手
+    分不清「主程序死了」和「只是没放货」——那正是最危险的状态：看着一切正常，
+    放货那一刻才发现根本没人在盯。
+
+    按约定不做保险丝（买手不会自己去巡检兜底），所以这条心跳是唯一的报警来源，
+    断了就必须叫醒人。
+    """
+
+    id: str
+    at: float = 0.0
+    exits: int = 0
+    round_no: int = 0
+    src: str = ""
+
+    def payload(self) -> dict:
+        return {"v": VERSION, "kind": "alive", "id": self.id,
+                "exits": int(self.exits), "round_no": int(self.round_no),
+                "at": round(self.at, 3), "src": self.src}
+
+    @classmethod
+    def parse(cls, d: dict) -> "Alive | None":
+        if not isinstance(d, dict) or d.get("v") != VERSION or d.get("kind") != "alive":
+            return None
+        who = str(d.get("id") or "").strip()
+        if not who:
+            return None
+        try:
+            at = float(d.get("at") or 0)
+            exits = int(d.get("exits") or 0)
+            rnd = int(d.get("round_no") or 0)
+        except (TypeError, ValueError):
+            return None
+        return cls(id=who, at=at, exits=exits, round_no=rnd,
+                   src=str(d.get("src") or who))
+
+
+@dataclass(frozen=True)
 class Enlist:
     """子程序报到：我在，我的转发口在这个端口上。
 
@@ -203,7 +243,7 @@ class Decoder:
         kind = str(body.get("kind") or "")
         if kind not in self.kinds:
             return None, f"不收 {kind!r} 这种消息"
-        s = (Sighting if kind == "seen" else Enlist).parse(body)
+        s = {"seen": Sighting, "enlist": Enlist, "alive": Alive}[kind].parse(body)
         if s is None:
             return None, "字段不认识（版本不一致？）"
         if self.allow and s.src not in self.allow:

@@ -36,7 +36,7 @@ from hunter.monitor import watch_items
 from hunter.notify import AsyncBroadcaster, Broadcaster
 from hunter.purchase_worker import Offer, PurchaseWorker
 
-from .bus import DEFAULT_PORT, Receiver, Sighting, bus_key
+from .bus import DEFAULT_PORT, Alive, Receiver, Sighting, bus_key
 from .link import mono_of
 
 #: 多久没收到这个型号的心跳就当它没货了。探针一轮 4~8 秒（冲刺时），
@@ -44,6 +44,8 @@ from .link import mono_of
 FRESH = 15.0
 #: 一个探针都联系不上多久，就认定自己瞎了、不再踩刹车。
 BLIND_AFTER = 45.0
+#: 主程序多久没心跳就报警。它每轮都发，所以 90 秒等于连着漏好几次。
+MASTER_STALE = 90.0
 
 
 def _p(*a) -> None:
@@ -82,12 +84,17 @@ class Buyer:
 
         self.fresh = float(ab.get("stock_fresh_seconds", FRESH) or FRESH)
         self.blind_after = float(link.get("blind_after", BLIND_AFTER) or BLIND_AFTER)
+        self.master_stale = float(link.get("master_stale", MASTER_STALE) or MASTER_STALE)
 
         self.lock = threading.Lock()
         #: 每个型号最后一次听到「有货」的本机单调时刻
         self.heard: dict[str, float] = {}
         #: 最后一次收到**任何**探针消息的时刻——用来分清「没货」和「我瞎了」
         self.any_signal = 0.0
+        #: 最后一次收到主程序心跳的时刻，和它当时报的出口数
+        self.last_alive, self.master_exits, self.master_id = 0.0, 0, ""
+        #: 已经就失联报过警了，别每轮刷一遍
+        self._warned_missing = False
 
         self.worker = PurchaseWorker(
             self.autobuy, self._report,
@@ -106,6 +113,52 @@ class Buyer:
         slug = self.slug_of.get(part, "")
         return (self.urls.buy_url(slug, part) if slug
                 else self.urls.base + "/shop/buy-iphone")
+
+    def heard_alive(self, a: Alive, ip: str = "") -> None:
+        """主程序的心跳。
+
+        它同时是「我没瞎」的证据：没货的时候不会有 seen 消息，光看 seen 的话
+        买手会在每一个安静的时段都以为自己失明。
+        """
+        now = time.monotonic()
+        with self.lock:
+            first = not self.last_alive
+            back = self._warned_missing
+            self.last_alive, self.master_exits = now, a.exits
+            self.master_id = a.id
+            self._warned_missing = False
+        if first:
+            self.log(f"[买手] 主程序 {a.id} 在线，{a.exits} 条出口")
+        elif back:
+            self.log(f"[买手] 主程序 {a.id} 回来了")
+            self.bc.send("✅ 主程序恢复", f"{a.id} 又在发心跳了，{a.exits} 条出口",
+                         "", critical=True)
+
+    def on_bus(self, msg, ip: str = "") -> None:
+        """总线上来的东西分流。"""
+        if isinstance(msg, Alive):
+            self.heard_alive(msg, ip)
+        else:
+            self.heard_of(msg, ip)
+
+    def check_master(self) -> None:
+        """主程序失联就叫醒人。
+
+        按约定不做保险丝——买手不会自己去巡检兜底。所以这条报警是唯一的出路：
+        主程序挂了而没人知道的话，看着一切正常，放货那一刻才发现根本没人在盯。
+        """
+        now = time.monotonic()
+        with self.lock:
+            last, warned, who = self.last_alive, self._warned_missing, self.master_id
+            if not last or warned or now - last <= self.master_stale:
+                return
+            self._warned_missing = True
+        gone = now - last
+        self.log(f"[买手] ⚠️ 主程序 {who} 已经 {gone:.0f}s 没有心跳了")
+        self.bc.send("⚠️ 主程序失联", 
+                     f"{who} 已经 {gone:.0f} 秒没心跳。买手不会自己巡检，"
+                     f"现在等于没人在盯库存——去看看那台机器。",
+                     "", critical=True, wake=True)
 
     def heard_of(self, s: Sighting, ip: str = "") -> None:
         """探针说某个型号在某店有货。（ip 是包的源地址，买手用不上；主程序靠它认出子程序）
@@ -137,11 +190,16 @@ class Buyer:
         now = time.monotonic()
         with self.lock:
             last, any_signal = self.heard.get(part, 0.0), self.any_signal
+            alive = self.last_alive
         if last and now - last <= self.fresh:
             return True
+        # 「我还看得见」的证据，优先用主程序的心跳：没货的时候不会有 seen 消息，
+        # 光看 seen 的话，每一个安静的时段都会被误判成失明。
+        if alive and now - alive <= self.master_stale:
+            return False         # 主程序在刷，只是没提这个型号
         if not any_signal or now - any_signal > self.blind_after:
-            return None          # 一个探针都听不见，这是失明，不是没货
-        return False             # 探针还在说话，只是不提它了
+            return None          # 谁都联系不上，这是失明，不是没货
+        return False
 
     # ---------- 结果 ----------
 
@@ -166,14 +224,16 @@ class Buyer:
             raise SystemExit(
                 "买手不自己巡检，库存全靠总线——没有 HUNTER_BUS_KEY 就等于瞎子。"
                 "跑 `python -m hunter2 key` 生成一个，所有部署共用同一个。")
-        self.receiver = Receiver(key=key, on_sighting=self.heard_of, port=self.port,
-                                 allow=self.allow, log=self.log)
+        self.receiver = Receiver(key=key, on_sighting=self.on_bus, port=self.port,
+                                 allow=self.allow, log=self.log,
+                                 kinds=("seen", "alive"))
         self.receiver.start()
         self.worker.start()
         self.log(f"[买手] {self.bus_id} 就位：不巡检，只等探针的信号（Ctrl+C 停止）")
         try:
             while True:
                 time.sleep(1)
+                self.check_master()
                 if self.worker.halted:
                     self.log("[买手] 已停止接单（买够了或有待核对的订单）")
                     break

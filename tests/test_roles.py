@@ -83,7 +83,9 @@ class BuyerBrakeTests(unittest.TestCase):
         b = Buyer.__new__(Buyer)
         b.lock = __import__('threading').Lock()
         b.heard, b.any_signal = {}, 0.0
-        b.fresh, b.blind_after = fresh, blind
+        b.last_alive, b.master_exits, b.master_id = 0.0, 0, ''
+        b._warned_missing = False
+        b.fresh, b.blind_after, b.master_stale = fresh, blind, 90.0
         return b
 
     def test_a_fresh_heartbeat_means_go(self):
@@ -124,7 +126,9 @@ class BuyerIntakeTests(unittest.TestCase):
         b = Buyer.__new__(Buyer)
         b.lock = __import__('threading').Lock()
         b.heard, b.any_signal = {}, 0.0
-        b.fresh, b.blind_after = 15.0, 45.0
+        b.last_alive, b.master_exits, b.master_id = 0.0, 0, ''
+        b._warned_missing = False
+        b.fresh, b.blind_after, b.master_stale = 15.0, 45.0, 90.0
         b.parts, b.only_stores, b.offset = list(parts), list(only), offset
         b.note_of, b.slug_of = {}, {}
         b.urls = Mock()
@@ -279,7 +283,9 @@ class EndToEndTests(unittest.TestCase):
         b = Buyer.__new__(Buyer)
         b.lock = __import__('threading').Lock()
         b.heard, b.any_signal = {}, 0.0
-        b.fresh, b.blind_after = 15.0, 45.0
+        b.last_alive, b.master_exits, b.master_id = 0.0, 0, ''
+        b._warned_missing = False
+        b.fresh, b.blind_after, b.master_stale = 15.0, 45.0, 90.0
         b.parts, b.only_stores, b.offset = [self.PART, 'MJY64CH/A'], [self.STORE], 0
         b.note_of, b.slug_of = {}, {self.PART: 'iphone-18-pro'}
         b.urls = Mock()
@@ -350,3 +356,103 @@ class EndToEndTests(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(taken, self.rx.taken)
         self.assertGreater(self.rx.refused, refused)
+
+
+class MasterHeartbeatTests(unittest.TestCase):
+    """主程序自己挂了是发不出告警的，只能靠子程序发现「很久没听见」。
+
+    而没货的时候本来就没有 seen 消息——所以必须有独立的心跳，否则子程序
+    分不清「主程序死了」和「只是没放货」。那正是最危险的状态：看着一切正常，
+    放货那一刻才发现根本没人在盯。
+    """
+
+    def buyer(self, stale=90.0):
+        b = Buyer.__new__(Buyer)
+        b.lock = __import__('threading').Lock()
+        b.heard, b.any_signal = {}, 0.0
+        b.last_alive, b.master_exits, b.master_id = 0.0, 0, ''
+        b._warned_missing = False
+        b.fresh, b.blind_after, b.master_stale = 15.0, 45.0, stale
+        b.log, b.bc = Mock(), Mock()
+        return b
+
+    def beat(self, b, exits=2, who='scout'):
+        from hunter2.bus import Alive
+        b.heard_alive(Alive(id=who, at=time.time(), exits=exits, src=who))
+
+    # ---------- 心跳当作「我没瞎」的证据 ----------
+
+    def test_a_quiet_period_with_a_live_master_is_not_blindness(self):
+        """没货就没有 seen 消息。光看 seen 的话，每个安静时段都会被误判成失明。"""
+        b = self.buyer()
+        self.beat(b)
+        self.assertFalse(b.stock_live('P'), '主程序在刷，只是没提这个型号')
+
+    def test_without_any_master_it_is_blindness(self):
+        self.assertIsNone(self.buyer().stock_live('P'))
+
+    def test_a_stale_master_is_blindness_again(self):
+        b = self.buyer(stale=90.0)
+        self.beat(b)
+        b.last_alive = time.monotonic() - 999
+        self.assertIsNone(b.stock_live('P'))
+
+    def test_a_fresh_sighting_still_wins(self):
+        b = self.buyer()
+        self.beat(b)
+        b.heard['P'] = time.monotonic()
+        self.assertTrue(b.stock_live('P'))
+
+    # ---------- 失联告警 ----------
+
+    def test_a_missing_master_wakes_the_user(self):
+        b = self.buyer(stale=10.0)
+        self.beat(b)
+        b.last_alive = time.monotonic() - 60
+        b.check_master()
+        b.bc.send.assert_called_once()
+        self.assertIn('失联', b.bc.send.call_args.args[0])
+        self.assertTrue(b.bc.send.call_args.kwargs.get('wake'))
+
+    def test_it_only_warns_once(self):
+        b = self.buyer(stale=10.0)
+        self.beat(b)
+        b.last_alive = time.monotonic() - 60
+        for _ in range(5):
+            b.check_master()
+        self.assertEqual(1, b.bc.send.call_count)
+
+    def test_a_live_master_never_warns(self):
+        b = self.buyer()
+        self.beat(b)
+        b.check_master()
+        b.bc.send.assert_not_called()
+
+    def test_never_having_seen_a_master_does_not_warn(self):
+        """还没连上就报「失联」是噪音——刚启动时主程序可能还没起来。"""
+        b = self.buyer(stale=10.0)
+        b.check_master()
+        b.bc.send.assert_not_called()
+
+    def test_the_master_coming_back_is_reported(self):
+        b = self.buyer(stale=10.0)
+        self.beat(b)
+        b.last_alive = time.monotonic() - 60
+        b.check_master()
+        b.bc.send.reset_mock()
+        self.beat(b)
+        self.assertIn('恢复', b.bc.send.call_args.args[0])
+        b.check_master()                     # 恢复之后不该再报失联
+        self.assertEqual(1, b.bc.send.call_count)
+
+    # ---------- 分流 ----------
+
+    def test_the_bus_dispatches_by_message_kind(self):
+        from hunter2.bus import Alive, Sighting
+        b = self.buyer()
+        b.heard_of = Mock()
+        b.heard_alive = Mock()
+        b.on_bus(Alive(id='s', at=time.time()))
+        b.on_bus(Sighting(part='P', store='S', at=time.time()))
+        b.heard_alive.assert_called_once()
+        b.heard_of.assert_called_once()
