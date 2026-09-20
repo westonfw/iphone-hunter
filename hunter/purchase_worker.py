@@ -29,7 +29,11 @@ class PurchaseWorker:
                  clock=time.monotonic):
         self.buyer, self.report, self.log = buyer, report, log
         self.max_age = max(1, float(max_age))
-        self.max_attempts = max(1, int(max_attempts))
+        #: 一轮放货里同一型号最多打几次。**0 = 不限**——货一没监控就不再报，
+        #: 候选随之消失，_next 自然停手（2026-09-20 07:27 实测：结账说没货的
+        #: 那一刻，监控 6 秒前就已经改口了，不存在「打空炮」的窗口）。
+        #: 真正没救的失败由 retriable=False 直接判死，不靠次数兜。
+        self.max_attempts = max(0, int(max_attempts))
         self.retry_delay = max(1, float(retry_delay))
         self.warm_url, self.clock = warm_url, clock
         #: 结账预热拿哪个型号探路。跟 warm_url 分开：预热产品页可以关着，
@@ -40,6 +44,9 @@ class PurchaseWorker:
         self.epochs = {}
         #: 每个型号已经试过的门店。冒出一家没试过的 = 新机会，重试计数清零。
         self.tried = {}
+        #: 这一轮已经判死的型号（retriable=False，比如页面明写售罄）。跟次数无关，
+        #: 不限次数时它就是唯一的刹车。卖光再补货时跟着 attempts 一起清。
+        self.burned = set()
         self.cv = threading.Condition()
         self.closed = False
         self.halted = False
@@ -63,12 +70,14 @@ class PurchaseWorker:
                 # 否则接口抖一下就把重试次数刷没了。
                 self.attempts.pop(part, None)
                 self.tried.pop(part, None)
+                self.burned.discard(part)
                 self.epochs[part] = self.epochs.get(part, 0) + 1
             elif live - prev - tried:
                 # 冒出一家没试过的门店：重试计数清零，而且换 epoch——正在跑的
                 # 那一单是拿旧门店表打的，它的结论管不了这家新店。
                 fresh = "、".join(sorted(live - prev - tried))
                 self.attempts.pop(part, None)
+                self.burned.discard(part)
                 self.epochs[part] = self.epochs.get(part, 0) + 1
                 self.log(f'[购买] {part} 新增有货门店 {fresh}，重试次数重新计')
             self.cv.notify_all()
@@ -89,8 +98,12 @@ class PurchaseWorker:
         计数按**型号**记，不按门店——一轮尝试内部就会把有货的几家挨个试过，
         再按门店计数等于把同一轮重复算好几次。
         """
+        if offer.part in self.burned:
+            return False
         count, after = self.attempts.get(offer.part, (0, -1))
-        return (now - offer.observed <= self.max_age and count < self.max_attempts
+        if self.max_attempts and count >= self.max_attempts:
+            return False
+        return (now - offer.observed <= self.max_age
                 and offer.observed > after
                 and (count == 0 or now >= after + self.retry_delay))
 
@@ -258,10 +271,16 @@ class PurchaseWorker:
                 with self.cv:
                     self.tried[offer.part] = self.tried.get(offer.part, set()) | set(stores)
                     if self.epochs.get(offer.part, 0) == epoch:
-                        count = self.attempts.get(offer.part, (0, 0))[0] + 1
-                        if not result.retriable:
-                            count = self.max_attempts
-                        self.attempts[offer.part] = count, self.clock()
+                        if result.ok:
+                            # 成一单**不算一次重试**——重试次数是给失败用的，
+                            # 买满为止由 max_orders 的配额说了算。计数清零，但
+                            # 仍然要等一次新观察（after 照记），别拿旧观察连打。
+                            self.attempts[offer.part] = 0, self.clock()
+                        else:
+                            count = self.attempts.get(offer.part, (0, 0))[0] + 1
+                            if not result.retriable:
+                                self.burned.add(offer.part)
+                            self.attempts[offer.part] = count, self.clock()
                     self.cooldown_until = max(self.cooldown_until,
                                               self.clock() + result.retry_after)
                     # 买够了才停。成功一单只是「还差几台」——真正的上限由

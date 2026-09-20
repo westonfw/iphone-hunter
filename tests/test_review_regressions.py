@@ -420,7 +420,7 @@ class TargetChoiceAndQuotaRegressions(unittest.TestCase):
     def worker(self, **kw):
         w = PurchaseWorker.__new__(PurchaseWorker)
         w.offers, w.attempts, w.epochs = {}, {}, {}
-        w.tried = {}
+        w.tried, w.burned = {}, set()
         w.max_age, w.max_attempts, w.retry_delay = 90.0, 2, 15.0
         w.cooldown_until, w.log = 0.0, Mock()
         w.clock = kw.get('clock', lambda: 0.0)
@@ -1291,3 +1291,77 @@ class MaxOrdersActuallyWorksRegressions(unittest.TestCase):
             with self.assertRaises(QuotaReached):
                 with PurchaseGuard(root, max_orders=4):
                     pass
+
+
+class KeepBuyingWhileStockLastsRegressions(unittest.TestCase):
+    """放货期间就该一直买到配额满，重试次数不该成为拦路虎。"""
+
+    def worker(self, max_attempts=2, clock=None):
+        w = PurchaseWorker.__new__(PurchaseWorker)
+        w.offers, w.attempts, w.epochs = {}, {}, {}
+        w.tried, w.burned = {}, set()
+        w.max_age, w.max_attempts, w.retry_delay = 90.0, max_attempts, 15.0
+        w.cooldown_until, w.log = 0.0, Mock()
+        w.clock = clock or (lambda: 0.0)
+        return w
+
+    @staticmethod
+    def offer(part, store, observed=0.0):
+        return Offer(part, store, store, 'url', part, observed, (0, 0))
+
+    def test_a_success_does_not_burn_a_retry(self):
+        """买到一台不算「失败重试」，否则 max_orders 还没到就先被次数卡死。"""
+        now = [0.0]
+        w = self.worker(clock=lambda: now[0])
+        w.offers = {('A', 'R1'): self.offer('A', 'R1')}
+        w.attempts['A'] = (0, 0.0)                    # 刚成过一单：计数清零、记了时间
+        now[0] = 20.0
+        self.assertIsNone(w._next())                  # 还得等一次新观察
+        w.offers[('A', 'R1')] = self.offer('A', 'R1', observed=19.0)
+        self.assertIsNotNone(w._next())               # 新观察来了就接着买
+
+    def test_zero_means_no_attempt_limit(self):
+        now = [0.0]
+        w = self.worker(max_attempts=0, clock=lambda: now[0])
+        for i in range(1, 8):
+            w.offers = {('A', 'R1'): self.offer('A', 'R1', observed=now[0])}
+            self.assertIsNotNone(w._next(), f'第 {i} 次就被拦了')
+            w.attempts['A'] = (i, now[0])
+            now[0] += 20.0
+
+    def test_a_hopeless_verdict_still_stops_even_without_a_limit(self):
+        """不限次数时，retriable=False 是唯一的刹车——页面明写售罄那种。"""
+        now = [0.0]
+        w = self.worker(max_attempts=0, clock=lambda: now[0])
+        w.offers = {('A', 'R1'): self.offer('A', 'R1')}
+        w.burned.add('A')
+        self.assertIsNone(w._next())
+        now[0] = 60.0
+        w.offers = {('A', 'R1'): self.offer('A', 'R1', observed=59.0)}
+        self.assertIsNone(w._next())                  # 新观察也救不回来
+
+    def test_a_restock_clears_the_hopeless_verdict(self):
+        w = self.worker(max_attempts=0)
+        w.cv = __import__('threading').Condition()
+        w.burned.add('A')
+        w.offers = {('A', 'R1'): self.offer('A', 'R1')}
+        w.observe('A', [], ['R1'])                    # 明确报卖光
+        self.assertNotIn('A', w.burned)
+
+    def test_a_new_store_also_clears_it(self):
+        w = self.worker(max_attempts=0)
+        w.cv = __import__('threading').Condition()
+        w.burned.add('A')
+        w.tried['A'] = {'R1'}
+        w.offers = {('A', 'R1'): self.offer('A', 'R1')}
+        w.observe('A', [self.offer('A', 'R1'), self.offer('A', 'R2')])
+        self.assertNotIn('A', w.burned)
+
+    def test_the_limit_still_works_when_asked_for(self):
+        now = [0.0]
+        w = self.worker(max_attempts=2, clock=lambda: now[0])
+        w.offers = {('A', 'R1'): self.offer('A', 'R1')}
+        w.attempts['A'] = (2, 0.0)
+        now[0] = 60.0
+        w.offers = {('A', 'R1'): self.offer('A', 'R1', observed=59.0)}
+        self.assertIsNone(w._next())

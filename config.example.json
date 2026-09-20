@@ -64,7 +64,7 @@
     "login_warn_days": 3,
     "warm_max_age": 180,
     "candidate_max_age": 90,
-    "max_attempts_per_stock": 2,
+    "max_attempts_per_stock": 0,
     "retry_delay": 15,
     "clear_bag_before_add": true,
     "max_orders": 1,

@@ -291,7 +291,7 @@ class StockWatcher(BaseWatcher):
             self.purchase_worker = PurchaseWorker(
                 self.autobuy, self._report_purchase,
                 max_age=ab.get('candidate_max_age', 90),
-                max_attempts=ab.get('max_attempts_per_stock', 2),
+                max_attempts=ab.get('max_attempts_per_stock', 2),   # 0 = 不限
                 retry_delay=ab.get('retry_delay', 15),
                 warm_url=self._buy_url(self.parts[0]) if self.warm_enabled else '',
                 probe_url=self._buy_url(self.parts[0]) if self.parts else '', log=log)

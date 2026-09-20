@@ -479,6 +479,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.max_orders` | **你打算一共买几台**（累计，不是每单）。默认 `1`。跟 Apple 那个「购物袋最多 2 件」是两回事——后者是每次结账的上限，代码里叫 `BAG_LIMIT`；一个人总共能买几台 Apple 怎么限我们不知道（有人买到 6 台），**程序不去猜，只按你写的数停**。Apple 限购 2，但多买一台是不可逆的花钱动作，必须显式写成 `2` 才会买第二台。已买台数记在 `order-attempt.json` 里，**重启不会清**，买够了就永远不再下单，直到跑 `order-state --reset-count`。结果不明的单**不计入**，但会挡住后续所有购买（要 `order-state --resolve`） |
 | `autobuy.fast_add_to_cart` | 用 cookie 里的 `atbtoken` 发一个 GET 直接加购，默认 `true`（实测 388ms vs 走产品页 11~28s）。**只在「不折抵 + 不加 AppleCare」时生效**——那两个选项是写死在 URL 参数里的；失败会自动退回产品页 |
 | `autobuy.bag_trust_seconds` | 同型号重试时，距上次尝试多久之内还值得赌「袋里还在」，默认 `600`。赌对省掉一次产品页加载（11~26s），赌错只多花一次 `/shop/bag`（几秒）|
+| `autobuy.max_attempts_per_stock` | 一轮放货里同一型号最多打几次，**`0` = 不限**（放货期间一直买到 `max_orders` 满为止）。不限也不会打空炮：货一没监控下一轮就不报了，候选随之消失；真没救的失败（页面明写售罄、配置不对、被限流）由 `retriable=False` 直接判死，不靠次数兜 |
 | `autobuy.candidate_max_age` | 库存观察超过这么多秒就不再拿去下单，默认 `90`。太小会让 `max_attempts_per_stock` 形同虚设 |
 | `autobuy.pickup_store_numbers` | 快车道门店编号，如 `["R581"]`；监控命中时优先使用实际有货的门店编号。仅有门店名不能运行快车道 |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |
