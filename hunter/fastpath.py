@@ -200,12 +200,23 @@ async () => {
         return {stk: t ? t[1] : "", count: c ? parseInt(c[1], 10) : null,
                 cart, skus, items, qty, origin: location.origin};
     };
-    const here = parse(document.documentElement.innerHTML);
-    if (here.stk && here.cart) return here;          // 已经在购物袋页上
+    // **永远重新读，不吃当前页面的 DOM。**
+    //
+    // 原来这里有条捷径：页面已经在购物袋页上就直接 parse 它的 innerHTML，省一次
+    // 请求。问题是它**不看这个页面是什么时候加载的**——而 _park_after_attempt
+    // 每次尝试结束都把页面停在 /shop/bag 上，然后一停就是十几分钟。下一单开始时
+    // 读到的是那个十几分钟前的快照：袋子早就被保活清空了，快照里却还有一条，于是
+    // 去删一个不存在的条目，然后加购，最后袋里到底有什么谁也不知道。
+    //
+    // 2026-09-20 23:14 实测就是这样：23:12 保活刚清空，23:14 下单却又「删了 1 件」。
+    // 省下的那点时间换来的是「可能读到任意旧的状态」，而袋子一脏整单必死。
     try {
         // 相对地址会跟着当前页的 origin 走。页面停在 secureN 上时，
         // fetch("/shop/bag") 打的是 secureN，读回来是空的——调用方必须校验 origin。
-        const res = await fetch("/shop/bag", {credentials: "include", signal: AbortSignal.timeout(30000)});
+        // no-store：这是「袋子现在装了什么」，读到缓存副本等于读到过去。
+        const res = await fetch("/shop/bag", {credentials: "include",
+                                              cache: "no-store",
+                                              signal: AbortSignal.timeout(30000)});
         if (!res.ok) return {status: res.status, cart: false, origin: location.origin,
                              retry_after: res.headers.get("Retry-After")};
         return {...parse(await res.text()), status: res.status, origin: location.origin};
@@ -375,7 +386,10 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
             return {"ok": False, "removed": removed,
                     "reason": f"删 {key[:16]}… 返回 {r.get('status')}"}
         removed += 1
-    log(f"[快车道] 已清空购物袋（接口删了 {removed} 件，"
+    # **把 SKU 打出来。** 只打条数的话，「真的读到 1 条」和「读到一份旧快照里的
+    # 1 条」在日志里长得一模一样——2026-09-20 那三次失败就是这么混过去的。
+    log(f"[快车道] 已清空购物袋（接口删了 {removed} 件"
+        f"{('：' + '、'.join(skus)) if skus else ''}，"
         f"{(time.monotonic() - t0) * 1000:.0f}ms，没加载购物袋页）")
     return {"ok": True, "kept": False, "removed": removed}
 

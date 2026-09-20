@@ -247,15 +247,42 @@ class LoginVerificationRegressions(unittest.TestCase):
             'signOutWords': 0, 'signInWords': 0, 'secureHost': '', 'rendered': 12})
         self.assertIsNone(verify_signed_in(p, self.BASE, log=Mock())['signed_in'])
 
-    def test_preflight_never_reports_signed_in_without_order_page_proof(self):
+    def preflight(self, landed_url, goto_raises=False):
+        """跑一次兜底登录检查，返回 (AutoBuy, 结论)。"""
         with tempfile.TemporaryDirectory() as tmp:
             ab = AutoBuy({}, Path(tmp), log=Mock())
             ab._settle = Mock()
-            with patch('hunter.autobuy.verify_signed_in',
-                       return_value={'signed_in': None, 'secure_host': '', 'evidence': 'x'}):
-                note = ab._preflight_login(Mock())
-            self.assertIsNone(ab.signed_in)
-            self.assertNotIn('已登录', note)
+            ab._sign_in = Mock(return_value=(False, '没配密码'))
+            p = Mock()
+            p.url = landed_url
+            if goto_raises:
+                p.goto.side_effect = RuntimeError('boom')
+            return ab, ab._preflight_login(p), p
+
+    def test_the_preflight_does_not_open_the_order_page(self):
+        """订单页那一趟是多余的：账号页没登录就会跳登录页，那本身就是判据。
+        每 5 分钟一轮的保活里，多翻一趟就是把请求数白白翻一倍。"""
+        ab, note, p = self.preflight('https://www.apple.com.cn/shop/account/home')
+        went = [c.args[0] for c in p.goto.call_args_list]
+        self.assertTrue(went, '一次导航都没有')
+        self.assertFalse([u for u in went if '/shop/order' in u],
+                         f'还在翻订单页：{went}')
+
+    def test_the_account_page_accepting_us_is_proof(self):
+        ab, note, _ = self.preflight('https://www.apple.com.cn/shop/account/home')
+        self.assertIs(True, ab.signed_in)
+        self.assertIn('已登录', note)
+
+    def test_being_bounced_to_sign_in_is_a_hard_negative(self):
+        ab, note, _ = self.preflight('https://idmsa.apple.com.cn/appleauth/auth/signin')
+        self.assertIs(False, ab.signed_in)
+        self.assertNotIn('已登录', note)
+
+    def test_an_unreachable_account_page_is_unknown_never_signed_in(self):
+        """**判不准就说判不准**，绝不报「已登录」——那正是上次踩的坑。"""
+        ab, note, _ = self.preflight('', goto_raises=True)
+        self.assertIsNone(ab.signed_in)
+        self.assertNotIn('已登录', note)
 
     def test_login_expiry_is_read_from_cookie_not_process_uptime(self):
         import time as _t
@@ -1746,3 +1773,45 @@ class AbortWhenGoneRegressions(unittest.TestCase):
         w.log, w.tried, w.attempts, w.epochs, w.burned = Mock(), {}, {}, {}, set()
         w.observe('A', [])
         self.assertEqual(42.0, w.polled['A'])
+
+
+class StaleBagRegressions(unittest.TestCase):
+    """购物袋状态**永远重新读**，不吃当前页面的 DOM，也不吃 HTTP 缓存。
+
+    2026-09-20 23:14 实测：23:12 保活刚把袋子清空，23:14 下单却又「删了 1 件」——
+    因为 _park_after_attempt 把页面停在 /shop/bag 上十几分钟不动，而读袋子有条
+    「已经在购物袋页上就直接 parse innerHTML」的捷径，它不看页面是什么时候加载的。
+    读到的是十几分钟前的快照：去删一个早就不存在的条目，然后加购，最后袋里到底
+    有什么谁也不知道。袋子一脏，结账的 availableNowForAllLines 对每家店都是假，
+    整单死在「所有门店不可取货」上——而货其实好好的。
+    """
+
+    def test_the_dom_shortcut_is_gone(self):
+        from hunter import fastpath
+        self.assertNotIn('if (here.stk && here.cart) return here',
+                         fastpath.JS_CART_STATE,
+                         '又能读到停了十几分钟的页面了')
+
+    def test_it_always_refetches(self):
+        from hunter import fastpath
+        self.assertIn('fetch("/shop/bag"', fastpath.JS_CART_STATE)
+
+    def test_the_read_never_comes_from_cache(self):
+        """「袋子现在装了什么」读到缓存副本，等于读到过去。"""
+        from hunter import fastpath
+        self.assertIn('cache: "no-store"', fastpath.JS_CART_STATE)
+
+    def test_the_cleared_items_are_named(self):
+        """只打条数的话，「真读到 1 条」和「读到旧快照里的 1 条」长得一模一样。"""
+        import inspect
+        from hunter import fastpath
+        src = inspect.getsource(fastpath.prepare_bag)
+        self.assertIn("'、'.join(skus)", src)
+
+    def test_the_bag_is_cleared_even_when_login_is_unknown(self):
+        """登录判不准正是袋子最可能脏的时候——预热跑不起来多半就是加购没进袋。"""
+        import inspect
+        from hunter.autobuy import AutoBuy
+        src = inspect.getsource(AutoBuy.prepare)
+        self.assertNotIn('self.signed_in is True and self.clear_bag', src)
+        self.assertIn('if self.clear_bag and self.preclear_bag', src)

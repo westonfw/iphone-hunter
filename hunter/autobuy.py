@@ -30,7 +30,7 @@ from .apple import REGIONS
 # fill_field 定义在 checkout.py：调用点在那边，而 checkout 不能反向
 # import autobuy（循环导入）。这里再导出一次，保持 autobuy 也能 import。
 from .checkout import (BTN_SIGN_IN, ID_ACCOUNT, ID_PWD, JS_FILL, OrderPlacer,
-                       goto_buy_page, login_state, verify_signed_in, watch_checkout_block,
+                       goto_buy_page, login_state, watch_checkout_block,
                        click_id, eval_in_frames, fill_field, frame_for_id,
                        is_session_expired, is_sign_in, read_field)
 
@@ -420,58 +420,48 @@ class AutoBuy:
         self.login_verified_at = time.time()
         self._remember_host(st, where)
 
-    def _verify_login(self, page) -> dict:
-        """权威验一次登录：真实导航到订单页，看 Apple 认不认。"""
-        return verify_signed_in(page, REGIONS[self.region], timeout_ms=self.timeout,
-                                settle=self._settle, log=self.log)
-
     def _preflight_login(self, page) -> str:
-        """开卖**之前**验登录，没登录就当场登掉。
+        """结账预热跑不起来时的兜底：**直接去账号页**，没登录就当场登掉。
 
-        这才是自动登录该待的位置。原来它只在 _drive 里被动触发——加购完、跳结账、
-        撞上登录墙才开始登，等于把 10~25s 塞进抢购的关键路径；真要是弹双重认证，
-        那一单就没了。挪到预热阶段，最坏情况也只是「现在提醒你去输个验证码」。
+        原来是「先翻订单页验一次 → 判定没登录 → 再跳账号页 → 登完再翻一次订单页」，
+        三次导航，其中两次订单页是多余的：**账号页没登录就会跳登录页，这件事本身
+        就是判据**，而且它跟结账要的是同一级鉴权。多翻的那两趟不只是慢——每一次
+        导航都是一次真实请求，在一个每 5 分钟跑一轮的保活里白白翻一倍。
 
-        判据用的是**订单页**而不是当前这张购物袋页：购物袋上渲染出账号入口并不
-        代表登录——实测过监控报「已登录」、人点进订单却被要求登录。订单页跟结账
-        要的是同一级鉴权，它认了才算数。
+        这条路是兜底，不是主力。正常情况下结账预热（warm_checkout_session）就把
+        登录态给出来了，那才是最权威的判据——它撞的正是下单要的那道墙。
         """
-        st = self._verify_login(page)
-        if st["signed_in"] is True:
-            self._mark_signed_in(st, "订单页")
-            return "已登录"
-        if st["signed_in"] is None:
-            # 判不准就如实说判不准，绝不报「已登录」——那正是上次踩的坑。
-            self.signed_in = None
-            self.login_note = st["evidence"]
-            return "登录态没验出来"
-
-        self.signed_in = False
-        self.log("[预热] ⚠️ 没登录——现在就登，别等到放货那一刻")
         try:
             page.goto(f"{REGIONS[self.region]}/shop/account/home",
                       timeout=self.timeout, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
+            self._settle(page)
         except Exception as e:
-            self.login_note = f"跳登录页失败：{type(e).__name__}"
-            return "⚠️ 未登录且跳不到登录页"
-        if _is_sign_in(page.url):
-            ok, why = self._sign_in(page)
-            if not ok:
-                self.login_note = why
-                self.log(f"[预热] ⚠️ 自动登录没成功：{why}")
-                return f"⚠️ 未登录：{why}"
-            self.log("[预热] 登录完成——这 10~25s 花在开卖前，不占抢购时间")
+            self.signed_in = None
+            self.login_note = f"跳账号页失败：{type(e).__name__}"
+            return "登录态没验出来"
 
-        # 无论是刚登完、还是账号页压根没跳登录，都得再权威验一次：
-        # 「离开了登录页」不等于「订单页认你」。
-        again = self._verify_login(page)
-        if again["signed_in"] is True:
-            self._mark_signed_in(again, "订单页")
-            return "已登录（预热时补登）"
-        self.signed_in = again["signed_in"]
-        self.login_note = again["evidence"]
-        return "⚠️ 登录态不明" if again["signed_in"] is None else "⚠️ 仍未登录"
+        if not _is_sign_in(page.url):
+            # 账号页没把我们踢去登录 = 它认我们。这是服务端判的，不是页面上
+            # 渲染了个账号入口——后者不算数（实测过报「已登录」、点订单却要登录）。
+            self._mark_signed_in({"signed_in": True, "evidence": "账号页"}, "账号页")
+            return "已登录"
+
+        self.signed_in = False
+        self.log("[预热] ⚠️ 没登录——现在就登，别等到放货那一刻")
+        ok, why = self._sign_in(page)
+        if not ok:
+            self.login_note = why
+            self.log(f"[预热] ⚠️ 自动登录没成功：{why}")
+            return f"⚠️ 未登录：{why}"
+        self.log("[预热] 登录完成——这 10~25s 花在开卖前，不占抢购时间")
+
+        # 「离开了登录页」不等于「账号页认你」，再确认一次落点。
+        if _is_sign_in(page.url):
+            self.signed_in = None
+            self.login_note = "登完还停在登录页"
+            return "⚠️ 登录态不明"
+        self._mark_signed_in({"signed_in": True, "evidence": "账号页"}, "账号页")
+        return "已登录（预热时补登）"
 
     #: 登录凭证所在的域。大陆站不是 `.apple.com` 的 myacinfo，而是
     #: `.idmsa.apple.com.cn` 下的 DES<hash>，15 天到期（2026-09-14 实测）。
@@ -640,7 +630,10 @@ class AutoBuy:
                     # 刚补登成功 = 这一轮的结账墙还立着。立刻补一次，别等下一轮。
                     # 2026-09-20 07:20 掉线、07:27 放货，正好撞上，白付 21 秒。
                     note = add(note, warm())
-            if self.signed_in is True and self.clear_bag and self.preclear_bag:
+            # **不挂在 signed_in 上。** 登录判不准正是袋子最可能脏的时候（预热
+            # 跑不起来多半就是因为加购没进袋），那时候更该清一遍。清一个空袋子
+            # 不花什么，留一条脏条目却会让下一单整单死在「所有门店不可取」上。
+            if self.clear_bag and self.preclear_bag:
                 try:
                     check.goto(f'{REGIONS[self.region]}/shop/bag', timeout=self.timeout,
                                wait_until='domcontentloaded')
