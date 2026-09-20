@@ -124,6 +124,21 @@ def _apple_password(cfg: dict, log=print) -> str:
     return os.environ.get(PWD_ENV, "")
 
 
+def _on_main(url: str, region: str) -> bool:
+    """页面是不是已经在主站上。
+
+    购物袋接口是 `fetch("/shop/bag")`——相对地址，跟着 `location.origin` 走，
+    **不读当前页面的 DOM**。所以只要 origin 对，停在主站的哪一页都能问袋子，
+    根本不用先导航到 /shop/bag。
+
+    这不是抠细节：2026-09-20 09:42 那次放货，光 `goto(/shop/bag)` 就花了
+    **16 秒**（放货瞬间主站很慢），而页面本来就停在 /shop/bag 上——
+    _park_after_attempt 每次失败后就把它带回那儿了。
+    """
+    base = REGIONS.get(region) or ""
+    return bool(base) and (url or "").startswith(base + "/")
+
+
 def _pages(ctx) -> set:
     """context 当前开着的标签页。拿不到就当空集——这只用来收拾自己开出来的
     多余标签，问不出来时宁可不收，也不能让预热本身炸掉。"""
@@ -889,13 +904,22 @@ class AutoBuy:
         if light:
             why = (f"同型号重试（距上次 {time.time() - self._last_at:.0f}s）" if retry
                    else "接口加购（不加载产品页）")
-            self.log(f"[自动下单] {why}：走购物袋页，产品页能不碰就不碰")
+            here = ""
             try:
-                page.goto(f"{REGIONS[self.region]}/shop/bag", timeout=self.timeout,
-                          wait_until="domcontentloaded")
-            except Exception as e:
-                self.log(f"[自动下单] 购物袋页打不开（{type(e).__name__}），走完整流程")
-                light = False
+                here = page.url or ""
+            except Exception:
+                here = ""
+            if _on_main(here, self.region):
+                # 已经在主站上了，一趟导航都不用——袋子是 fetch 出来的，不看 DOM。
+                self.log(f"[自动下单] {why}：页面已在主站，直接问购物袋")
+            else:
+                self.log(f"[自动下单] {why}：先回主站，产品页能不碰就不碰")
+                try:
+                    page.goto(f"{REGIONS[self.region]}/shop/bag", timeout=self.timeout,
+                              wait_until="domcontentloaded")
+                except Exception as e:
+                    self.log(f"[自动下单] 购物袋页打不开（{type(e).__name__}），走完整流程")
+                    light = False
         fast = light
         self._last_part, self._last_at = want_part, time.time()
 

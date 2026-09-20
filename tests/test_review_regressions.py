@@ -583,8 +583,7 @@ class SameModelRetryRegressions(unittest.TestCase):
         page.goto.reset_mock()
         self.drive(ab, page, {'ok': True, 'kept': True})      # 第二轮，袋里还在
         gone = [c.args[0] for c in page.goto.call_args_list]
-        self.assertEqual(['https://www.apple.com.cn/shop/bag'], gone)
-        self.assertNotIn(self.URL, gone)                      # 产品页一次都没加载
+        self.assertEqual([], gone, '已经在主站、袋里也对，一趟导航都不该有')
 
     def test_retry_falls_back_to_the_product_page_when_the_bag_is_wrong(self):
         ab, page = self.buyer(), self.page()
@@ -592,7 +591,6 @@ class SameModelRetryRegressions(unittest.TestCase):
         page.goto.reset_mock()
         self.drive(ab, page, {'ok': True, 'kept': False, 'removed': 1})
         gone = [c.args[0] for c in page.goto.call_args_list]
-        self.assertEqual('https://www.apple.com.cn/shop/bag', gone[0])
         self.assertIn(self.URL, gone)                         # 赌错了就老实加载
         ab._pick.assert_called()                              # 而且必选项要重选
 
@@ -750,8 +748,9 @@ class FastAddToCartRegressions(unittest.TestCase):
                    [{'ok': True, 'kept': False},        # 购物袋页上：空袋
                     {'ok': True, 'kept': True}])        # 快加购后复核：进袋了
         gone = [c.args[0] for c in page.goto.call_args_list]
-        self.assertIn('https://www.apple.com.cn/shop/bag', gone[0])
-        self.assertTrue(any('add-to-cart=add-to-cart' in g for g in gone), gone)
+        # 页面本来就在主站上，连购物袋页都不用去——袋子是 fetch 出来的
+        self.assertEqual(1, len(gone), gone)
+        self.assertIn('add-to-cart=add-to-cart', gone[0])
         self.assertNotIn(self.URL, gone)                 # 产品页一次都没碰
         ab._pick.assert_not_called()                     # 必选项也不用点
         page.locator.assert_not_called()                 # 更没有点加购按钮
@@ -1434,3 +1433,70 @@ class FatalVsBlockedRegressions(unittest.TestCase):
             if res.fatal:
                 w.burned.add('A')
             self.assertEqual(want, 'A' in w.burned, res.stage)
+
+
+class SkipTheBagNavigationRegressions(unittest.TestCase):
+    """袋子是 fetch("/shop/bag") 问出来的，跟着 location.origin 走、不读 DOM。
+    所以只要已经在主站上，那趟导航纯属白烧。
+
+    2026-09-20 09:42 实测：放货瞬间 goto(/shop/bag) 花了 **16 秒**，而页面本来
+    就停在 /shop/bag 上（_park_after_attempt 每次失败后就把它带回那儿）。
+    36.2 秒的尝试里，这一项占了将近一半。
+    """
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+    BAG = 'https://www.apple.com.cn/shop/bag'
+
+    def buyer(self):
+        ab = AutoBuy({'pickup_store_numbers': ['R581']},
+                     Path(tempfile.mkdtemp()), log=Mock())
+        ab._pick, ab._settle = Mock(), Mock()
+        ab._wait_add_button = Mock(return_value=(True, ''))
+        ab._await_options = Mock(return_value=0.0)
+        return ab
+
+    def ctx(self):
+        c = Mock()
+        c.cookies.return_value = [{'name': 'as_atb', 'value': '1.0|x|' + 'e' * 40}]
+        return c
+
+    def page(self, url):
+        p = Mock()
+        p.url = url
+        p.goto.side_effect = lambda u, **kw: setattr(p, 'url', u)
+        return p
+
+    def drive(self, ab, page, ctx, bags):
+        with patch('hunter.fastpath.prepare_bag', side_effect=list(bags)), \
+             patch('hunter.fastpath.bag_to_checkout', return_value=''), \
+             patch('hunter.autobuy.watch_checkout_block', return_value={}), \
+             patch('hunter.fastpath.wait_for_bag_count', return_value=0.0):
+            return ab._drive(ctx, page, self.URL, False)
+
+    def test_already_on_the_main_site_means_no_navigation_at_all(self):
+        ab, page = self.buyer(), self.page(self.BAG)
+        self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
+        page.goto.assert_not_called()
+
+    def test_any_main_site_page_counts_not_just_the_bag(self):
+        ab, page = self.buyer(), self.page('https://www.apple.com.cn/shop/sorry/session_expired')
+        self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
+        page.goto.assert_not_called()
+
+    def test_sitting_on_the_checkout_host_still_needs_a_trip_back(self):
+        """secureN 上 fetch("/shop/bag") 打的是 secureN，读回来是空的（2026-09-14
+        为此中过招，结果袋里两台）。"""
+        ab = self.buyer()
+        page = self.page('https://secure7.www.apple.com.cn/shop/checkout')
+        self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
+        self.assertEqual([self.BAG], [c.args[0] for c in page.goto.call_args_list])
+
+    def test_a_blank_page_also_needs_the_trip(self):
+        ab, page = self.buyer(), self.page('about:blank')
+        self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
+        self.assertEqual([self.BAG], [c.args[0] for c in page.goto.call_args_list])
+
+    def test_a_lookalike_host_is_not_the_main_site(self):
+        ab, page = self.buyer(), self.page('https://www.apple.com.cn.evil.test/shop/bag')
+        self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
+        self.assertEqual([self.BAG], [c.args[0] for c in page.goto.call_args_list])
