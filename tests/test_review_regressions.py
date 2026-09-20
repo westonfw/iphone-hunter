@@ -1500,3 +1500,79 @@ class SkipTheBagNavigationRegressions(unittest.TestCase):
         ab, page = self.buyer(), self.page('https://www.apple.com.cn.evil.test/shop/bag')
         self.drive(ab, page, self.ctx(), [{'ok': True, 'kept': True}])
         self.assertEqual([self.BAG], [c.args[0] for c in page.goto.call_args_list])
+
+
+class OneFetchLessRegressions(unittest.TestCase):
+    """加购后的复核和进结账读的是同一份购物袋。放货那一刻一次读要 2.5 秒，
+    合成一次就是省 2.5 秒——2026-09-20 09:50 那趟总共才 23.1 秒。"""
+
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJT84CH/A'
+    STATE = {'stk': 'TOK', 'count': 1, 'cart': True, 'skus': ['MJT84CH/A'],
+             'qty': [1], 'items': ['item-1'], 'origin': 'https://www.apple.com.cn',
+             'checkoutUrl': '/shop/checkout'}
+
+    def test_prepare_bag_hands_the_raw_state_out_when_it_keeps_the_cart(self):
+        from hunter.fastpath import prepare_bag
+        page = Mock()
+        page.evaluate.return_value = dict(self.STATE)
+        r = prepare_bag(page, want_part='MJT84CH/A',
+                        want_origin='https://www.apple.com.cn', log=lambda *a: None)
+        self.assertTrue(r['kept'])
+        self.assertEqual(1, r['state']['count'])
+
+    def test_bag_to_checkout_reuses_a_handed_state_without_fetching(self):
+        from hunter.fastpath import bag_to_checkout
+        page = Mock()
+        page.evaluate.side_effect = AssertionError('不该再 fetch 一次')
+        bag_to_checkout(page, want_part='MJT84CH/A',
+                        want_origin='https://www.apple.com.cn',
+                        log=lambda *a: None, state=dict(self.STATE))
+
+    def test_it_still_fetches_when_no_state_is_handed(self):
+        from hunter.fastpath import bag_to_checkout
+        page = Mock()
+        page.evaluate.return_value = dict(self.STATE)
+        bag_to_checkout(page, want_part='MJT84CH/A',
+                        want_origin='https://www.apple.com.cn', log=lambda *a: None)
+        page.evaluate.assert_called()
+
+    def test_an_empty_state_is_not_trusted(self):
+        """给了个空壳就该自己重读，别拿它当真。"""
+        from hunter.fastpath import bag_to_checkout
+        page = Mock()
+        page.evaluate.return_value = dict(self.STATE)
+        bag_to_checkout(page, want_part='MJT84CH/A',
+                        want_origin='https://www.apple.com.cn',
+                        log=lambda *a: None, state={})
+        page.evaluate.assert_called()
+
+    def test_fast_add_reports_both_the_verdict_and_the_state(self):
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        page = Mock()
+        page.goto.side_effect = lambda u, **kw: None
+        with patch('hunter.fastpath.prepare_bag',
+                   return_value={'ok': True, 'kept': True, 'state': dict(self.STATE)}):
+            ok, st = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
+        self.assertTrue(ok)
+        self.assertEqual(1, st['count'])
+
+    def test_a_failed_fast_add_hands_back_nothing(self):
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        page = Mock()
+        page.goto.side_effect = lambda u, **kw: None
+        with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': False}):
+            ok, st = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
+        self.assertFalse(ok)
+        self.assertIsNone(st)
+
+    def test_the_state_is_used_once_and_dropped(self):
+        """登录之后那条路必须重读——那时候袋子和会话都可能变了。"""
+        ab = AutoBuy({}, Path(tempfile.mkdtemp()), log=Mock())
+        ab._bag_state = dict(self.STATE)
+        with patch('hunter.fastpath.bag_to_checkout', return_value='') as b:
+            try:
+                ab._enter_checkout(Mock(), Mock(), 'MJT84CH/A', state=ab._bag_state)
+            except Exception:
+                pass
+        self.assertIsNone(ab._bag_state)
+        self.assertEqual(1, b.call_args.kwargs['state']['count'])

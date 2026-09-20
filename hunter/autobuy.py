@@ -245,6 +245,8 @@ class AutoBuy:
         #: 这一单是不是可能产生了订单。每次 _drive 开头清零，只用来决定收尾时
         #: 要不要把标签带离结账页（那一页上有二维码和订单号）。
         self._attempt_order = False
+        #: 刚读到的购物袋状态，只用来把「加购后复核」和「进结账读袋」并成一次。
+        self._bag_state = None
         #: 上一轮打的是哪个型号、什么时候打完的。同型号重试时用来决定要不要走
         #: 「先问购物袋」的快路。用墙上时钟，因为它要跨越很长的空闲期。
         self._last_part, self._last_at = "", 0.0
@@ -842,6 +844,7 @@ class AutoBuy:
         if dry_run:
             return self._drive_inner(ctx, page, url, True, in_stock, in_stock_numbers)
         self._attempt_order = False
+        self._bag_state = None
         try:
             with PurchaseGuard(self.root, max_orders=self.max_orders) as guard:
                 self.submit_guard = guard
@@ -946,9 +949,11 @@ class AutoBuy:
                          f"（省下一次整页加载）")
             # 袋里没有：先试接口加购（一个 GET，实测 388ms）。不成再退产品页。
             if fast and not bagged_ok and token:
-                bagged_ok = self._fast_add(page, product_url, want_part, token)
+                bagged_ok, fresh = self._fast_add(page, product_url, want_part, token)
                 if bagged_ok:
                     self.bagged_part = want_part
+                    # 复核刚读到的那份状态直接交给 bag_to_checkout，别再 fetch 一次
+                    self._bag_state = fresh
             # 还得加购的话，现在才需要产品页：要么快路没成、要么刚清了袋。
             # 清过袋就必须重开——页面上的选择会随着清袋失效（api_cleared）。
             if not bagged_ok and (not on_product or prepared.get("removed")):
@@ -1036,7 +1041,8 @@ class AutoBuy:
         blocked = watch_checkout_block(page, log=self.log, ctx=ctx)
         self._checkout_cleanup = blocked.get("close")
         try:
-            page = self._enter_checkout(ctx, page, want_part)
+            page = self._enter_checkout(ctx, page, want_part,
+                                        state=self._bag_state)
         except Blocked:
             raise  # 包括页面入口抛出的限流，统一由 _drive 转换为冷却结果。
         except Exception as e:
@@ -1105,12 +1111,18 @@ class AutoBuy:
         outcome = placer.place(page, t0)
         return self._wrap(placer, placer.result_url or page.url, *outcome)
 
-    def _enter_checkout(self, ctx, page, want_part):
-        """登录前后共用一个入口，页面入口异常与接口异常按同样方式传递。"""
+    def _enter_checkout(self, ctx, page, want_part, state=None):
+        """登录前后共用一个入口，页面入口异常与接口异常按同样方式传递。
+
+        `state` 只在「刚刚读过袋子」时传，用完即弃——登录之后那条路必须重读，
+        那时候袋子和会话都可能变了。
+        """
         from .fastpath import EntryUnavailable, bag_to_checkout
+        self._bag_state = None
         try:
             direct = bag_to_checkout(page, want_part=want_part, want_qty=1,
-                                     want_origin=REGIONS[self.region], log=self.log)
+                                     want_origin=REGIONS[self.region], log=self.log,
+                                     state=state)
         except EntryUnavailable:
             return self._checkout_via_bag(ctx, page, want_part)
         if not direct:
@@ -1385,12 +1397,18 @@ class AutoBuy:
         return (any(m in t for m in self.NO_TRADE_IN)
                 and any(m in a for m in self.NO_APPLECARE))
 
-    def _fast_add(self, page, product_url: str, want_part: str, token: str) -> bool:
+    def _fast_add(self, page, product_url: str, want_part: str,
+                  token: str) -> tuple[bool, dict | None]:
         """用 atbtoken 发一个 GET 把目标加进购物袋。成功返回 True。
 
         **失败是静默的**：token 用过一次就作废，再发一次照样 200、页面照常、
         袋子纹丝不动。所以返回值一律以 prepare_bag 复核的结果为准，绝不看状态码。
         失败时调用方老实退回产品页那条路。
+
+        返回 (进袋了没有, 复核时读到的购物袋状态)。状态是给紧接着的
+        bag_to_checkout 用的——它要的是同一份东西，递过去就少 fetch 一次。
+        放货那一刻一次袋状态读要 2.5 秒，那是整趟 21 秒里的一大块。
+        状态可能为 None（读法变了、或者固件没带），那时候它自己重读，只是慢一点。
         """
         from .fastpath import atb_add_url, prepare_bag
         t0 = time.monotonic()
@@ -1399,15 +1417,15 @@ class AutoBuy:
                       timeout=self.timeout, wait_until="domcontentloaded")
         except Exception as e:
             self.log(f"[自动下单] 快加购请求失败（{type(e).__name__}），走产品页")
-            return False
+            return False, None
         # 复核：这一步不能省，加购失败没有任何显式信号
         st = prepare_bag(page, want_part=want_part,
                          want_origin=REGIONS[self.region], log=self.log)
         ok = bool(st.get("ok") and st.get("kept"))
         el = (time.monotonic() - t0) * 1000
-        self.log(f"[自动下单] {'快加购成功' if ok else '⚠️ 快加购没进袋（token 多半已用过）'}"
+        self.log(f"[自动下单] {'快加购成功' if ok else '⚠️ 快加购没进袋（原因见日志上一条）'}"
                  f"（{el:.0f}ms，未加载产品页）")
-        return ok
+        return ok, (st.get("state") if ok else None)
 
     def _await_options(self, page, cap_ms: int = 8000, step_ms: int = 100) -> float:
         """等产品页把必选项分区渲染出来。返回实际等了多少毫秒。

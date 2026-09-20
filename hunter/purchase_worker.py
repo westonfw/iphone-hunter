@@ -297,6 +297,13 @@ class PurchaseWorker:
                     self.halted = bool(getattr(self.buyer, 'halt_for_human', False))
                 self.log(f'[购买] {offer.part}：{result.stage}，'
                          f'耗时 {self.clock() - started:.1f}s')
+                # 一单打完立刻补一次保活，别等下一个间隔。
+                # 2026-09-19/20 的统计：6 次购买尝试里有 4 次在 1 分钟内跟着一次
+                # 掉线（基线掉线率约 1 次/小时，随机撞上的概率 2.5%，不是巧合）。
+                # 结账预热本身不引起掉线（同期 75 次，零相关），差别在于它不跑六步
+                # ——所以多半是六步或它的失败收尾把会话作废了。掉了不马上修，下一次
+                # 放货就得自己付那 20 秒登录。
+                check_after = self.clock()
                 try:
                     self.report(result, offer.title, offer.url)
                 except Exception as e:

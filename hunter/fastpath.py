@@ -354,7 +354,9 @@ def prepare_bag(page, want_part: str = "", want_origin: str = "", log=print) -> 
     # 少了数量那条就会放过「同型号两台」——集合比对看不出来，实测中招过。
     if want and len(items) == 1 and skus == [want] and qty[:1] == [1]:
         log(f"[快车道] 购物袋里已经正好是 {want} × 1，跳过清空和加购")
-        return {"ok": True, "kept": True, "removed": 0}
+        # 把刚读到的原始状态带出去：紧接着 bag_to_checkout 要的是同一份东西，
+        # 递过去就少 fetch 一次。放货那一刻一次袋状态读要 2.5 秒。
+        return {"ok": True, "kept": True, "removed": 0, "state": st}
     if want and skus == [want] and (len(items) > 1 or qty[:1] != [1]):
         log(f"[快车道] 购物袋里是 {want} 但有 {len(items)} 条 / 数量 {qty[:3]}"
             f"——不是要的那一台，照样清空重加")
@@ -411,18 +413,25 @@ def wait_for_bag_count(page, minimum: int = 1, cap_ms: int = 2000,
 
 
 def bag_to_checkout(page, want_part: str = "", want_qty: int = 1,
-                    want_origin: str = "", log=print) -> str:
+                    want_origin: str = "", log=print, state: dict | None = None) -> str:
     """从购物袋接口直接拿到结账地址。拿不到返回空串，调用方停止本次尝试。
 
     want_part 给了就**强制复核**袋里的型号，对不上抛 CartMismatch——
     宁可这一单不下，也不能买错机器。
+
+    `state` 是**刚刚**读到的购物袋状态（毫秒级之前）。给了就不再自己 fetch 一次：
+    放货那一刻主站很慢，2026-09-20 09:50 实测一次袋状态读就要 2.5 秒，而加购后
+    的复核和这里读的是同一份东西。省一次就是省 2.5 秒，那是整趟 21 秒里的一大块。
     """
     t0 = time.monotonic()
-    try:
-        st = page.evaluate(JS_CART_STATE) or {}
-    except Exception as e:
-        log(f"[快车道] 读购物袋状态失败：{type(e).__name__}")
-        return ""
+    if isinstance(state, dict) and state:
+        st = state
+    else:
+        try:
+            st = page.evaluate(JS_CART_STATE) or {}
+        except Exception as e:
+            log(f"[快车道] 读购物袋状态失败：{type(e).__name__}")
+            return ""
     raise_if_blocked(st, "读取购物袋")
     stk, count = str(st.get("stk") or ""), st.get("count")
     # 空袋子不能往下走：加购很可能压根没成，这时候进结账只会得到一个空订单
