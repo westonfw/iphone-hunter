@@ -109,8 +109,9 @@ class PurchaseWorker:
             if any(k[0] == part for k in self.offers):
                 return True
             last = self.polled.get(part)
-        fresh = float(getattr(self.buyer, 'cfg', {}).get(
-            'stock_fresh_seconds', self.FRESH_SECONDS) or self.FRESH_SECONDS)
+        cfg = getattr(getattr(self, 'buyer', None), 'cfg', None)
+        fresh = float((cfg or {}).get('stock_fresh_seconds', self.FRESH_SECONDS)
+                      or self.FRESH_SECONDS)
         if last is None or self.clock() - last > fresh:
             return None
         return False
