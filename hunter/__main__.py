@@ -10,6 +10,7 @@ from pathlib import Path
 from . import PY_CMD
 from .apple import REGIONS, AppleClient, Blocked, NotLive, Stock
 from .autobuy import (DEFAULT_CDP_PORT, AutoBuy, AutoBuyUnavailable, _store_list,
+                      stores_of,
                       cdp_candidates, inspect_checkout, launch_debug_chrome, probe_cdp,
                       windows_chrome)
 from .logbook import setup as setup_logbook
@@ -227,6 +228,7 @@ def cmd_rehearse(args) -> int:
     ab = dict(cfg.get("autobuy") or {})
     ab["enabled"] = True
     ab.setdefault("region", args.region or cfg.get("region", "cn"))
+    ab["pickup_store_numbers"] = stores_of(cfg)
     if args.show:
         ab["headless"] = False
     url = client.buy_url(slug, part)
@@ -271,10 +273,11 @@ def cmd_buy(args) -> int:
     """真跑一次下单：加购 → 现在下单 → 停在待付款。不经过库存监控。"""
     cfg = load_config()
     ab = dict(cfg.get("autobuy") or {})
+    ab["pickup_store_numbers"] = stores_of(cfg)
     if args.stop_at_review:
         ab["stop_at_review"] = True
     if args.store:
-        ab["pickup_store_numbers"] = [args.store.upper()]
+        ab["pickup_store_numbers"] = [args.store.upper()]   # 点名一家，那家就是全部
     if not args.confirm:
         pay = ab.get("payment_method") or "支付宝"
         stores = _store_list(ab.get("pickup_stores"), ab.get("pickup_store_name"))
@@ -402,13 +405,18 @@ def cmd_fastpath(args) -> int:
     cfg = load_config()
     ab = cfg.get("autobuy") or {}
     pk = cfg.get("pickup") or {}
-    stores = [s for s in (ab.get("pickup_store_numbers") or pk.get("stores") or [])
+    stores = [s for s in (stores_of(cfg) or [])
               if str(s).upper().startswith("R")]
     if not stores:
         raise SystemExit("配置里没有门店编号（形如 R581）。填 pickup.stores 或 "
                          "autobuy.pickup_store_numbers。名字（五角场）不行——"
                          "selectStore 只认编号。")
     store = (args.store or stores[0]).upper()
+    # --store 是人当场点名的，那家就是全部——跟 `buy --store` 一个规矩。
+    # 没点名就按配置的门店走，这个入口带 --confirm 是会真下单的。
+    allow = [store] if args.store else stores
+    if store not in allow:
+        allow = [store]
 
     try:
         from playwright.sync_api import sync_playwright
@@ -434,6 +442,10 @@ def cmd_fastpath(args) -> int:
               f"{args.time or ab.get('pickup_time') or 'earliest'}\n")
         fc = FastCheckout(
             store=store,
+            stores=[store] + [x for x in stores if x != store],
+            # **边界也要传。** 只读配置不传下去的话，首店排不上时它会换到一家
+            # 没配过的店，而这个入口带 --confirm 是会真下单的。
+            allow=allow,
             id_last4=str(ab.get("id_last4") or ""),
             last_name=str(ab.get("pickup_last_name") or ""),
             first_name=str(ab.get("pickup_first_name") or ""),

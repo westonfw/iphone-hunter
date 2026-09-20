@@ -268,8 +268,9 @@ class MonitorCandidateTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         w = StockWatcher.__new__(StockWatcher)
         w.state = State(Path(self.tmp.name) / 'state.json')
-        w.cfg = {'autobuy': {'pickup_store_numbers': ['R001']}}
-        w.note_of, w.only_stores, w.parts = {}, [], ['P']
+        w.cfg = {'pickup': {'stores': ['R001']}, 'autobuy': {}}
+        # 一份名单：盯的就是买的
+        w.note_of, w.only_stores, w.parts = {}, ['R001'], ['P']
         w.autobuy = SimpleNamespace(pickup_stores=[])
         w.client = SimpleNamespace(observed_at={})
         w.purchase_worker = Mock()
@@ -294,7 +295,7 @@ class MonitorCandidateTests(unittest.TestCase):
         self.assertEqual(['R001'], self.w.state.get('pickup:P'))
         self.assertEqual([], self.w.purchase_worker.observe.call_args.args[1])
 
-    def test_only_allowed_stores_become_purchase_candidates(self):
+    def test_stores_outside_the_configured_list_never_become_candidates(self):
         self.w._check_pickup('P', [self.store(), self.store('R002')])
         offers = self.w.purchase_worker.observe.call_args.args[1]
         self.assertEqual(['R001'], [o.store for o in offers])

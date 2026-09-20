@@ -1,36 +1,26 @@
-"""hunter2 的入口。跟 `python -m hunter watch` 做的是同一件事，多一条局域网总线。
+"""hunter2 的入口：**买手**这一侧。
+
+盯库存的那一半在 `python -m scout` 里，这边只负责买。
+
+    HUNTER_BUS_KEY=<所有部署一样的随机串> python -m hunter2 buy
 
 部署一个新账号 = 把整个目录拷一份、改 config.json。订单记录、浏览器 profile、
 日志目录都在各自的目录下，天然隔离。
 
-    HUNTER_BUS_KEY=<两边一样的随机串> python -m hunter2 watch
-
-没配 HUNTER_BUS_KEY 就退化成单机，行为跟 hunter watch 完全一致。
+单机不联机的用法在 `python -m hunter watch`——那条路不需要密钥，也不碰总线。
 """
 
 from __future__ import annotations
 
 import argparse
 import secrets
+import sys
 
 from hunter.__main__ import ROOT, load_config
+from hunter.logbook import setup as setup_logbook
 
 from .bus import KEY_ENV, bus_key
 from .buyer import Buyer
-from .link import LinkedWatcher
-from .sensor import Sensor
-
-
-def cmd_watch(args) -> int:
-    """又盯又买（单机也能跑）。想把两件事拆到不同进程/机器上，用 sense / buy。"""
-    LinkedWatcher(load_config(), ROOT, sprint=args.sprint).loop()
-    return 0
-
-
-def cmd_sense(args) -> int:
-    """只盯不买。不需要账号，所以可以按出口 IP 随便加。"""
-    Sensor(load_config(), ROOT, sprint=args.sprint).loop()
-    return 0
 
 
 def cmd_buy(args) -> int:
@@ -68,7 +58,36 @@ def cmd_doctor(args) -> int:
 
     print(f"  link.buyer_offset = {link.get('buyer_offset', 0)}"
           f"   ← 几份部署要各不相同，否则多型号同时放货时会挤在同一个上")
-    print(f"  link.peers = {link.get('peers') or '(广播)'}")
+    peers = [str(x) for x in (link.get("peers") or []) if x]
+    print(f"  link.peers = {peers or '(广播)'}")
+    # 写清端口的单播是合法的——同机多进程各绑各的端口，谁也吞不掉谁。
+    # 只有光秃秃的地址才有歧义：几个进程绑同一个 UDP 端口时，单播只投给其中
+    # 一个，而且不报任何错。
+    bare = [x for x in peers if ":" not in x]
+    if bare:
+        ok = False
+        print(f"  ✗ {'、'.join(bare)} 没写端口。同一台机器上有多个进程时，"
+              f"单播只会投给其中一个，而且不报任何错。")
+        print("    要么把 peers 留空走广播（每个进程都拿得到副本），"
+              "要么给每份部署配不同的 link.port，"
+              "并在 peers 里写成 192.168.1.9:48712 这样带端口的形式。")
+
+    # 一主多子：买手同时是主程序的一条出口
+    same = bool(link.get("same_exit_as_master"))
+    print(f"  link.same_exit_as_master = {str(same).lower()}"
+          + ("   ← 标了 true 就不开转发口。只有跟主程序同一个出口 IP 的那台该标，"
+             "标错了主程序会白白少一条出口" if same else
+             "   ← 会开一个转发口把出口 IP 借给主程序；跟主程序同 IP 的那台要标 true"))
+    if not same:
+        print(f"  link.proxy_port = {link.get('proxy_port', 0) or '(随机)'}")
+    print(f"  link.enlist_every = {link.get('enlist_every', 20)}s"
+          f"   ← 主程序 60s 判掉线")
+    print(f"  link.master_stale = {link.get('master_stale', 90)}s"
+          f"   ← 主程序这么久没心跳就叫醒你。不做保险丝，这是唯一的出路")
+
+    from hunter.autobuy import stores_of
+    print(f"  门店 = {'、'.join(stores_of(cfg)) or '(附近全部)'}"
+          f"   ← 盯的就是买的，一份名单")
 
     print(f"  autobuy.apple_id = {ab.get('apple_id') or '(没写)'}")
     print(f"  autobuy.cdp_port = {ab.get('cdp_port') or '(默认 9222)'}"
@@ -82,14 +101,6 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="python -m hunter2", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    w = sub.add_parser("watch", help="又盯又买（单机模式），同时接入总线")
-    w.add_argument("--sprint", action="store_true", help="冲刺模式（开卖前十分钟）")
-    w.set_defaults(func=cmd_watch)
-
-    se = sub.add_parser("sense", help="只盯不买——不需要账号，按出口 IP 加")
-    se.add_argument("--sprint", action="store_true", help="冲刺模式")
-    se.set_defaults(func=cmd_sense)
-
     b = sub.add_parser("buy", help="只买不盯——库存全靠探针喂，按账号加")
     b.set_defaults(func=cmd_buy)
 
@@ -100,6 +111,17 @@ def main(argv=None) -> int:
     d.set_defaults(func=cmd_doctor)
 
     args = ap.parse_args(argv)
+    if args.cmd == "buy":
+        # 长跑的那个才落盘。key / doctor 跑完就退，给它们开一份日志纯属噪音。
+        try:
+            log_cfg = load_config().get("logging") or {}
+        except SystemExit:
+            log_cfg = {}
+        lb = setup_logbook(ROOT, log_cfg, command=args.cmd,
+                           argv=argv or sys.argv[1:])
+        if lb:
+            req = f"，请求明细 {lb.req_path.name}" if lb.req_path else ""
+            print(f"[日志] {lb.log_path}{req}")
     return args.func(args)
 
 

@@ -705,7 +705,7 @@ class FastCheckout:
                  payment_label: str = "招商银行", installment_months: int = 24,
                  fapiao: str = "e_personal_fdf", place_order: bool = False,
                  pickup_time: str = "", stk_timeout_ms: int = 15000, log=print,
-                 submit_guard=None, cancelled=None, stores=None,
+                 submit_guard=None, cancelled=None, stores=None, allow=None,
                  require_slot: bool = True, stages=None):
         self.submit_guard = submit_guard
         self.cancelled = cancelled or (lambda: False)
@@ -714,6 +714,13 @@ class FastCheckout:
         #: 抢手时这一步最要命：一趟重来是十几秒 + 一次重新加购，而换店只是
         #: 一次 fulfillment 请求。第一家永远是 self.store。
         self.stores = [x for x in _dedupe([self.store] + list(stores or [])) if x]
+        #: **硬限制**：只许在这几家里换。跟 `stores` 不是一回事——那个是偏好顺序，
+        #: 这个是边界。留空 = 不限（配置里没写「只去这几家」）。
+        #:
+        #: 分开是因为换店的候选来自**结账侧**的库存，那是附近十几家店，比我们
+        #: 配的多得多。不设边界的话，首选排不上时会安静地换到一家没配过的店，
+        #: 然后一路把单下掉——等发现时人已经要跑去另一个区取货了。
+        self.allow = [x for x in _dedupe(list(allow or [])) if x]
         #: 实际下单用的那家。轮换之后跟 self.store 可能不同，日志和结果都看它。
         self.store_used = self.store
         #: 拿不到取货时段就换店、全都拿不到就停。置 False 可退回老流程（无时段
@@ -746,6 +753,7 @@ class FastCheckout:
         #: 等 x-aos-stk 出现的上限。页面越慢这条路越值钱，所以别急着放弃。
         self.stk_timeout_ms = int(stk_timeout_ms)
         self.log = log
+        self._honour_limit()
         self.order_url = ""
         self.failure_kind = ""
         self.retry_after = 0.0
@@ -996,6 +1004,31 @@ class FastCheckout:
                     "true" if slot.get("recommendationLabel") else "false"))
         return out
 
+    def _honour_limit(self) -> None:
+        """把边界套到**整张候选表**上，不只是首选那家。
+
+        只纠正首选是不够的：轮换是从 self.stores 里挑的，那张表里留着越界的门店
+        就照样会换过去。越界只会是上游传参出了问题（监控给的门店没经过过滤之类），
+        但闷着头按它下单的后果是真金白银——人得跑到另一个区去取机器。
+
+        一家合法的都不剩时**直接拒绝**，不留一个越界的顶上：那等于把配置当建议。
+        """
+        if not self.allow:
+            return
+        inside = [x for x in self.stores if x in self.allow]
+        out = [x for x in self.stores if x not in self.allow]
+        if not inside:
+            raise ValueError(
+                f"候选门店 {'、'.join(self.stores) or '(空)'} 没有一家在配置的门店里"
+                f"（{'、'.join(self.allow)}）——不在配置外的店下单")
+        if out:
+            self.log(f"[快车道] ⚠️ 候选里的 {'、'.join(out)} 不在配置的门店里"
+                     f"（{'、'.join(self.allow)}），已剔除")
+        self.stores = inside
+        if self.store not in self.allow:
+            self.store = inside[0]
+        self.store_used = self.store
+
     def select_store(self, page) -> dict:
         """选门店并挑时段。第一家不行就按**结账侧的库存**精准换，不盲试。
 
@@ -1026,7 +1059,17 @@ class FastCheckout:
 
         # 按我们的偏好顺序取「结账说有货」的那几家，首选那家已经试过了
         nxt = [x for x in self.stores if x in ready and x != self.store]
-        nxt += [x for x in ready if x not in self.stores and x not in nxt]
+        # 偏好表之外的，只在**没配硬限制**时才考虑。配了就一家都不许越界——
+        # 结账侧报的是附近十几家，里面大多数是「为了一台机器跑那么远不值当」的。
+        extra = [x for x in ready if x not in self.stores and x not in nxt
+                 and (not self.allow or x in self.allow)]
+        nxt += extra
+        if self.allow:
+            blocked = [x for x in ready if x not in nxt and x != self.store
+                       and x not in self.allow]
+            if blocked:
+                self.log(f"[快车道] 结账侧 {'、'.join(blocked[:6])} 也有货，"
+                         f"但不在配置的门店里，不去")
         if avail and not ready:
             raise Stalled(
                 f"结账侧 {len(avail)} 家门店全是「目前不可取货」——这一单已经没货了"

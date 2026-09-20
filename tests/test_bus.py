@@ -54,8 +54,8 @@ class SignatureTests(unittest.TestCase):
         self.assertIn('compare_digest', inspect.getsource(bus.verify))
 
     def test_the_signature_does_not_depend_on_key_order(self):
-        a = {'v': 1, 'kind': 'seen', 'part': 'P', 'store': 'S'}
-        b = {'store': 'S', 'part': 'P', 'kind': 'seen', 'v': 1}
+        a = {'v': 2, 'kind': 'seen', 'part': 'P', 'store': 'S'}
+        b = {'store': 'S', 'part': 'P', 'kind': 'seen', 'v': 2}
         self.assertEqual(sign(a, KEY), sign(b, KEY))
         self.assertTrue(verify(b, sign(a, KEY), KEY))
 
@@ -120,7 +120,7 @@ class ClockTests(unittest.TestCase):
 class ShapeTests(unittest.TestCase):
     def test_only_sightings_are_carried(self):
         """**不传「没货了」**：对端的失明不是真相，拿来踩刹车会误杀真放货。"""
-        body = {'v': 1, 'kind': 'gone', 'part': 'P', 'store': 'S',
+        body = {'v': 2, 'kind': 'gone', 'part': 'P', 'store': 'S',
                 'at': 1000.0, 'nonce': 'x'}
         raw = json.dumps({'body': body, 'mac': sign(body, KEY)}).encode()
         got, why = Decoder(key=KEY, clock=lambda: 1000.0).decode(raw)

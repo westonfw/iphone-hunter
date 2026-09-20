@@ -153,6 +153,25 @@ def _pages(ctx) -> set:
     return set(pages) if isinstance(pages, (list, tuple, set)) else set()
 
 
+def stores_of(cfg: dict) -> list[str]:
+    """这份配置的门店名单。**一份名单，一个含义：只盯这几家，也只在这几家买。**
+
+    分成「盯的」和「买的」两份是没有意义的：放货是每家门店各自独立的，A 店有货
+    完全不说明 B 店有货。所以盯一家不打算买的店，除了白烧巡检预算，还会在放货
+    那一刻喊出一条没人能用的信号；反过来，能买却没盯的店放货时我们压根看不见。
+
+    留空 = 人没有限制过门店，附近哪家有货就去哪家。
+
+    `pickup.stores` 是正式的那个键；`autobuy.pickup_store_numbers` 是老配置里
+    的写法，只在前者没写时才认。
+    """
+    pk = _store_list((cfg.get("pickup") or {}).get("stores"))
+    if pk:
+        return [x.upper() for x in pk]
+    ab = cfg.get("autobuy") or {}
+    return [x.upper() for x in _store_list(ab.get("pickup_store_numbers"))]
+
+
 def _store_list(*sources) -> list[str]:
     """把 pickup_stores / pickup_store_name 归一成有序去重的门店名列表。
 
@@ -302,7 +321,12 @@ class AutoBuy:
         #: 快车道要的是门店**编号**（R581），而 pickup_stores 存的是名字（五角场）。
         #: 这两者不能混：selectStore=五角场 服务端不认，而且不会报错、只是选不中。
         #: 放货那一刻优先用监控报上来的「真有货的那几家」，它们本来就是编号。
-        self.pickup_store_numbers = _store_list(self.cfg.get("pickup_store_numbers"))
+        #: 配置里的门店名单，**同时是偏好顺序和硬边界**——就这一份。
+        #: 放货那一刻监控报上来的「真有货的那几家」会排到它前面，但不会超出它：
+        #: 结账侧换店的候选来自 Apple 返回的附近十几家店，不设边界就会安静地
+        #: 换到一家没配过的店把单下掉，等发现时人已经要跑去另一个区取机器了。
+        self.pickup_store_numbers = [
+            x.upper() for x in _store_list(self.cfg.get("pickup_store_numbers"))]
         self.pickup_city = str(self.cfg.get("pickup_city") or "上海")
         self.pickup_state = str(self.cfg.get("pickup_state") or "上海")
         self.pickup_district = str(self.cfg.get("pickup_district") or "杨浦区")
@@ -1026,6 +1050,7 @@ class AutoBuy:
             # 拿配置里的第一家（R581 五角场），哪怕有货的是静安。
             store_numbers=[s for s in ((in_stock_numbers or [])
                                        + self.pickup_store_numbers) if s],
+            allow_stores=self.pickup_store_numbers,
             payment=self.payment_method,
             delivery=self.delivery,
             id_last4=self.id_last4,

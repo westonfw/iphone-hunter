@@ -249,3 +249,168 @@ class PhaseTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BoostAndSpreadTests(unittest.TestCase):
+    """冲刺要真的把每条出口都提上来，新出口也不该被别人的退避拖住。"""
+
+    CFG = {'region': 'cn', 'pacing': {'base_interval': 75, 'min_interval': 4,
+                                      'budget_per_hour': 9999, 'burst': 999}}
+
+    def pool(self, now):
+        def mk(**k):
+            c = Mock()
+            c.breakers = {}
+            return c
+        self._patches = [
+            patch('scout.exits.AppleClient', side_effect=mk),
+            patch.object(ExitPool, '_proxy_url',
+                         side_effect=lambda i, p: f'http://u:k@{i}:{p}')]
+        for x in self._patches:
+            x.start()
+            self.addCleanup(x.stop)
+        return ExitPool(self.CFG, log=lambda *a: None, clock=lambda: now[0])
+
+    def test_boost_pulls_every_exit_forward(self):
+        """**只改节奏器是不够的。** 备用出口的 due_at 还是按 75 秒排的，
+        目标间隔压到 4 秒对它完全没生效，当前这条被拦时也顶不上来。"""
+        now = [1000.0]
+        p = self.pool(now)
+        p.enlist('b', '192.168.1.9', 48712, False)
+        p._exits['b'].due_at = now[0] + 75
+        p.boost(180)
+        self.assertLess(p._exits['b'].due_at - now[0], 10.0,
+                        '冲刺没有把备用出口的排期提上来')
+
+    def test_boost_does_not_push_an_earlier_exit_back(self):
+        now = [1000.0]
+        p = self.pool(now)
+        p._exits['direct'].due_at = now[0]
+        p.boost(180)
+        self.assertLessEqual(p._exits['direct'].due_at, now[0])
+
+    def test_a_newcomer_is_not_held_up_by_someone_elses_backoff(self):
+        """旧出口退避 300 秒，新来的健康出口被排到 315 秒后——它立刻就能跑。"""
+        now = [1000.0]
+        p = self.pool(now)
+        p._exits['direct'].due_at = now[0] + 300
+        p.enlist('b', '192.168.1.9', 48712, False)
+        self.assertLess(p._exits['b'].due_at - now[0], 5.0,
+                        '新出口被一条退避中的旧出口拖到后面去了')
+
+    def test_a_newcomer_still_avoids_a_live_exit(self):
+        now = [1000.0]
+        p = self.pool(now)
+        p._exits['direct'].due_at = now[0]
+        p.enlist('b', '192.168.1.9', 48712, False)
+        self.assertGreater(p._exits['b'].due_at - now[0], 5.0,
+                           '跟现有出口撞在一起了')
+
+
+class ReservedNameTests(unittest.TestCase):
+    """direct 是内置直连的名字，谁也不能顶掉它。
+
+    顶掉之后它的 permanent 也一起没了——那个子程序一掉线，池子里可能一条出口
+    都不剩，主程序整个停摆。
+    """
+
+    def pool(self):
+        def mk(**k):
+            c = Mock()
+            c.breakers = {}
+            return c
+        for x in (patch('scout.exits.AppleClient', side_effect=mk),
+                  patch.object(ExitPool, '_proxy_url',
+                               side_effect=lambda i, p: f'http://u:k@{i}:{p}')):
+            x.start()
+            self.addCleanup(x.stop)
+        return ExitPool({'region': 'cn'}, log=lambda *a: None)
+
+    def test_a_child_cannot_take_the_name(self):
+        p = self.pool()
+        before = p._exits['direct']
+        p.enlist('direct', '192.168.1.9', 48712, False)
+        self.assertIs(before, p._exits['direct'])
+        self.assertEqual(1, len(p))
+
+    def test_the_builtin_stays_permanent(self):
+        p = self.pool()
+        p.enlist('direct', '192.168.1.9', 48712, False)
+        self.assertTrue(p._exits['direct'].permanent)
+        self.assertTrue(p._exits['direct'].direct)
+
+    def test_it_says_why(self):
+        logs = []
+        p = self.pool()
+        p.log = logs.append
+        p.enlist('direct', '192.168.1.9', 48712, False)
+        self.assertTrue(any('direct' in x for x in logs))
+
+
+class BoostFloorTests(unittest.TestCase):
+    """冲刺只压缩「常规间隔」那一段，硬等待一秒都不能少。
+
+    预算还差多少令牌、退避排到了哪儿、熔断还剩多久——三样都是真的要等的。
+    拿冲刺去顶限流，正是 541 续期的原因。
+    """
+
+    CFG = {'region': 'cn', 'pacing': {'base_interval': 30, 'min_interval': 4,
+                                      'budget_per_hour': 90, 'burst': 1}}
+
+    def pool(self, now, cfg=None):
+        def mk(**k):
+            c = Mock()
+            c.breakers = {}
+            return c
+        for x in (patch('scout.exits.AppleClient', side_effect=mk),
+                  patch.object(ExitPool, '_proxy_url',
+                               side_effect=lambda i, p: f'http://u:k@{i}:{p}')):
+            x.start()
+            self.addCleanup(x.stop)
+        return ExitPool(cfg or self.CFG, log=lambda *a: None,
+                        clock=lambda: now[0])
+
+    def test_the_budget_still_has_to_be_waited_out(self):
+        """冲刺会按 `boost_budget_per_hour` 抬高预算，那是配置的意图；
+        但**抬高之后的**那点预算还是要等——不能一个令牌都没有就发。"""
+        now = [1000.0]
+        cfg = {'region': 'cn',
+               'pacing': {'base_interval': 30, 'min_interval': 4,
+                          'budget_per_hour': 90, 'boost_budget_per_hour': 90,
+                          'burst': 1}}
+        p = self.pool(now, cfg)
+        e = p._exits['direct']
+        e.pacer.bucket.tokens = 0.0            # 预算见底，要等一个令牌
+        e.due_at = now[0] + 40
+        p.boost(180)
+        self.assertGreater(e.due_at - now[0], 30.0,
+                           '冲刺把预算等待也一起压掉了')
+
+    def test_a_failure_cooldown_is_not_compressed(self):
+        now = [1000.0]
+        p = self.pool(now)
+        e = p._exits['direct']
+        e.pacer.bucket.tokens = 99
+        p.blocked(e, 30.0)                     # 连不上，晾 30 秒
+        floor = e.due_at
+        p.boost(180)
+        self.assertGreaterEqual(e.due_at, floor,
+                                '三十秒的故障冷却被冲刺压成了几秒')
+
+    def test_a_healthy_exit_is_still_pulled_forward(self):
+        now = [1000.0]
+        p = self.pool(now)
+        e = p._exits['direct']
+        e.pacer.bucket.tokens = 99
+        e.due_at = now[0] + 75
+        p.boost(180)
+        self.assertLess(e.due_at - now[0], 10.0, '健康的出口没能提上来')
+
+    def test_a_success_clears_the_floor(self):
+        now = [1000.0]
+        p = self.pool(now)
+        e = p._exits['direct']
+        e.pacer.bucket.tokens = 99
+        p.blocked(e, 30.0)
+        p.ok(e)
+        self.assertEqual(0.0, e.floor_at, '打通了，上次退避的下限还压着')

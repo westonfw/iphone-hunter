@@ -1,5 +1,6 @@
 config.json
 state.json
+scout-state.json
 checkout-trace.jsonl
 __pycache__/
 *.pyc

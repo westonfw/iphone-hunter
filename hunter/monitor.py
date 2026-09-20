@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .apple import (MAX_PARTS_PER_QUERY, PICKUP_PATH, REGIONS, AppleClient, Availability, Blocked, CoolingDown,
                     NotLive, Stock, StorePickup)
-from .autobuy import AutoBuy, _store_list
+from .autobuy import AutoBuy, _store_list, stores_of
 from .notify import AsyncBroadcaster, Broadcaster, open_in_browser
 from .purchase_guard import atomic_json
 from .purchase_worker import Offer, PurchaseWorker
@@ -94,6 +94,11 @@ class BaseWatcher:
 
         ab = dict(cfg.get("autobuy") or {})
         ab.setdefault("region", cfg.get("region", "cn"))
+        # pickup.stores 在 autobuy 那份配置外面，而换店要用它当边界——在这儿
+        # 算好塞进去，AutoBuy 自己看不到整份配置
+        # 门店名单在 autobuy 那份配置外面（pickup.stores），在这儿并进去——
+        # AutoBuy 自己看不到整份配置
+        ab["pickup_store_numbers"] = stores_of(cfg)
         self.autobuy = AutoBuy(ab, root, log=log) if ab.get("enabled") else None
         # 预热：开卖前把产品页加载好、选项选好，放货时省掉整个页面加载。
         #
@@ -281,7 +286,7 @@ class StockWatcher(BaseWatcher):
         pk = cfg.get("pickup") or {}
         self.pickup_on = bool(pk.get("enabled", True))
         self.location = str(pk.get("location", "")).strip()
-        self.only_stores = [s.upper() for s in _store_list(pk.get("stores"))]
+        self.only_stores = stores_of(cfg)
         if self.pickup_on and not self.location:
             self.log("[提示] config.pickup.location 没填邮编，本次跳过门店取货监控")
             self.pickup_on = False
@@ -369,32 +374,50 @@ class StockWatcher(BaseWatcher):
             if not stores:
                 self.log(f"[{now()}] {label}: 指定的门店编号没出现在结果里，检查 pickup.stores")
                 if getattr(self, "purchase_worker", None):
-                    self.purchase_worker.observe(part, [])
+                    # **这是「不知道」，不是「没货」。** 默认的 definitive=True
+                    # 会让急刹把它当成确定无货——而一家都没返回恰恰说明我们
+                    # 什么都没查到。
+                    self.purchase_worker.observe(part, [], definitive=False)
                 return
+
+        # **冲刺不能挂在「有没有买手」上。** 探针是强制关掉自动下单的，挂在
+        # worker 分支里等于探针永远不提速——而它恰恰是那个负责早一点看见的角色。
+        unknown_now = [s for s in stores if s.state is Stock.UNKNOWN]
+        ready_now = [s for s in stores if s.state is Stock.AVAILABLE]
+        pacer = getattr(self, 'pacer', None)
+        if ready_now and pacer is not None:
+            # 有货就冲刺：补货不挑时间，hot_windows 帮不上忙，而「刚看到货」
+            # 是唯一可靠的提速信号——第一单没抢到时，后续几分钟最值钱。
+            until = pacer.boost()
+            if until:
+                self.log(f'[{now()}] {label}: 发现有货，巡检冲刺 '
+                         f'{until - time.monotonic():.0f}s（{pacer.describe()}）')
 
         worker = getattr(self, 'purchase_worker', None)
         if worker:
-            ab = self.cfg.get('autobuy') or {}
-            allowed = [s.upper() for s in _store_list(ab.get("pickup_store_numbers"))]
-            accepted = [s for s in stores if
-                        not allowed or s.store_number.upper() in allowed]
             observed = getattr(self.client, "observed_at", {}).get(PICKUP_PATH, time.monotonic())
-            preferred = allowed or self.only_stores
+            preferred = self.only_stores
             live = [Offer(
                 part, s.store_number, s.store_name, self._buy_url(part), label, observed,
                 (self.parts.index(part), preferred.index(s.store_number.upper())
                  if s.store_number.upper() in preferred else len(preferred)))
-                for s in accepted if s.state is Stock.AVAILABLE]
-            worker.observe(part, live,
-                [s.store_number for s in accepted if s.state is Stock.UNAVAILABLE])
-            pacer = getattr(self, 'pacer', None)
-            if live and pacer is not None:
-                # 有货就冲刺：补货不挑时间，hot_windows 帮不上忙，而「刚看到货」
-                # 是唯一可靠的提速信号——第一单没抢到时，后续几分钟最值钱。
-                until = pacer.boost()
-                if until:
-                    self.log(f'[{now()}] {label}: 发现有货，巡检冲刺 '
-                             f'{until - time.monotonic():.0f}s（{pacer.describe()}）')
+                for s in ready_now]
+            # 有门店状态未知、**或者配置的门店少回来一家**，都不是一次「说全了」
+            # 的读数。照常递候选，但别让急刹拿它当「刚刚查过、而且没查到」——
+            # 那是把未知当成确定无货去踩刹车。少回来的那家可能正好是有货的那家。
+            seen_now = {s.store_number.upper() for s in stores
+                        if s.state is not Stock.UNKNOWN}
+            missing = [x for x in self.only_stores if x not in seen_now]
+            if missing:
+                self.log(f'[{now()}] {label}: {"、".join(missing)} 这一轮没返回，'
+                         f'当作未知')
+            # **空结果也是「不知道」。** 不限制门店时 unknown_now 和 missing
+            # 都是空的，于是一个什么都没返回的响应被当成了「附近一家都没货」——
+            # 后面那句「保留上次状态」来得太晚，急刹已经拿到 False 了。
+            worker.observe(
+                part, live,
+                [s.store_number for s in stores if s.state is Stock.UNAVAILABLE],
+                definitive=bool(stores) and not unknown_now and not missing)
         if not stores:
             self.log(f'[{now()}] {label}: 门店结果为空，保留上次状态')
             return

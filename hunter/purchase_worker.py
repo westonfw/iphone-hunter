@@ -44,6 +44,11 @@ class PurchaseWorker:
         self.epochs = {}
         #: 每个型号已经试过的门店。冒出一家没试过的 = 新机会，重试计数清零。
         self.tried = {}
+        #: 上一次重置之后**有没有见过货**。不能用「候选此刻还在不在」代替：
+        #: 一次未知读数会先把候选清空，紧接着的那条明确售罄就找不到 prev 了，
+        #: 于是重置被跳过——同一家店再补货时，旧的失败次数、burned、tried 全都
+        #: 还在，队列再也不试它。
+        self.had = set()
         #: 每个型号**最后一次被真正查过**的时刻。只有查过才敢说「没货」——
         #: 查询失败/熔断时根本不调 observe，那时候「看不到」只是「没去看」。
         self.polled = {}
@@ -62,23 +67,39 @@ class PurchaseWorker:
         # 让买家在发结账请求之前能回头问一句「货还在吗」
         self.buyer.stock_live = self.stock_live
 
-    def observe(self, part, offers, unavailable=()):
+    def observe(self, part, offers, unavailable=(), definitive=True):
+        """递交一次观察。
+
+        `definitive=False` 表示「这些候选是真的，但这一轮没把话说全」——比如
+        门店状态里有 UNKNOWN。那时候**不能动 polled**：急刹拿它当「刚刚查过、
+        而且没查到」，把一次未知当成确定无货去踩刹车，会掐掉一次真放货。
+        """
         with self.cv:
             prev = {k[1] for k in self.offers if k[0] == part}
             self.offers = {k: v for k, v in self.offers.items() if k[0] != part}
             for offer in offers:
                 self.offers[offer.key] = offer
-            self.polled[part] = self.clock()      # 这一轮真的查过它了
+            if definitive:
+                self.polled[part] = self.clock()  # 这一轮真的把话说全了
+            else:
+                # **还要把上一次的作废。** 留着旧的 polled 的话，这一轮明明没
+                # 看清，急刹却拿上一轮的时刻算出「刚刚查过、而且没查到」——
+                # 一次未知就掐掉了一单。
+                self.polled.pop(part, None)
             live = {o.store for o in offers}
             tried = self.tried.get(part, set())
+            if live:
+                self.had.add(part)
 
-            if unavailable and prev and not live:
+            if definitive and unavailable and (prev or part in self.had) \
+                    and not live:
                 # **明确**报无货：这一轮卖完了，下次放货算全新的一轮。
                 # 注意跟「结果未知」区分——未知只是撤回候选，不能当成新一轮，
                 # 否则接口抖一下就把重试次数刷没了。
                 self.attempts.pop(part, None)
                 self.tried.pop(part, None)
                 self.burned.discard(part)
+                self.had.discard(part)
                 self.epochs[part] = self.epochs.get(part, 0) + 1
             elif live - prev - tried:
                 # 冒出一家没试过的门店：重试计数清零，而且换 epoch——正在跑的
@@ -88,6 +109,21 @@ class PurchaseWorker:
                 self.burned.discard(part)
                 self.epochs[part] = self.epochs.get(part, 0) + 1
                 self.log(f'[购买] {part} 新增有货门店 {fresh}，重试次数重新计')
+            self.cv.notify_all()
+
+    def restock(self, part) -> None:
+        """这个型号卖空过、又补回来了：重试次数、判死标记、试过的门店全部清零。
+
+        **跟 observe 分开是有意的。** 撤销候选和重置重试状态是两件事：合在一起
+        做的话（`observe(part, [])`），一条没带快照的心跳会把候选也清空，而后面
+        没有任何东西来恢复它们——急刹说有货，队列却拿不出候选，买手就那么站着。
+        """
+        with self.cv:
+            self.attempts.pop(part, None)
+            self.tried.pop(part, None)
+            self.burned.discard(part)
+            self.had.discard(part)
+            self.epochs[part] = self.epochs.get(part, 0) + 1
             self.cv.notify_all()
 
     #: 「刚刚查过」的时限。超过它就当没查过——常规巡检间隔 30~45 秒，拿那么旧的

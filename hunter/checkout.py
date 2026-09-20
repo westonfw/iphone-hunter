@@ -1441,6 +1441,7 @@ class OrderPlacer:
 
     def __init__(self, *, region: str = "cn",
                  store_numbers: list[str] | None = None,
+                 allow_stores: list[str] | None = None,
                  payment: str = "支付宝", delivery: str = "pickup",
                  id_last4: str = "", last_name: str = "", first_name: str = "",
                  email: str = "", phone: str = "", installment_months: int = 0,
@@ -1454,11 +1455,20 @@ class OrderPlacer:
         self.cancelled = cancelled
         self.region = region
         # 只留真正长得像编号的，顺序去重
+        #: 硬限制的门店编号，空 = 不限。换店时不许越过它。
+        self.allow_stores: list[str] = [
+            x for x in (str(v or '').strip().upper() for v in (allow_stores or []))
+            if x and self.STORE_NO.match(x)]
         self.store_numbers: list[str] = []
         for x in (store_numbers or []):
             x = (x or "").strip().upper()
             if self.STORE_NO.match(x) and x not in self.store_numbers:
                 self.store_numbers.append(x)
+        # 边界在这儿就兑现，别留到换店那一步：候选表里留着越界的门店，轮换照样
+        # 会换过去（首选排不上时就是这么溜出去的）
+        if self.allow_stores:
+            self.store_numbers = [x for x in self.store_numbers
+                                  if x in self.allow_stores]
         self.payment = (payment or "支付宝").strip() or "支付宝"
         self.delivery = delivery if delivery in ("pickup", "shipping") else "pickup"
         self.id_last4 = re.sub(r"\s+", "", id_last4 or "").upper()
@@ -1513,6 +1523,7 @@ class OrderPlacer:
             return False
         fc = FastCheckout(
             store=self.store_numbers[0], stores=self.store_numbers,
+            allow=self.allow_stores,
             id_last4=self.id_last4, last_name=self.last_name,
             first_name=self.first_name, email=self.email, phone=self.phone,
             city=self.pickup_city, state=self.pickup_state,

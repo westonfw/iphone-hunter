@@ -138,9 +138,13 @@ class StoreConfigurationRegressions(unittest.TestCase):
                                      (None, ['R581', 'R359', 'R999'])):
             with self.subTest(configured=configured), tempfile.TemporaryDirectory() as tmp:
                 w = StockWatcher.__new__(StockWatcher)
-                w.cfg = {'autobuy': {'pickup_store_numbers': configured, 'pickup_stores': ['旧店名']}}
+                from hunter.autobuy import stores_of
+                w.cfg = {'autobuy': {'pickup_store_numbers': configured,
+                                     'pickup_stores': ['旧店名']}}
                 w.autobuy = AutoBuy(w.cfg['autobuy'], Path(tmp), log=Mock())
-                w.parts, w.only_stores, w.note_of = ['P'], [], {}
+                # 盯的和买的是同一份名单，都从 stores_of 来
+                w.only_stores = stores_of(w.cfg)
+                w.parts, w.note_of = ['P'], {}
                 w.client = SimpleNamespace(observed_at={})
                 w.state = State(Path(tmp) / 'state.json')
                 w.purchase_worker, w.hit, w.log = Mock(), Mock(), Mock()
@@ -420,7 +424,7 @@ class TargetChoiceAndQuotaRegressions(unittest.TestCase):
     def worker(self, **kw):
         w = PurchaseWorker.__new__(PurchaseWorker)
         w.offers, w.attempts, w.epochs = {}, {}, {}
-        w.tried, w.burned, w.polled = {}, set(), {}
+        w.tried, w.burned, w.polled, w.had = {}, set(), {}, set()
         w.max_age, w.max_attempts, w.retry_delay = 90.0, 2, 15.0
         w.cooldown_until, w.log = 0.0, Mock()
         w.clock = kw.get('clock', lambda: 0.0)
@@ -1298,7 +1302,7 @@ class KeepBuyingWhileStockLastsRegressions(unittest.TestCase):
     def worker(self, max_attempts=2, clock=None):
         w = PurchaseWorker.__new__(PurchaseWorker)
         w.offers, w.attempts, w.epochs = {}, {}, {}
-        w.tried, w.burned, w.polled = {}, set(), {}
+        w.tried, w.burned, w.polled, w.had = {}, set(), {}, set()
         w.max_age, w.max_attempts, w.retry_delay = 90.0, max_attempts, 15.0
         w.cooldown_until, w.log = 0.0, Mock()
         w.clock = clock or (lambda: 0.0)
