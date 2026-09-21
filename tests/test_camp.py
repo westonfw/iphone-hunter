@@ -190,9 +190,9 @@ class KeepAliveTests(unittest.TestCase):
         return placer(store="R581", stores=["R581"], place_order=False,
                       stk_timeout_ms=50)
 
-    def test_idle_extends_the_session_instead_of_searching(self):
-        # 冷档：step1 之后每轮打的是 extendSession，不是 search
-        page = FakePage([FUL] + [{"status": 200, "json": {}}] * 5)
+    def test_idle_keeps_searching_to_stay_warm(self):
+        # 冷档也一直打 search（保持会话热：首发 10s 是一次性的，之后 ~500ms）。
+        page = FakePage([FUL] + [MISS] * 5)
         fc = self.fc()
         n = [0]
         def stop():
@@ -200,10 +200,10 @@ class KeepAliveTests(unittest.TestCase):
             return n[0] > 2
         fc.camp(page, cadence=0, idle_cadence=0, max_seconds=1e9,
                 stop=stop, clock=lambda: 1000.0, sleep=lambda *_: None)
-        # 打出去的请求里有 extendSession，没有 search
         actions = [c["query"] for c in page.calls]
-        self.assertTrue(any("extendSessionUrl" in q for q in actions), actions)
-        self.assertFalse(any("search" in q for q in actions), actions)
+        self.assertTrue(any("search" in q for q in actions), actions)
+        # 不再用 extendSession
+        self.assertFalse(any("extendSessionUrl" in q for q in actions), actions)
 
     def test_keep_awake_logs_only_when_it_does_something(self):
         from unittest.mock import Mock

@@ -1331,7 +1331,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 30.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1343,8 +1343,9 @@ class FastCheckout:
         **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
         也是白打（今天的失败全是「主程序看到、search 没跟上」，没有反过来的），
         而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
-          * 主程序安静时 → **冷档**：`idle_cadence`（默认 180s，只为续会话，
-            低于 interactionMs 那 5 分钟的作废线）。
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 30s）也一直打 search，
+            只是慢些——把会话保持热着（首发 10s 是一次性的，之后 ~500ms），
+            凉了下一发又要 10s；顺带续会话、也能自己发现货。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
@@ -1399,26 +1400,33 @@ class FastCheckout:
                 # 那个客户端计时器，见 keep_awake）。
                 self.keep_awake(page)
 
+                # **一直打 search，冷热只差在间隔。**
+                # 2026-09-21 22:34 的日志钉死了一件事：那 10 秒是**一个会话第一发
+                # search** 的一次性开销，从第二发起全是 ~500ms（同一会话打了 90 多发，
+                # 首发 10110ms、其余 400~700ms）。所以：
+                #   * 首发（预热）把 10 秒烧掉，会话就热了；
+                #   * 之后冷档也一直打 search（便宜，还顺带续会话、自己发现货），
+                #     让会话**始终热着**——放货那一刻热档的 search 才是 ~500ms、
+                #     贴得进窗口，而不是又撞上一次 10 秒的首发。
+                # search 本身就是 checkoutx 交互，会重置服务端 interactionMs，所以
+                # 也不再需要 extendSession。
                 hot = clock() < hot_until
                 try:
-                    if hot:
-                        # 热档：主程序报了货，打一发真 search 探结账侧库存。
-                        data = self.step2_store(page)
-                        shots += 1
-                        if self.arm_from_search(page, data):
-                            self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
-                                     f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
-                            return self._place_from_armed(page, t0)
-                    else:
-                        # 冷档：主程序安静，search 打了也白打（它没看到货，结账侧
-                        # 更不会有）。只用便宜的续期接口保活——这就是「我还在」。
-                        self.extend_session(page)
+                    data = self.step2_store(page)
+                    shots += 1
+                    if shots == 1:
+                        self.log(f"[蹲守] 会话预热：第一发 search 走完，"
+                                 f"之后就热了（首发那 10 秒是一次性的）")
+                    if self.arm_from_search(page, data):
+                        self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
+                                 f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
+                        return self._place_from_armed(page, t0)
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
                     self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
                     back = max(cadence * 3, self.retry_after)
-                    self.log(f"[蹲守] {'search' if hot else '续期'}被拦（{e}），"
+                    self.log(f"[蹲守] search 被拦（{e}），"
                              f"退避 {back:.0f}s——节奏太密会被 Akamai 盯上，见 README 坑 9")
                     _, woke = self._nap(wake, back, stop, clock, sleep)
                     if stop():
@@ -1429,7 +1437,7 @@ class FastCheckout:
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），当没货接着蹲")
 
-                # 节奏跟主程序：热档密打、冷档只续会话（间隔要 < 5 分钟作废线）。
+                # 节奏跟主程序：热档密打、冷档慢打（都在保持会话热 + 自己发现货）。
                 wait = cadence if clock() < hot_until else idle_cadence
                 stopped, woke = self._nap(wake, wait, stop, clock, sleep)
                 if stopped:

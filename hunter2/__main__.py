@@ -108,8 +108,8 @@ def cmd_doctor(args) -> int:
               f"   ← 单账号一次只能蹲一个，由 buyer_offset 挑；只有它放货才有意义")
         print(f"    camp.cadence(热档) = {camp.get('cadence', 8)}s"
               f"   ← 主程序报货后密打的间隔")
-        print(f"    camp.idle_cadence(冷档) = {camp.get('idle_cadence', 180)}s"
-              f"   ← 主程序安静时只续会话，节奏跟主程序走；必须 < 5 分钟")
+        print(f"    camp.idle_cadence(冷档) = {camp.get('idle_cadence', 30)}s"
+              f"   ← 主程序安静时也一直 search 保持会话热（首发 10s 一次性，之后 ~0.5s）")
         print(f"    camp.session_seconds = {camp.get('session_seconds', 1080)}s"
               f"   ← 多久重建会话，必须 < 20 分钟 TTL")
     return 0 if ok else 1
