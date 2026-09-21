@@ -46,6 +46,9 @@ class Exit:
     #: 代理背后是多个 IP、自己轮换。标了它就不做流控：请求回来立刻发下一个，
     #: 541 不深退避（换 IP 就好）。见 ExitPool.done/blocked。
     rotating: bool = False
+    #: 连续「连不上/网络错误」的次数。用来做升级退避：第一次多半是瞬时抖动，
+    #: 只晾几秒；连着失败才逐步拉长（那才像代理真挂了）。打通一次就清零。
+    net_fails: int = 0
     used: int = 0
 
     @property
@@ -116,7 +119,7 @@ def configured_exits(raw, log=print) -> list[tuple[str, str, bool]]:
 
 #: 轮换代理的熔断配置：冷却 0 秒 = 被 541 不静默。一条 541 只是背后 200 个 IP
 #: 里的某一个被限了，下一个请求本就换了 IP，静默整条代理反而把好 IP 全废了。
-#: 代理自己挂了那种网络错误由 scout.poll 的 FAIL_COOLDOWN 单独管，不受这个影响。
+#: 代理自己挂了那种网络错误由 scout.poll → pool.network_failed 单独管（升级退避）。
 ROTATING_BREAKER = {"cooldowns": (0.0,), "heal_after": 1.0}
 
 
@@ -400,10 +403,25 @@ class ExitPool:
         # 故障冷却压成八秒——那是拿着冲刺去顶限流
         e.floor_at = max(e.floor_at, e.due_at)
 
+    def network_failed(self, e: Exit, base: float, cap: float) -> float:
+        """出口连不上/网络错误：算这次该晾多久（升级退避），并记连击次数。
+
+        第一次只晾 base（大概率是瞬时抖动，尤其轮换代理某个后端 IP 坏一下），
+        连着失败才 base、2·base、4·base…封顶 cap。这样单条代理偶尔抖一下不会把
+        主程序全盲一整个 30 秒，而代理真挂了也会逐步退避、不猛捶。
+
+        只算值、记次数，不动 due_at——退避照旧由调用方交给 pool.blocked 兑现
+        （轮换出口直接排 due_at，普通出口走节奏器），跟返回固定值时同一条路。
+        打通一次 net_fails 在 pool.ok 里清零。
+        """
+        e.net_fails += 1
+        return min(float(base) * (2 ** (e.net_fails - 1)), float(cap))
+
     def ok(self, e: Exit) -> None:
         if e.pacer:
             e.pacer.on_ok()
         e.floor_at = 0.0        # 打通了，那次退避的下限不再成立
+        e.net_fails = 0         # 连不上的连击也清零
 
     def boost(self, seconds: float = 0.0) -> None:
         """看到货了：所有出口一起冲刺。

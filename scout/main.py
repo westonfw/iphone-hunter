@@ -36,12 +36,18 @@ from .exits import ExitPool
 #: 比它更粗会把冲刺时的 4 秒间隔磨钝。
 TICK = 0.25
 
-#: 一条出口连不上（超时、DNS、代理挂了）之后先晾多久。
+#: 出口连不上（超时、DNS、代理挂了）之后晾多久——**升级退避**：第一次只晾
+#: FAIL_BASE，连着失败才 2×、4×…封顶 FAIL_CAP，打通一次就清零（见 pool.ok）。
 #:
-#: 这个值存在的理由是**别让一条坏出口拖住好出口**：一轮拆成六批，每批连接超时
-#: 15 秒，就是 90 秒里一个请求都没发出去，而调度器要等整轮结束才能换人。所以
-#: 网络故障一出现就立刻中止这一轮，把这条出口晾一会儿，让别的出口顶上。
-FAIL_COOLDOWN = 30.0
+#: 为什么不再是固定 30 秒：那是为「多出口时晾坏的那条、用好的顶上」定的。可现在
+#: 常见配置是**单条轮换代理 + use_direct=false**，晾 30 秒 = 主程序全盲 30 秒，
+#: 没有别的出口顶；而轮换代理一次失败大多是瞬时的（某个后端 IP 坏、代理抖一下），
+#: 下一发就换 IP 了，不该按「代理彻底死了」罚 30 秒。所以第一次只晾 3 秒快速探恢复，
+#: 真挂了才逐步拉长。
+#:
+#: 这一轮立刻中止仍然保留：接着用同一条坏出口打剩下几批只会各超时一次。
+FAIL_BASE = 3.0
+FAIL_CAP = 30.0
 
 
 def _p(*a) -> None:
@@ -170,9 +176,11 @@ class Scout:
                     # **立刻中止这一轮。** 接着用同一条坏出口打剩下几批，等于让
                     # 每批各超时一次；调度器要等整轮结束才能换人，六批就是 90 秒
                     # 一个请求都发不出去，而心跳照常、看着一切正常。
+                    cd = self.pool.network_failed(e, FAIL_BASE, FAIL_CAP)
                     self.log(f"[{now()}] {e.id} 门店查询失败：{type(ex).__name__}: {ex}"
-                             f"，这一轮停在这儿，先晾它 {FAIL_COOLDOWN:.0f}s")
-                    return ok, FAIL_COOLDOWN
+                             f"，这一轮停在这儿，先晾它 {cd:.0f}s"
+                             + (f"（连续第 {e.net_fails} 次）" if e.net_fails > 1 else ""))
+                    return ok, cd
                 at = wall_of(getattr(e.client, "observed_at", {}).get(
                     PICKUP_PATH, time.monotonic()))
                 oldest = at if not oldest else min(oldest, at)

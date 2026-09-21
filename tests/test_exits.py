@@ -771,3 +771,33 @@ class RotatingExitTests(PoolTests):
         p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
                                'rotating': True}])
         self.assertIn('pool(代理·多IP)', p.describe())
+
+
+class NetworkFailBackoffTests(PoolTests):
+    """连不上/网络错误：升级退避，第一次只晾几秒，连着失败才拉长，打通就清零。"""
+
+    def test_first_failure_is_short_not_thirty(self):
+        p = self.pool()
+        self.ready_now(p)
+        e = p._exits['direct']
+        self.now[0] = 2000.0
+        cd = p.network_failed(e, base=3.0, cap=30.0)
+        self.assertEqual(3.0, cd)                 # 第一次只晾 3 秒（不是 30）
+        self.assertEqual(1, e.net_fails)
+
+    def test_consecutive_failures_escalate_and_cap(self):
+        p = self.pool()
+        e = p._exits['direct']
+        self.now[0] = 2000.0
+        got = [p.network_failed(e, 3.0, 30.0) for _ in range(6)]
+        self.assertEqual([3.0, 6.0, 12.0, 24.0, 30.0, 30.0], got)  # 翻倍、封顶 30
+
+    def test_a_success_resets_the_streak(self):
+        p = self.pool()
+        e = p._exits['direct']
+        p.network_failed(e, 3.0, 30.0)
+        p.network_failed(e, 3.0, 30.0)
+        self.assertEqual(2, e.net_fails)
+        p.ok(e)                                   # 打通一次
+        self.assertEqual(0, e.net_fails)
+        self.assertEqual(3.0, p.network_failed(e, 3.0, 30.0))  # 又从头算

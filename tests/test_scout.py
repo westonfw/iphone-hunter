@@ -635,8 +635,24 @@ class BrokenExitTests(Harness, unittest.TestCase):
         e = self.direct
         e.client.script = [TimeoutError("连接超时")]
         _, retry = s.poll(e)
+        # 冷却了（下一轮不会立刻又挑中它），但**第一次只晾几秒**——单条代理偶尔
+        # 抖一下不该让主程序全盲一整个 30 秒。
         self.assertIsNotNone(retry, "网络故障没有触发冷却，下一轮还会挑中它")
-        self.assertGreaterEqual(retry, 10.0)
+        self.assertGreater(retry, 0.0)
+        self.assertLessEqual(retry, 5.0)
+
+    def test_repeated_failures_escalate_the_cooldown(self):
+        s = self.scout(self.cfg())
+        e = self.direct
+        e.client.script = [TimeoutError("连接超时")] * 6
+        cds = []
+        for _ in range(6):
+            e.client.calls = []           # 每次只喂一批
+            e.client.script = [TimeoutError("连接超时")]
+            _, retry = s.poll(e)
+            cds.append(retry)
+        # 连着失败逐步拉长、封顶 30；打通一次会清零（见 pool.ok）
+        self.assertEqual([3.0, 6.0, 12.0, 24.0, 30.0, 30.0], cds)
 
     def test_the_healthy_exit_takes_over_right_away(self):
         s = self.scout(self.cfg())
