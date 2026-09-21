@@ -139,13 +139,32 @@ class Buyer:
         #: 先起，但两边差个几十秒是常事，那时候报警是噪音。
         self.first_wait = max(self.master_stale, 120.0)
 
-        self.worker = PurchaseWorker(
-            self.autobuy, self._report,
-            max_age=ab.get("candidate_max_age", 90),
-            max_attempts=ab.get("max_attempts_per_stock", 2),
-            retry_delay=ab.get("retry_delay", 15),
-            probe_url=self._buy_url(self.parts[0]) if self.parts else "",
-            log=log)
+        #: 守株待兔模式：不再收到信号才冷启动，而是常驻蹲在结账页反复打 search。
+        #: 单账号一次只能蹲一个型号（购物袋是账号级的），所以蹲哪个由 buyer_offset
+        #: 在启用型号里挑一个。放货信号只对所蹲的那个型号有意义。
+        camp_cfg = dict(ab.get("camp") or {})
+        self.camp_enabled = bool(camp_cfg.get("enabled"))
+        self.camp_part = (self.parts[self.offset % len(self.parts)]
+                          if self.parts else "")
+        if self.camp_enabled:
+            from hunter.camp_worker import CampWorker
+            self.worker = CampWorker(
+                self.autobuy, self._report,
+                url=self._buy_url(self.camp_part),
+                in_stock_numbers=self.only_stores,
+                cadence=float(camp_cfg.get("cadence", 10)),
+                session_seconds=float(camp_cfg.get("session_seconds", 1080)),
+                log=log)
+            self.log(f"[买手] 守株待兔模式：蹲 {self.note_of.get(self.camp_part) or self.camp_part}"
+                     f"（{self.camp_part}），信号来了立刻打 search")
+        else:
+            self.worker = PurchaseWorker(
+                self.autobuy, self._report,
+                max_age=ab.get("candidate_max_age", 90),
+                max_attempts=ab.get("max_attempts_per_stock", 2),
+                retry_delay=ab.get("retry_delay", 15),
+                probe_url=self._buy_url(self.parts[0]) if self.parts else "",
+                log=log)
         # 覆盖掉 worker 自带的那个（它是按本机轮询写的，而买手不轮询）
         self.autobuy.stock_live = self.stock_live
         self.receiver = None

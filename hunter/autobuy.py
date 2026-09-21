@@ -94,6 +94,9 @@ class BuyResult:
     wake: bool = False
     #: 已经买够 max_orders 台，收工。不是失败，也不该重试。
     quota_done: bool = False
+    #: 蹲守（camp）会话到期/蹲够了，重建后接着蹲。不是失败——外层 CampWorker
+    #: 看到它就重新加购+进结账，继续蹲下一段。
+    rebuild: bool = False
     #: **这个型号这一轮没救了**（页面明写售罄、配置不对）。跟 retriable=False
     #: 不是一回事：被限流也是 retriable=False，但那是**全局**的，冷却过了还得
     #: 接着打这个型号——拿它判死等于一次 541 就把型号永久排除。
@@ -270,6 +273,9 @@ class AutoBuy:
         self._attempt_order = False
         #: 刚读到的购物袋状态，只用来把「加购后复核」和「进结账读袋」并成一次。
         self._bag_state = None
+        #: 守株待兔上下文。None = 普通冷启动下单；非 None = 进结账后不走六步，
+        #: 而是停在那儿反复打 search（见 camp()）。{wake, stop, cadence, max_seconds}
+        self._camp = None
         #: 上一轮打的是哪个型号、什么时候打完的。同型号重试时用来决定要不要走
         #: 「先问购物袋」的快路。用墙上时钟，因为它要跨越很长的空闲期。
         self._last_part, self._last_at = "", 0.0
@@ -841,6 +847,28 @@ class AutoBuy:
         return self._drive(self._ctx, self._page, None, dry_run=False,
                            in_stock=in_stock, in_stock_numbers=in_stock_numbers)
 
+    def camp(self, url: str, in_stock_numbers: list[str] | None = None,
+             *, wake=None, stop=None, cadence: float = 10.0,
+             session_seconds: float = 1080.0) -> BuyResult:
+        """守株待兔一段：加购目标型号 → 进结账 → 停在 step1 反复打 search。
+
+        跟 fire/buy 的区别只在最后一步——进结账后不走六步，而是蹲着等货
+        （见 fastpath.camp）。加购、进结账、登录那套全复用冷启动的逻辑。
+
+        返回的 BuyResult：`rebuild=True` 表示这段会话到期/蹲够了，外层 CampWorker
+        重新调一次 camp() 接着蹲；成单/结果不明/被拦等跟 buy 一样处理。
+
+        wake 是放货信号的 Event（收到该型号的 sighting 就 set），stop 是收工判据。
+        cadence 是空闲时两发 search 的最小间隔，session_seconds 是多久重建（< TTL）。
+        """
+        self._camp = {"wake": wake, "stop": stop, "cadence": cadence,
+                      "max_seconds": session_seconds}
+        try:
+            return self._run(url, dry_run=False,
+                             in_stock_numbers=in_stock_numbers)
+        finally:
+            self._camp = None
+
     def rehearse(self, url: str) -> BuyResult:
         """排练：走到「加入购物袋」前一步就停，不改动购物袋。
 
@@ -1218,10 +1246,16 @@ class AutoBuy:
         if placer.secure_host:
             self.secure_host = placer.secure_host
 
-        if self._gone(want_part, "六步"):
-            return BuyResult(False, "货已经没了，没走六步", page.url,
-                             "结账会话已建好，但监控在这一刻已经报无货。")
-        outcome = placer.place(page, t0)
+        if self._camp is not None:
+            c = self._camp
+            outcome = placer.camp(page, t0, wake=c.get("wake"), stop=c.get("stop"),
+                                  cadence=c.get("cadence", 10.0),
+                                  max_seconds=c.get("max_seconds", 1080.0))
+        else:
+            if self._gone(want_part, "六步"):
+                return BuyResult(False, "货已经没了，没走六步", page.url,
+                                 "结账会话已建好，但监控在这一刻已经报无货。")
+            outcome = placer.place(page, t0)
         return self._wrap(placer, placer.result_url or page.url, *outcome)
 
     def _enter_checkout(self, ctx, page, want_part, state=None):
@@ -1332,6 +1366,10 @@ class AutoBuy:
         会让监控下一轮再跑一遍整条链路——而「结果不明」意味着那一单可能已经成了
         （2026-09-18 07:15 就是这样，订单确认邮件都到了）。重试就是再下一单。
         """
+        from .checkout import OrderPlacer
+        if not ok and stage == OrderPlacer.CAMP_REBUILD:
+            # 蹲守会话到期：不是失败、不推送，让外层重建后接着蹲。
+            return BuyResult(False, stage, url, detail, retriable=True, rebuild=True)
         if ok:
             # 成单了：通知和「别动这个标签」都要用它，但**不是**停止信号。
             self.order_placed = self._attempt_order = True

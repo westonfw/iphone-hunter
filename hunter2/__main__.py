@@ -94,6 +94,22 @@ def cmd_doctor(args) -> int:
           f"   ← 同一台机器上的几份部署必须各用一个端口，"
           f"否则是同一个 Chrome、同一份 cookie，账号会互相踢下线")
     print(f"  autobuy.max_orders = {ab.get('max_orders', 1)}   ← 每份部署各记各的")
+
+    camp = dict(ab.get("camp") or {})
+    if camp.get("enabled"):
+        from hunter.monitor import watch_items
+        items = watch_items(cfg)
+        parts = [i["part"] for i in items]
+        off = int(link.get("buyer_offset") or 0)
+        part = parts[off % len(parts)] if parts else "(没有启用型号)"
+        note = next((i.get("note") for i in items if i.get("part") == part), part)
+        print(f"  autobuy.camp.enabled = true   ← 守株待兔：常驻蹲在结账页反复打 search")
+        print(f"    蹲的型号 = {note}（{part}）"
+              f"   ← 单账号一次只能蹲一个，由 buyer_offset 挑；只有它放货才有意义")
+        print(f"    camp.cadence = {camp.get('cadence', 10)}s"
+              f"   ← 空闲时几秒一发 search。像人一样，太密会被 541")
+        print(f"    camp.session_seconds = {camp.get('session_seconds', 1080)}s"
+              f"   ← 多久重建会话，必须 < 20 分钟 TTL")
     return 0 if ok else 1
 
 

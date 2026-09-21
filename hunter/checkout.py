@@ -1513,17 +1513,10 @@ class OrderPlacer:
         self.timeout_ms = timeout_ms
         self.log = log
 
-    def _try_fast_path(self, page) -> bool:
-        """唯一的结账实现；失败保留原始结论，不刷新、不点击页面。"""
+    def _build_fc(self):
+        """造一个配好的 FastCheckout。run（冷启动）和 camp（守株待兔）共用。"""
         from .fastpath import FastCheckout
-        self.fast_stage = "⚠️ 快车道未完成"
-        self.fast_detail = ""
-        if not self.store_numbers:
-            self.fast_stage = "⚠️ 缺少取货门店编号"
-            self.fast_detail = "请配置 pickup_store_numbers 或由库存监控提供门店编号。"
-            self.retriable = False
-            return False
-        fc = FastCheckout(
+        return FastCheckout(
             store=self.store_numbers[0], stores=self.store_numbers,
             allow=self.allow_stores,
             id_last4=self.id_last4, last_name=self.last_name,
@@ -1535,33 +1528,91 @@ class OrderPlacer:
             submit_guard=self.submit_guard, cancelled=self.cancelled,
             still_live=self.still_live,
             log=self.log)
+
+    def _harvest_fc(self, fc, page):
+        """run/camp 跑完后，把结论从 FastCheckout 上收回来（提交状态、判死、限流等）。
+
+        调用方必须在 finally 里调，哪怕 fc 抛了异常——提交状态必须带回上层。
+        """
+        self.store_used = getattr(fc, "store_used", "") or self.store_numbers[0]
+        from .fastpath import FastCheckout
+        self.fast_ordered = bool(
+            fc.submitted and fc.order_url
+            and not FastCheckout.order_rejected(fc.order_url))
+        if self.fast_ordered:
+            self.result_url = urljoin(page.url, fc.order_url)
+        self.fast_unknown = bool(
+            fc.submitted and not self.fast_ordered
+            and FastCheckout.order_unknown(fc.order_url))
+        self.no_retry = bool(self.fast_unknown or (fc.submitted and self.submit_guard is not None
+                                                    and not self.fast_ordered))
+        kind = getattr(fc, "failure_kind", "")
+        self.blocked = kind == "blocked"
+        self.retry_after = getattr(fc, "retry_after", 0.0)
+        self.session_expired = kind == "session_expired" and not fc.submitted
+        self.retriable = not self.no_retry and kind != "blocked"
+
+    def _try_fast_path(self, page) -> bool:
+        """唯一的结账实现；失败保留原始结论，不刷新、不点击页面。"""
+        self.fast_stage = "⚠️ 快车道未完成"
+        self.fast_detail = ""
+        if not self.store_numbers:
+            self.fast_stage = "⚠️ 缺少取货门店编号"
+            self.fast_detail = "请配置 pickup_store_numbers 或由库存监控提供门店编号。"
+            self.retriable = False
+            return False
+        fc = self._build_fc()
         try:
             ok, self.fast_stage, self.fast_detail = fc.run(page)
         finally:
-            # 轮换过的话，实际下单的门店跟候选表头不是同一家——通知里必须写对，
-            # 不然人跑错店。
-            self.store_used = getattr(fc, "store_used", "") or self.store_numbers[0]
-            # 即使 run 抛异常，也必须先把提交状态带回上层。
-            self.fast_ordered = bool(
-                fc.submitted and fc.order_url
-                and not FastCheckout.order_rejected(fc.order_url))
-            if self.fast_ordered:
-                self.result_url = urljoin(page.url, fc.order_url)
-            self.fast_unknown = bool(
-                fc.submitted and not self.fast_ordered
-                and FastCheckout.order_unknown(fc.order_url))
-            self.no_retry = bool(self.fast_unknown or (fc.submitted and self.submit_guard is not None
-                                                        and not self.fast_ordered))
-            kind = getattr(fc, "failure_kind", "")
-            self.blocked = kind == "blocked"
-            self.retry_after = getattr(fc, "retry_after", 0.0)
-            self.session_expired = kind == "session_expired" and not fc.submitted
-            self.retriable = not self.no_retry and kind != "blocked"
+            self._harvest_fc(fc, page)
         self.log(f"[快车道] {self.fast_stage}：{self.fast_detail}")
         if ok and not self.fast_ordered:
             # 仅把已经完成的 Review 展示给人，不自动接管页面操作。
             fc.show_review(page)
         return ok
+
+    #: camp 返回这个 stage 前缀 = 「会话到期/蹲够了，重建后接着蹲」，不是失败。
+    CAMP_REBUILD = "rebuild"
+
+    def camp(self, page, t0: float, *, wake=None, stop=None, cadence: float = 10.0,
+             max_seconds: float = 1080.0):
+        """守株待兔版的 place：停在结账页反复打 search，命中就下单。
+
+        返回 (ok, stage, detail, url)——跟 place 同形状，另外 stage=='rebuild'
+        时表示这个会话该重建了（调用方重新加购+进结账再蹲），不是失败。
+        """
+        if is_session_expired(page.url):
+            self.session_expired = True
+            return False, self.CAMP_REBUILD, "会话已失效，重建后接着蹲", ""
+        if is_sign_in(page.url):
+            return False, "⚠️ 卡在登录页", "请先在浏览器里完成登录。", ""
+        if self.delivery != "pickup":
+            self.retriable = False
+            return False, "⚠️ 蹲守仅支持到店取货", "delivery 必须为 pickup。", ""
+        if not self.store_numbers:
+            self.retriable = False
+            return False, "⚠️ 缺少取货门店编号", "配置 pickup_store_numbers。", ""
+        fc = self._build_fc()
+        try:
+            ok, stage, detail = fc.camp(page, wake=wake, stop=stop,
+                                        cadence=cadence, max_seconds=max_seconds)
+        except Exception as e:
+            ok, stage, detail = False, "⚠️ 蹲守异常，已停止", f"{type(e).__name__}: {e}"
+        finally:
+            self._harvest_fc(fc, page)
+        self.log(f"[蹲守] {stage}：{detail}")
+        if self.fast_unknown:
+            self.no_retry = True
+            return False, "⚠️ 下单结果不明，已停手", (
+                detail + " 订单可能已经创建，请查看订单列表；不会再次提交。"), ""
+        if self.fast_ordered:
+            try:
+                order = snapshot(page).get("order") or ""
+            except Exception:
+                order = ""
+            return self._ok(t0, order)
+        return ok, stage, detail, ""
 
     def place(self, page, t0: float) -> tuple[bool, str, str, str]:
         if is_session_expired(page.url):
