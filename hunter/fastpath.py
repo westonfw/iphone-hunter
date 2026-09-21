@@ -1234,7 +1234,14 @@ class FastCheckout:
             self.step1_pickup(page)   # 上膛：停在这里，后面只反复打 search
         except SessionExpired:
             return False, "rebuild", "会话过期，重建"
-        except (Stalled, Blocked) as e:
+        except Blocked as e:
+            # checkoutx 入口被 541：这是「反复探 checkoutx」的常态噪音，不是要
+            # 通知人的结论。带上 retry_after 让上层**静默冷却**再重来，别 3 秒
+            # 一撞把它捶得越来越深。
+            self.failure_kind = "blocked"
+            self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
+            return False, "⚠️ 上膛被拦", f"{e}。checkoutx 入口被 541，冷却后重建。"
+        except Stalled as e:
             return False, "⚠️ 上膛失败", f"{e}"
 
         # 进来时若主程序已经在报货（wake 已 set），直接进热档；否则冷档续会话。

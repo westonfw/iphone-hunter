@@ -48,6 +48,8 @@ class CampWorker:
         self.closed = False
         self.halted = False
         self.thread = None
+        #: 连续「进不了结账入口」（541）的次数，攒到 5 次说一句。
+        self._fails = 0
         #: 放货信号：收到所蹲型号的 sighting 就 set()，让蹲守里的 search 立刻打。
         self.wake = threading.Event()
         # Playwright 归这个线程，跟 PurchaseWorker 一样的约定
@@ -109,24 +111,36 @@ class CampWorker:
 
                 if getattr(result, "rebuild", False):
                     # 会话到期/蹲够了：不推送、不停，重新上膛接着蹲。
+                    self._fails = 0
                     self.log(f"[蹲守] {result.detail or '重建会话'}")
                     self._pause(self.rebuild_pause)
                     continue
 
-                # 有结论（成单/结果不明/被拦/配置死局）：报出来。
+                # **被 541 / 上膛被拦：静默冷却，不推送。** camp 反复探 checkoutx，
+                # 541 是常态噪音，不是要通知人的结论；关键是别 3 秒一撞把它捶深。
+                back = float(getattr(result, "retry_after", 0.0) or 0.0)
+                if back > 0 and not result.ok:
+                    self._fails += 1
+                    pause = max(self.rebuild_pause, back)
+                    self.log(f"[蹲守] {result.stage}——静默冷却 {pause:.0f}s 再重新上膛"
+                             f"（连续第 {self._fails} 次）")
+                    # 一直进不去就说一句：多半是这个 IP/账号在 checkoutx 上被限了。
+                    if self._fails == 5:
+                        self.report(result, self._title(), self.url)
+                        self.log("[蹲守] ⚠️ 连着 5 次进不了结账入口——这个出口 IP 或"
+                                 "账号可能在 checkoutx 上被限，蹲守暂时无从下手")
+                    self._pause(pause)
+                    continue
+
+                # 到这儿才是真结论（成单 / 结果不明 / 配置死局）：报出来。
+                self._fails = 0
                 self.report(result, self._title(), self.url)
 
                 if result.quota_done or getattr(self.buyer, "halt_for_human", False):
                     self.halted = True
                     self.log(f"[蹲守] {result.detail or '收工'}")
                     break
-
-                # 被限流：按 retry_after 冷却，别硬撞（checkoutx 越撞退避越深）。
-                pause = max(self.rebuild_pause,
-                            float(getattr(result, "retry_after", 0.0) or 0.0))
-                if pause > self.rebuild_pause:
-                    self.log(f"[蹲守] 冷却 {pause:.0f}s 再重新上膛")
-                self._pause(pause)
+                self._pause(self.rebuild_pause)
         finally:
             try:
                 self.buyer.stop()   # 只在创建 Playwright 的线程上关闭。

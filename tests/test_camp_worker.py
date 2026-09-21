@@ -105,3 +105,43 @@ class WorkerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BlockedCooldownTests(unittest.TestCase):
+    """上膛被 541：静默冷却、不推送，攒到 5 次才说一句——别 3 秒一撞、别刷通知。"""
+    URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJYE4CH/A"
+
+    def worker(self, seq):
+        self.reports = []
+        b = FakeBuyer(seq)
+        w = CampWorker(b, lambda r, t, u: self.reports.append(r), url=self.URL,
+                       rebuild_pause=0.0, log=lambda *a: None)
+        self.naps = []
+        w._pause = lambda s: self.naps.append(s)
+        return b, w
+
+    def blocked(self):
+        return BuyResult(False, "⚠️ 上膛被拦", self.URL, retriable=False, retry_after=120.0)
+
+    def test_a_block_is_silent_and_cools_down(self):
+        # 3 次上膛被拦 → 成单收工。前 3 次不推送、各冷却 120s。
+        b, w = self.worker([self.blocked(), self.blocked(), self.blocked(),
+                            BuyResult(True, "ok", self.URL, quota_done=True)])
+        w._run()
+        self.assertEqual(1, len(self.reports))     # 只有成单那次推送
+        self.assertEqual([120.0, 120.0, 120.0], self.naps)  # 成单后 break，不再 pause
+
+    def test_five_in_a_row_warns_once(self):
+        # 连着 5 次被拦：第 5 次推一条「进不去」提醒
+        b, w = self.worker([self.blocked()] * 6)
+        # 让它跑 5 次就停
+        n = [0]
+        orig = w._pause
+        def pause(s):
+            n[0] += 1
+            if n[0] >= 5:
+                w.closed = True
+            orig(s)
+        w._pause = pause
+        w._run()
+        self.assertEqual(1, len(self.reports))     # 第 5 次那一条
