@@ -826,9 +826,9 @@ class FastCheckout:
     #: 点掉。返回点了什么，供日志排查真实选择器。
     JS_KEEP_AWAKE = r"""
     () => {
-        // 1) 合成用户活动，重置任何按「idle 事件」计时的客户端计时器
+        // 1) 合成用户活动，重置任何按「idle 事件」计时的客户端计时器。
+        //    这是主要手段，纯派发事件、不动页面，绝对安全。
         try {
-            const now = Date.now();
             for (const type of ["mousemove", "keydown", "pointermove", "scroll"]) {
                 const ev = type === "keydown"
                     ? new KeyboardEvent(type, {bubbles: true, key: "Shift"})
@@ -837,22 +837,36 @@ class FastCheckout:
                 window.dispatchEvent(ev);
             }
         } catch (e) {}
-        // 2) 找「还在吗 / 会话即将过期」对话框里的「继续 / 我还在」按钮点掉
-        const words = ["继续", "我还在", "还在", "保持", "Continue", "Keep", "Stay",
-                       "extend", "继续购物", "返回"];
-        const cands = [...document.querySelectorAll(
-            'button, a, [role=button], [data-autom]')];
-        for (const el of cands) {
-            const t = (el.innerText || el.textContent || "").trim();
-            const am = (el.getAttribute && (el.getAttribute("data-autom") || "")) || "";
-            if (!t && !am) continue;
-            const hay = (t + " " + am).toLowerCase();
-            if (words.some(w => hay.includes(w.toLowerCase()))) {
-                // 只点看得见的，别误点隐藏的
-                const box = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-                if (box && box.width > 0 && box.height > 0) {
-                    try { el.click(); return "clicked:" + (t || am).slice(0, 30); }
-                    catch (e) {}
+        // 2) 点对话框**只在确实是会话超时对话框里**才点，否则一律不点。
+        //    绝不能像之前那样满页面找「继续」——那会点到「继续填写送货地址」
+        //    这种流程按钮，把上膛好的 Fulfillment-init 往前推、搞乱状态。
+        //    判据要两个都满足：
+        //      a) 元素在一个模态/对话框容器里（role=dialog / aria-modal / .modal…）
+        //      b) 那个容器的文字提到「会话 / 超时 / 还在 / session / time」
+        //    命中才点里面的「我还在 / 继续会话 / 保持 / Keep / Stay」按钮。
+        const SESSION = ["会话", "超时", "还在吗", "是否还在", "即将结束", "即将过期",
+                         "session", "time out", "timed out", "timeout", "still there",
+                         "still shopping", "expire"];
+        const KEEP = ["我还在", "继续会话", "保持", "还在", "keep", "stay", "continue session",
+                      "yes", "是的", "是"];
+        const modals = [...document.querySelectorAll(
+            '[role=dialog], [aria-modal=true], .modal, .rs-modal, [class*=modal], [class*=Modal], [class*=overlay]')];
+        for (const box of modals) {
+            const bt = (box.innerText || box.textContent || "").toLowerCase();
+            if (!SESSION.some(w => bt.includes(w.toLowerCase()))) continue;   // 不是会话对话框
+            const btns = [...box.querySelectorAll('button, a, [role=button]')];
+            for (const el of btns) {
+                const t = (el.innerText || el.textContent || "").trim();
+                if (!t) continue;
+                const low = t.toLowerCase();
+                // 精确一点：整段就是这几个词，或明确的「保持/继续会话」类，
+                // 别用 includes 去撞「继续填写…」那种长句
+                if (KEEP.some(w => low === w.toLowerCase() || low.startsWith(w.toLowerCase()))) {
+                    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                    if (r && r.width > 0 && r.height > 0) {
+                        try { el.click(); return "clicked:" + t.slice(0, 30); }
+                        catch (e) {}
+                    }
                 }
             }
         }

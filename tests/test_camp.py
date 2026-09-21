@@ -205,11 +205,22 @@ class KeepAliveTests(unittest.TestCase):
         self.assertTrue(any("extendSessionUrl" in q for q in actions), actions)
         self.assertFalse(any("search" in q for q in actions), actions)
 
-    def test_keep_awake_clicks_the_dialog(self):
-        # keep_awake 返回点了什么就记一行；FakePage.evaluate(单参) 返回非空即视为点到
-        page = FakePage([])
+    def test_keep_awake_logs_only_when_it_clicks_something(self):
+        from unittest.mock import Mock
         fc = self.fc()
         logs = []
         fc.log = lambda *a: logs.append(" ".join(str(x) for x in a))
+        # 什么都没点（JS 返回空串）→ 不记日志
+        page = Mock(); page.evaluate.return_value = ""
         fc.keep_awake(page)
-        self.assertTrue(any("会话对话框" in x for x in logs))
+        self.assertEqual([], logs)
+        # 真点了会话对话框（JS 返回 clicked:…）→ 记一行
+        page.evaluate.return_value = "clicked:我还在"
+        fc.keep_awake(page)
+        self.assertTrue(any("clicked:我还在" in x for x in logs))
+
+    def test_keep_awake_survives_evaluate_errors(self):
+        from unittest.mock import Mock
+        fc = self.fc()
+        page = Mock(); page.evaluate.side_effect = RuntimeError("boom")
+        fc.keep_awake(page)   # 不抛就行
