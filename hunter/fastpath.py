@@ -852,26 +852,21 @@ class FastCheckout:
         //    要求 role=tab/radio 或有 pickup 的 data-autom，且文字短（<=6 字），
         //    这样绝不会撞「继续填写取货详情」那种流程长句。
         try {
-            // 「到店取货」这几个字精确、短，只会是那个 tab（流程按钮是更长的
-            // 「继续填写取货详情」），所以：文字**正好是**「到店取货」的可点元素，
-            // 或 role=tab/radio、或带 pickup 的 data-autom，都算取货 tab。
+            // **只认文字含「到店取货」**。上一版还按 data-autom 含 pickup/retail 找，
+            // 结果把地址字段「上海 徐汇区」（它的 data-autom 也带 pickup）点了——错的。
+            // 「到店取货」这四个字流程按钮（「继续填写取货详情」）、地址都不含，安全；
+            // 而且要求它是可点的 tab/单选/按钮类，别点到纯文本标题。
             const cands = [...document.querySelectorAll(
-                'button, a, label, [role=tab], [role=radio], [role=button], '
-                + '[data-autom*="pickup" i], [data-autom*="retail" i]')];
+                'button, a, label, [role=tab], [role=radio], [role=button]')];
             for (const el of cands) {
                 const t = txt(el);
-                const am = (el.getAttribute && (el.getAttribute("data-autom") || "").toLowerCase()) || "";
-                const role = (el.getAttribute && (el.getAttribute("role") || "")) || "";
-                const exact = (t === "到店取货" || t === "到店自取" || t === "Pick up"
-                               || t.toLowerCase() === "pickup");
-                const byAutom = am.includes("pickup") || am.includes("retail");
-                if (!(exact || byAutom) || !vis(el)) continue;
+                if (!(t.includes("到店取货") || t.includes("到店自取")) || !vis(el)) continue;
                 // 已经选中就别再点
                 const sel = (el.getAttribute && el.getAttribute("aria-selected") === "true")
                           || (el.getAttribute && el.getAttribute("aria-checked") === "true")
                           || /(\bselected\b|\bactive\b|--selected|is-selected)/i.test(el.className || "");
                 if (sel) break;
-                try { el.click(); did.push("pickup-tab:" + (t || am).slice(0, 20)); break; }
+                try { el.click(); did.push("pickup-tab:" + t.slice(0, 12)); break; }
                 catch (e) {}
             }
         } catch (e) {}
@@ -1386,6 +1381,7 @@ class FastCheckout:
         hot_until = (clock() + hot_seconds
                      if (wake is not None and wake.is_set()) else 0.0)
         shots = 0
+        last_shot = clock()   # 量「距上一发多久」，验证会话热多久会凉
         try:
             while True:
                 if stop():
@@ -1401,22 +1397,22 @@ class FastCheckout:
                 self.keep_awake(page)
 
                 # **一直打 search，冷热只差在间隔。**
-                # 2026-09-21 22:34 的日志钉死了一件事：那 10 秒是**一个会话第一发
-                # search** 的一次性开销，从第二发起全是 ~500ms（同一会话打了 90 多发，
-                # 首发 10110ms、其余 400~700ms）。所以：
-                #   * 首发（预热）把 10 秒烧掉，会话就热了；
-                #   * 之后冷档也一直打 search（便宜，还顺带续会话、自己发现货），
-                #     让会话**始终热着**——放货那一刻热档的 search 才是 ~500ms、
-                #     贴得进窗口，而不是又撞上一次 10 秒的首发。
-                # search 本身就是 checkoutx 交互，会重置服务端 interactionMs，所以
-                # 也不再需要 extendSession。
+                # 有数据的部分（2026-09-21 22:34 一个会话）：首发 10110ms，其后 90
+                # 多发全 400~700ms、间隔约 10s——所以那 10 秒是「会话第一发」的一次性
+                # 开销，预热时先烧掉它是稳的。
+                # **没数据、待验证**：间隔拉到 idle_cadence（默认 30s）时会话还热不热、
+                # 多久凉回 10 秒——只有约 10s 连续间隔的样本。所以下面每发都记
+                # 「距上一发多久 + 这发多少 ms」，用真实运行把衰减曲线量出来再定间隔。
                 hot = clock() < hot_until
                 try:
+                    gap = clock() - last_shot
                     data = self.step2_store(page)
                     shots += 1
-                    if shots == 1:
-                        self.log(f"[蹲守] 会话预热：第一发 search 走完，"
-                                 f"之后就热了（首发那 10 秒是一次性的）")
+                    last_shot = clock()
+                    ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
+                    self.log(f"[蹲守] 第 {shots} 发 search {ms}ms"
+                             f"（{'热' if hot else '冷'}档，距上一发 {gap:.0f}s）"
+                             + ("　← 首发预热，那 10 秒是一次性的" if shots == 1 else ""))
                     if self.arm_from_search(page, data):
                         self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
                                  f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
