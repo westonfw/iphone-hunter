@@ -8,8 +8,8 @@ import time
 import unittest
 from unittest.mock import Mock
 
-from hunter2.bus import (Decoder, Receiver, Seen, Sender, Sighting, encode,
-                         sign, verify)
+from hunter2.bus import (WRONG_KIND, Decoder, Receiver, Seen, Sender, Sighting,
+                         encode, sign, verify)
 
 KEY = b"test-key-0123456789"
 
@@ -125,7 +125,8 @@ class ShapeTests(unittest.TestCase):
         raw = json.dumps({'body': body, 'mac': sign(body, KEY)}).encode()
         got, why = Decoder(key=KEY, clock=lambda: 1000.0).decode(raw)
         self.assertIsNone(got)
-        self.assertIn('gone', why)      # 连这种消息都不收
+        # 种类不收是「按设计忽略」，返回静默哨兵，不当错误刷屏
+        self.assertEqual(WRONG_KIND, why)
 
     def test_an_unknown_version_is_refused(self):
         body = {'v': 99, 'kind': 'seen', 'part': 'P', 'store': 'S',
@@ -175,6 +176,31 @@ class WireTests(unittest.TestCase):
             rx.close()
         self.assertEqual(1, len(got), '信号没过来')
         self.assertEqual('MJYA4CH/A', got[0].part)
+
+    def test_a_wrong_kind_packet_is_skipped_without_logging(self):
+        """买手收到别的买手的 enlist 是常态，别刷屏——静默跳过、不记日志。"""
+        from hunter2.bus import Enlist
+        port = self._free_port()
+        log = Mock()
+        # 这个接收方只收 seen（模拟买手不收 enlist——其实买手收 seen/alive，
+        # 这里用 seen 一种就够验「种类不收时静默」）
+        rx = Receiver(key=KEY, on_sighting=lambda s, ip: None, port=port,
+                      log=log, kinds=('seen',))
+        rx.start()
+        try:
+            tx = Sender(key=KEY, src='buyerB', port=port, peers=('127.0.0.1',),
+                        log=lambda *a: None)
+            for _ in range(3):
+                tx.send(Enlist(id='buyerB', proxy_port=48712, direct=False,
+                               at=time.time(), src='buyerB'))
+            tx.close()
+            time.sleep(0.3)
+        finally:
+            rx.close()
+        self.assertEqual(3, rx.skipped, '种类不收的包应被静默跳过并计数')
+        # 一行「丢弃」日志都不该有
+        self.assertFalse(any('丢弃' in str(c) for c in log.call_args_list),
+                         '种类不收不该刷丢弃日志')
 
     def test_a_handler_that_raises_does_not_kill_the_receiver(self):
         port = self._free_port()
@@ -258,8 +284,9 @@ class EnlistTests(unittest.TestCase):
         self.assertIn('签名', why)
 
     def test_a_buyer_refuses_enlist_by_default(self):
-        """能处理的消息种类越少，能出错的地方越少。"""
+        """能处理的消息种类越少，能出错的地方越少。种类不收返回静默哨兵，
+        不当错误刷屏（买手收到别的买手的 enlist 是常态）。"""
         got, why = Decoder(key=KEY, clock=lambda: 1000.0).decode(
             encode(self.enlist(), KEY))
         self.assertIsNone(got)
-        self.assertIn('enlist', why)
+        self.assertEqual(WRONG_KIND, why)

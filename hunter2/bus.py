@@ -74,6 +74,9 @@ MAX_PAYLOAD = 1200
 #: 「这是我自己广播的」。UDP 广播会回到本机，主程序既发又收，不挡掉的话
 #: 每一轮都会在日志里拒绝自己一次。这不是错误，所以收端见到它一声不吭。
 ECHO = "自己发的"
+#: 种类不在这个接收方要收的范围里（买手收到别的买手的 enlist 就是这种）。
+#: 跟 ECHO 一样是「按设计就该忽略」的，不是错误——静默跳过，别刷屏。
+WRONG_KIND = "种类不收"
 
 
 def wall_of(mono: float, now_mono=None, now_wall=None) -> float:
@@ -383,7 +386,7 @@ class Decoder:
             return None, ECHO       # 广播回到本机，不是错误，别刷屏
         kind = str(body.get("kind") or "")
         if kind not in self.kinds:
-            return None, f"不收 {kind!r} 这种消息"
+            return None, WRONG_KIND
         s = {"seen": Sighting, "enlist": Enlist, "alive": Alive}[kind].parse(body)
         if s is None:
             return None, "字段不认识（版本不一致？）"
@@ -500,7 +503,7 @@ class Receiver:
         self.closed = False
         #: 同一个理由不重复刷屏——密钥配错的话会每个包都拒一次。
         self._last_reason = ""
-        self.taken = self.refused = self.echoed = 0
+        self.taken = self.refused = self.echoed = self.skipped = 0
 
     def start(self) -> None:
         if self.thread is not None:
@@ -525,6 +528,12 @@ class Receiver:
             s, why = self.decoder.decode(raw)
             if why == ECHO:
                 self.echoed += 1
+                continue
+            if why == WRONG_KIND:
+                # 按设计就不收的种类（如买手收到别的买手的 enlist）。静默跳过：
+                # 正常的 seen/alive 夹在中间会把 _last_reason 去重重置，不静默的话
+                # 每条 enlist 都刷一行。
+                self.skipped += 1
                 continue
             if s is None:
                 self.refused += 1

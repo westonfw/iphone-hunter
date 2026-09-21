@@ -587,9 +587,19 @@ class AutoBuy:
         # 误判登录态、白付一次 10~25s 的登录。2026-09-20 08:57、09:43、09:51
         # 三行「删了 2 件」全是这个形状：不是重复加购，是遗留 + 探路。
         # 袋里正好就是探路型号时连加都不用加，省一个 token；不是就先清掉。
-        # 读不到（页面还在 about:blank 上）就照旧走加购，复核那一步会兜住。
-        st = prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
-                         log=self.log)
+        #
+        # **只在页面已经在主站上时才先读袋。** 每轮预热的登录检查页是新开的，
+        # 初始停在 about:blank（origin=null），在那儿读袋必然被主站校验判「不能
+        # 当真」——白读一次、还刷一行吓人的日志。不在主站就直接走下面的加购，
+        # 那一步本来就会导航到产品页、之后再读就正常了。
+        here = ""
+        try:
+            here = page.url or ""
+        except Exception:
+            here = ""
+        st = (prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
+                          log=self.log)
+              if _on_main(here, self.region) else {})
         if not (st.get('ok') and st.get('kept')):
             try:
                 page.goto(atb_add_url(buy_url, part, token), timeout=self.timeout,

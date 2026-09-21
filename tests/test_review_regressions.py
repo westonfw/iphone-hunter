@@ -874,12 +874,34 @@ class CheckoutWarmupRegressions(unittest.TestCase):
                             for c in page.goto.call_args_list))
 
     def test_a_probe_already_in_the_bag_is_not_added_again(self):
-        """上一单留在袋里的正好是探路型号：直接用，别叠成两条。"""
-        ab, page = self.buyer(), self.page()
+        """上一单留在袋里的正好是探路型号：直接用，别叠成两条。
+
+        先读袋只在页面已在主站上时才做（about:blank 上读必然拿到 null，白读
+        还刷日志）。这里页面停在 /shop/bag（park 之后的常见落点），先读袋就会跑。
+        """
+        ab, page = self.buyer(), self.page('https://www.apple.com.cn/shop/bag')
         note = self.warm(ab, page, {'ok': True, 'kept': True})
         self.assertIn('本来就没墙', note)
         self.assertFalse(any('add-to-cart=add-to-cart' in c.args[0]
                              for c in page.goto.call_args_list))
+
+    def test_on_about_blank_the_pre_read_is_skipped(self):
+        """新开的预热页停在 about:blank：跳过先读袋，直接走加购导航——
+        不在 about:blank 上白读一次、刷「当前页在 null」那行。"""
+        ab, page = self.buyer(), self.page('about:blank')
+        reads = []
+        def spy(p, **kw):
+            reads.append(getattr(p, 'url', ''))
+            return {'ok': True, 'kept': True}
+        with patch('hunter.fastpath.prepare_bag', side_effect=spy):
+            ab._enter_checkout.return_value = self.page(
+                'https://secure7.www.apple.com.cn/shop/checkout')
+            ab.warm_checkout_session(ab._ctx, page, self.URL)
+        # 没有任何一次 prepare_bag 是在 about:blank 上读的
+        self.assertNotIn('about:blank', reads)
+        # 走了加购导航
+        self.assertTrue(any('add-to-cart=add-to-cart' in c.args[0]
+                            for c in page.goto.call_args_list))
 
     def test_no_wall_is_reported_as_already_ready(self):
         ab, page = self.buyer(), self.page()
