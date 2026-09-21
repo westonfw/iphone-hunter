@@ -205,19 +205,19 @@ class KeepAliveTests(unittest.TestCase):
         self.assertTrue(any("extendSessionUrl" in q for q in actions), actions)
         self.assertFalse(any("search" in q for q in actions), actions)
 
-    def test_keep_awake_logs_only_when_it_clicks_something(self):
+    def test_keep_awake_logs_only_when_it_does_something(self):
         from unittest.mock import Mock
         fc = self.fc()
         logs = []
         fc.log = lambda *a: logs.append(" ".join(str(x) for x in a))
-        # 什么都没点（JS 返回空串）→ 不记日志
+        # 什么都没做（JS 返回空串）→ 不记日志
         page = Mock(); page.evaluate.return_value = ""
         fc.keep_awake(page)
         self.assertEqual([], logs)
-        # 真点了会话对话框（JS 返回 clicked:…）→ 记一行
-        page.evaluate.return_value = "clicked:我还在"
+        # 做了动作（切 tab / 关弹窗）→ 记一行
+        page.evaluate.return_value = "pickup-tab:到店取货 | close:×"
         fc.keep_awake(page)
-        self.assertTrue(any("clicked:我还在" in x for x in logs))
+        self.assertTrue(any("页面维护" in x and "pickup-tab" in x for x in logs))
 
     def test_keep_awake_survives_evaluate_errors(self):
         from unittest.mock import Mock

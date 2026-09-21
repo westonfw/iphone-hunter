@@ -826,8 +826,16 @@ class FastCheckout:
     #: 点掉。返回点了什么，供日志排查真实选择器。
     JS_KEEP_AWAKE = r"""
     () => {
+        const did = [];
+        const vis = (el) => {
+            if (!el || !el.getBoundingClientRect) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        };
+        const txt = (el) => ((el.innerText || el.textContent || "").trim());
+
         // 1) 合成用户活动，重置任何按「idle 事件」计时的客户端计时器。
-        //    这是主要手段，纯派发事件、不动页面，绝对安全。
+        //    纯派发事件、不动页面，绝对安全，是保活的主要手段。
         try {
             for (const type of ["mousemove", "keydown", "pointermove", "scroll"]) {
                 const ev = type === "keydown"
@@ -837,40 +845,82 @@ class FastCheckout:
                 window.dispatchEvent(ev);
             }
         } catch (e) {}
-        // 2) 点对话框**只在确实是会话超时对话框里**才点，否则一律不点。
-        //    绝不能像之前那样满页面找「继续」——那会点到「继续填写送货地址」
-        //    这种流程按钮，把上膛好的 Fulfillment-init 往前推、搞乱状态。
-        //    判据要两个都满足：
-        //      a) 元素在一个模态/对话框容器里（role=dialog / aria-modal / .modal…）
-        //      b) 那个容器的文字提到「会话 / 超时 / 还在 / session / time」
-        //    命中才点里面的「我还在 / 继续会话 / 保持 / Keep / Stay」按钮。
-        const SESSION = ["会话", "超时", "还在吗", "是否还在", "即将结束", "即将过期",
-                         "session", "time out", "timed out", "timeout", "still there",
-                         "still shopping", "expire"];
-        const KEEP = ["我还在", "继续会话", "保持", "还在", "keep", "stay", "continue session",
-                      "yes", "是的", "是"];
-        const modals = [...document.querySelectorAll(
-            '[role=dialog], [aria-modal=true], .modal, .rs-modal, [class*=modal], [class*=Modal], [class*=overlay]')];
-        for (const box of modals) {
-            const bt = (box.innerText || box.textContent || "").toLowerCase();
-            if (!SESSION.some(w => bt.includes(w.toLowerCase()))) continue;   // 不是会话对话框
-            const btns = [...box.querySelectorAll('button, a, [role=button]')];
-            for (const el of btns) {
-                const t = (el.innerText || el.textContent || "").trim();
-                if (!t) continue;
-                const low = t.toLowerCase();
-                // 精确一点：整段就是这几个词，或明确的「保持/继续会话」类，
-                // 别用 includes 去撞「继续填写…」那种长句
-                if (KEEP.some(w => low === w.toLowerCase() || low.startsWith(w.toLowerCase()))) {
-                    const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-                    if (r && r.width > 0 && r.height > 0) {
-                        try { el.click(); return "clicked:" + t.slice(0, 30); }
-                        catch (e) {}
+
+        // 2) 把可见页面切到「到店取货」tab。camp 是靠后台 fetch 选的 RETAIL，
+        //    但页面 DOM 默认停在「快递」tab——切过去，可见状态才跟服务端一致，
+        //    弹窗/遮罩也才在对的 tab 上。**只点 tab/单选类控件，不点提交按钮**：
+        //    要求 role=tab/radio 或有 pickup 的 data-autom，且文字短（<=6 字），
+        //    这样绝不会撞「继续填写取货详情」那种流程长句。
+        try {
+            const PICK = ["到店取货", "取货", "pickup", "pick up", "store pickup"];
+            const tabs = [...document.querySelectorAll(
+                '[role=tab], [role=radio], [data-autom*="pickup" i], [data-autom*="retail" i], label')];
+            for (const el of tabs) {
+                const t = txt(el);
+                const am = (el.getAttribute && (el.getAttribute("data-autom") || "").toLowerCase()) || "";
+                const role = (el.getAttribute && (el.getAttribute("role") || "")) || "";
+                const looksPickup = PICK.some(w => (t.toLowerCase().includes(w) && t.length <= 6)
+                                                   || am.includes(w.replace(/ /g, "")));
+                if (!looksPickup || !vis(el)) continue;
+                // 已经选中就别再点
+                const sel = (el.getAttribute && el.getAttribute("aria-selected") === "true")
+                          || (el.getAttribute && el.getAttribute("aria-checked") === "true")
+                          || /(\bselected\b|\bactive\b|--selected|is-selected)/i.test(el.className || "");
+                if (sel) break;
+                // 只有 tab/radio/或带 pickup data-autom 的才点，别点普通 button
+                if (role === "tab" || role === "radio" || am) {
+                    try { el.click(); did.push("pickup-tab:" + (t || am).slice(0, 20)); break; }
+                    catch (e) {}
+                }
+            }
+        } catch (e) {}
+
+        // 3) 关掉弹窗/遮罩。**只点明确的关闭控件**（aria-label / data-autom 含
+        //    close/dismiss/关闭，或纯 × / ✕ 图标按钮），绝不点流程按钮。
+        try {
+            const closers = [...document.querySelectorAll(
+                '[aria-label*="close" i], [aria-label*="关闭"], [aria-label*="dismiss" i], '
+                + '[data-autom*="close" i], [data-autom*="dismiss" i], '
+                + '.modal button[class*="close" i], [class*="overlay"] [class*="close" i]')];
+            for (const el of closers) {
+                if (!vis(el)) continue;
+                try { el.click(); did.push("close:" + (txt(el) || el.getAttribute("aria-label") || "x").slice(0, 20)); break; }
+                catch (e) {}
+            }
+            // 纯 × 图标按钮兜底
+            if (!did.some(x => x.startsWith("close:"))) {
+                for (const el of document.querySelectorAll('button, [role=button]')) {
+                    const t = txt(el);
+                    if ((t === "×" || t === "✕" || t === "关闭" || t.toLowerCase() === "close") && vis(el)) {
+                        try { el.click(); did.push("close:" + t); break; } catch (e) {}
                     }
                 }
             }
-        }
-        return "";
+        } catch (e) {}
+
+        // 4) 会话超时对话框：只在「模态框 + 文字含会话/超时/还在」里点「我还在」类。
+        try {
+            const SESSION = ["会话", "超时", "还在吗", "是否还在", "即将结束", "即将过期",
+                             "session", "time out", "timed out", "timeout", "still there",
+                             "still shopping", "expire"];
+            const KEEP = ["我还在", "继续会话", "保持", "还在", "keep", "stay",
+                          "continue session", "是的", "是"];
+            const modals = [...document.querySelectorAll(
+                '[role=dialog], [aria-modal=true], .modal, [class*="modal" i], [class*="overlay" i]')];
+            for (const box of modals) {
+                const bt = (box.innerText || box.textContent || "").toLowerCase();
+                if (!SESSION.some(w => bt.includes(w.toLowerCase()))) continue;
+                for (const el of box.querySelectorAll('button, a, [role=button]')) {
+                    const low = txt(el).toLowerCase();
+                    if (!low) continue;
+                    if (KEEP.some(w => low === w.toLowerCase() || low.startsWith(w.toLowerCase()))) {
+                        if (vis(el)) { try { el.click(); did.push("session:" + txt(el).slice(0, 20)); } catch (e) {} }
+                    }
+                }
+            }
+        } catch (e) {}
+
+        return did.join(" | ");
     }
     """
 
@@ -896,7 +946,7 @@ class FastCheckout:
         except Exception:
             return
         if what:
-            self.log(f"[蹲守] 点掉了会话对话框（{what}）")
+            self.log(f"[蹲守] 页面维护（{what}）")
 
     def _post(self, page, path: str, action: str, module: str,
               fields: list[tuple[str, str]], model_page: str = "") -> dict:
@@ -1321,6 +1371,7 @@ class FastCheckout:
             return False, "⚠️ 读不到 x-aos-stk", "不在结账页上，或页面还没加载完。"
         try:
             self.step1_pickup(page)   # 上膛：停在这里，后面只反复打 search
+            self.keep_awake(page)     # 上膛后立刻把可见页面切到「到店取货」tab
         except SessionExpired:
             return False, "rebuild", "会话过期，重建"
         except Blocked as e:
