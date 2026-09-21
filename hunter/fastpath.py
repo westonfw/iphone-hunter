@@ -1331,7 +1331,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 180.0, hot_seconds: float = 60.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1346,7 +1346,7 @@ class FastCheckout:
           * 主程序安静时 → **冷档**：`idle_cadence`（默认 180s，只为续会话，
             低于 interactionMs 那 5 分钟的作废线）。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
-            密打，持续 `hot_seconds`（默认 60s）再没有新信号就回冷档。
+            密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
 
         max_seconds：这个会话最多蹲多久，必须 < 20 分钟 TTL（默认 18 分钟）。

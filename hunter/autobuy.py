@@ -849,7 +849,7 @@ class AutoBuy:
 
     def camp(self, url: str, in_stock_numbers: list[str] | None = None,
              *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 180.0, hot_seconds: float = 60.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              session_seconds: float = 1080.0) -> BuyResult:
         """守株待兔一段：加购目标型号 → 进结账 → 停在 step1 反复打 search。
 
@@ -1256,7 +1256,7 @@ class AutoBuy:
             outcome = placer.camp(page, t0, wake=c.get("wake"), stop=c.get("stop"),
                                   cadence=c.get("cadence", 8.0),
                                   idle_cadence=c.get("idle_cadence", 180.0),
-                                  hot_seconds=c.get("hot_seconds", 60.0),
+                                  hot_seconds=c.get("hot_seconds", 25.0),
                                   max_seconds=c.get("max_seconds", 1080.0))
         else:
             if self._gone(want_part, "六步"):

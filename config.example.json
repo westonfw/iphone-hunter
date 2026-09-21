@@ -89,7 +89,7 @@
       "enabled": false,
       "cadence": 8,
       "idle_cadence": 180,
-      "hot_seconds": 60,
+      "hot_seconds": 25,
       "session_seconds": 1080
     },
     "max_orders": 1,
