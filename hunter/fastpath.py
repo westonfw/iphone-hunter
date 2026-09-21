@@ -1439,7 +1439,10 @@ class FastCheckout:
                             return r
                     elif clock() - last_extend >= idle_cadence:
                         # 空闲：不 search，只用续期接口保服务端会话（就是「我还在」）。
+                        te = clock()
                         self.extend_session(page)
+                        self.log(f"[蹲守] 续期保活（{(clock() - te) * 1000:.0f}ms）——"
+                                 f"重置服务端 5 分钟空闲计时，不查库存")
                         last_extend = clock()
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
