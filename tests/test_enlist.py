@@ -379,3 +379,69 @@ class DegradeTests(unittest.TestCase):
         self.assertEqual(0, tx.send(small) if False else 0)
         self.assertFalse(tx.oversize(small))
         self.assertEqual("scout", small.id)
+
+
+class ForwardReportTests(EnlisterTests):
+    """转发口的用量得在买手自己的日志里看得见。
+
+    2026-09-21 那次「已转 0 条」误导了一整天：那行只在启动时打一次，之后主程序
+    经这台打了近 900 轮，买手日志里一个字都没有。
+    """
+
+    def test_it_says_nothing_when_nothing_moved(self):
+        e = self.make()
+        said = []
+        e.log = said.append
+        self.assertEqual("", e.report())
+        self.assertEqual([], said)
+
+    def test_it_reports_the_delta_not_just_the_total(self):
+        e = self.make()
+        said = []
+        e.log = said.append
+        self.proxy.served, self.proxy.refused = 40, 2
+        e.report()
+        self.proxy.served = 55
+        e.report()
+        self.assertEqual(2, len(said))
+        self.assertIn("转了 40 条、拒 2 条", said[0])
+        self.assertIn("转了 15 条、拒 0 条（累计 55 / 2）", said[1])
+
+    def test_closing_prints_the_grand_total(self):
+        e = self.make()
+        said = []
+        e.log = said.append
+        self.proxy.served, self.proxy.refused = 676, 3
+        e.close()
+        self.assertTrue(any("收尾：这一程共转 676 条、拒 3 条" in x for x in said))
+
+    def test_a_never_used_port_says_so_at_close(self):
+        """一整程都没被借过口，收尾时要点破——那多半是配置把它当成同出口了。"""
+        e = self.make()
+        said = []
+        e.log = said.append
+        e.close()
+        self.assertTrue(any("主程序从没走过这台的口" in x for x in said))
+
+    def test_a_same_exit_child_has_nothing_to_report(self):
+        cfg = {"link": dict(CFG["link"], same_exit_as_master=True)}
+        e = self.make(cfg)
+        said = []
+        e.log = said.append
+        self.assertEqual("", e.report(final=True))
+        self.assertEqual([], said)
+
+    def test_the_loop_reports_on_schedule(self):
+        e = self.make()
+        said = []
+        e.log = said.append
+        self.proxy.served = 7
+        with patch("hunter2.enlist.REPORT_EVERY", 0.0), \
+             patch.object(e, "beat", return_value=1):
+            e.closed = False
+            # 跑一轮就停
+            def stop(*a, **k):
+                e.closed = True
+            e._tick.wait = stop
+            e._run()
+        self.assertTrue(any("转了 7 条" in x for x in said))

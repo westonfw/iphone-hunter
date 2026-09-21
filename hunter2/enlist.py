@@ -25,6 +25,13 @@ from .proxy import ForwardProxy
 
 #: 多久报到一次。主程序那边 60 秒判掉线，20 秒等于要连着漏三次才会被摘。
 EVERY = 20.0
+#: 多久在日志里汇报一次转发口的用量。
+#:
+#: 2026-09-21 查过一回「主程序到底有没有走这台的口」：买手日志里唯一一行
+#: 「已转 0 条」是启动那一刻打的，之后再没打过，看着像从没转过——而主程序那天
+#: 经它打了近 900 轮。转发成功不记日志（每 20 秒一条太吵），所以要有个定期的
+#: 增量汇报，而且只在数字动了的时候说。
+REPORT_EVERY = 300.0
 
 
 class Enlister:
@@ -50,6 +57,9 @@ class Enlister:
         self.closed = False
         self._tick = threading.Event()
         self.sent = 0
+        #: 上次汇报时的 (已转, 拒) 和时刻，用来算增量、只在有变化时开口
+        self._reported = (0, 0)
+        self._report_at = time.monotonic()
 
     def start(self) -> int:
         """开口、开始报到。返回转发口端口（同出口标记下是 0）。"""
@@ -87,7 +97,33 @@ class Enlister:
                          + (f"，转发口 :{self.proxy_port}" if self.proxy_port
                             else "（同出口，无转发口）")
                          + ("" if n else "——但一个对端都没发出去，检查网络"))
+            if time.monotonic() - self._report_at >= REPORT_EVERY:
+                self.report()
             self._tick.wait(self.every)
+
+    def report(self, final: bool = False) -> str:
+        """把转发口的用量写进日志。平时只说增量、只在动了的时候说；收尾时说总量。
+
+        返回打出去的那行（没打就是空串），方便测试。
+        """
+        self._report_at = time.monotonic()
+        if self.proxy is None:
+            return ""
+        served, refused = int(self.proxy.served), int(self.proxy.refused)
+        d_served = served - self._reported[0]
+        d_refused = refused - self._reported[1]
+        self._reported = (served, refused)
+        if final:
+            line = (f"[转发] 收尾：这一程共转 {served} 条、拒 {refused} 条"
+                    + ("" if served else "——主程序从没走过这台的口，"
+                       "检查它有没有把这台当出口（同出口标记 / use_buyer_exits）"))
+        elif d_served or d_refused:
+            line = (f"[转发] 过去 {REPORT_EVERY / 60:.0f} 分钟转了 {d_served} 条、"
+                    f"拒 {d_refused} 条（累计 {served} / {refused}）")
+        else:
+            return ""
+        self.log(line)
+        return line
 
     def close(self, timeout: float = 2.0) -> None:
         self.closed = True
@@ -96,6 +132,7 @@ class Enlister:
             self.thread.join(timeout)
             self.thread = None
         if self.proxy is not None:
+            self.report(final=True)
             self.proxy.close()
         self.sender.close()
 
