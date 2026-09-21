@@ -852,26 +852,27 @@ class FastCheckout:
         //    要求 role=tab/radio 或有 pickup 的 data-autom，且文字短（<=6 字），
         //    这样绝不会撞「继续填写取货详情」那种流程长句。
         try {
-            const PICK = ["到店取货", "取货", "pickup", "pick up", "store pickup"];
-            const tabs = [...document.querySelectorAll(
-                '[role=tab], [role=radio], [data-autom*="pickup" i], [data-autom*="retail" i], label')];
-            for (const el of tabs) {
+            // 「到店取货」这几个字精确、短，只会是那个 tab（流程按钮是更长的
+            // 「继续填写取货详情」），所以：文字**正好是**「到店取货」的可点元素，
+            // 或 role=tab/radio、或带 pickup 的 data-autom，都算取货 tab。
+            const cands = [...document.querySelectorAll(
+                'button, a, label, [role=tab], [role=radio], [role=button], '
+                + '[data-autom*="pickup" i], [data-autom*="retail" i]')];
+            for (const el of cands) {
                 const t = txt(el);
                 const am = (el.getAttribute && (el.getAttribute("data-autom") || "").toLowerCase()) || "";
                 const role = (el.getAttribute && (el.getAttribute("role") || "")) || "";
-                const looksPickup = PICK.some(w => (t.toLowerCase().includes(w) && t.length <= 6)
-                                                   || am.includes(w.replace(/ /g, "")));
-                if (!looksPickup || !vis(el)) continue;
+                const exact = (t === "到店取货" || t === "到店自取" || t === "Pick up"
+                               || t.toLowerCase() === "pickup");
+                const byAutom = am.includes("pickup") || am.includes("retail");
+                if (!(exact || byAutom) || !vis(el)) continue;
                 // 已经选中就别再点
                 const sel = (el.getAttribute && el.getAttribute("aria-selected") === "true")
                           || (el.getAttribute && el.getAttribute("aria-checked") === "true")
                           || /(\bselected\b|\bactive\b|--selected|is-selected)/i.test(el.className || "");
                 if (sel) break;
-                // 只有 tab/radio/或带 pickup data-autom 的才点，别点普通 button
-                if (role === "tab" || role === "radio" || am) {
-                    try { el.click(); did.push("pickup-tab:" + (t || am).slice(0, 20)); break; }
-                    catch (e) {}
-                }
+                try { el.click(); did.push("pickup-tab:" + (t || am).slice(0, 20)); break; }
+                catch (e) {}
             }
         } catch (e) {}
 
@@ -898,24 +899,20 @@ class FastCheckout:
             }
         } catch (e) {}
 
-        // 4) 会话超时对话框：只在「模态框 + 文字含会话/超时/还在」里点「我还在」类。
+        // 4) 会话超时对话框「你是否仍在购物？」——按钮是「我仍在购物」。
+        //    实测这一版（2026-10）就是这几个字，只出现在这个对话框上，不会撞任何
+        //    流程按钮，所以**不必先命中模态容器**（Apple 的容器 class 不稳），
+        //    直接全页面找文字含「仍在购物 / 继续当前会话」的可见按钮点掉。
+        //    另留几个历史/英文写法兜底。
         try {
-            const SESSION = ["会话", "超时", "还在吗", "是否还在", "即将结束", "即将过期",
-                             "session", "time out", "timed out", "timeout", "still there",
-                             "still shopping", "expire"];
-            const KEEP = ["我还在", "继续会话", "保持", "还在", "keep", "stay",
-                          "continue session", "是的", "是"];
-            const modals = [...document.querySelectorAll(
-                '[role=dialog], [aria-modal=true], .modal, [class*="modal" i], [class*="overlay" i]')];
-            for (const box of modals) {
-                const bt = (box.innerText || box.textContent || "").toLowerCase();
-                if (!SESSION.some(w => bt.includes(w.toLowerCase()))) continue;
-                for (const el of box.querySelectorAll('button, a, [role=button]')) {
-                    const low = txt(el).toLowerCase();
-                    if (!low) continue;
-                    if (KEEP.some(w => low === w.toLowerCase() || low.startsWith(w.toLowerCase()))) {
-                        if (vis(el)) { try { el.click(); did.push("session:" + txt(el).slice(0, 20)); } catch (e) {} }
-                    }
+            const KEEP = ["仍在购物", "我仍在购物", "继续当前会话", "继续会话", "我还在",
+                          "still shopping", "keep shopping", "stay signed in", "continue session"];
+            for (const el of document.querySelectorAll('button, a, [role=button]')) {
+                const t = txt(el);
+                if (!t || !vis(el)) continue;
+                const low = t.toLowerCase();
+                if (KEEP.some(w => low.includes(w.toLowerCase()))) {
+                    try { el.click(); did.push("session:" + t.slice(0, 20)); break; } catch (e) {}
                 }
             }
         } catch (e) {}
