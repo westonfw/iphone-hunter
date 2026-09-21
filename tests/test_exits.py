@@ -621,12 +621,50 @@ class ConfiguredExitTests(PoolTests):
     def test_not_borrowing_keeps_children_out(self):
         said = []
         with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
-            p = ExitPool(self.cfg(exits=['http://1.2.3.4:8080'], use_buyer_exits=False),
+            p = ExitPool(self.cfg(exits=['http://1.2.3.4:8080'], use_buyer=False),
                          log=said.append, clock=lambda: 1000.0)
         self.add(p, 'b')
         self.add(p, 'b')
         self.assertEqual({'direct', 'proxy1'}, set(p._exits))
-        self.assertEqual(1, sum('use_buyer_exits' in x for x in said))
+        self.assertEqual(1, sum('use_buyer=false' in x for x in said))
+
+    def test_the_old_use_buyer_exits_name_still_works(self):
+        """老配置写的是 use_buyer_exits，兼容着读。"""
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            p = ExitPool(self.cfg(exits=['http://1.2.3.4:8080'], use_buyer_exits=False),
+                         log=lambda *a: None, clock=lambda: 1000.0)
+        self.add(p, 'b')
+        self.assertEqual({'direct', 'proxy1'}, set(p._exits))
+
+    def test_use_direct_false_drops_the_builtin(self):
+        """只走干净代理：把本机直连从池子里拿掉。"""
+        p = self.cpool(exits=['http://1.2.3.4:8080'], use_direct=False)
+        self.assertNotIn('direct', p._exits)
+        self.assertEqual({'proxy1'}, set(p._exits))
+
+    def test_use_direct_false_still_takes_buyers(self):
+        p = self.cpool(exits=['http://1.2.3.4:8080'], use_direct=False)
+        self.add(p, 'b')
+        self.assertEqual({'proxy1', 'b'}, set(p._exits))
+
+    def test_no_direct_no_proxy_no_buyer_refuses_to_start(self):
+        """三样出口全关，主程序等于瞎子——启动就报错，别静默空转。"""
+        with self.assertRaises(SystemExit):
+            with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+                ExitPool(self.cfg(use_direct=False, use_buyer=False),
+                         log=lambda *a: None, clock=lambda: 1000.0)
+
+    def test_no_direct_but_buyers_allowed_starts_empty_with_a_warning(self):
+        """关了直连、没配代理，但允许买手：起来时是空池，等买手报到，但要吼一声。"""
+        said = []
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            p = ExitPool(self.cfg(use_direct=False, use_buyer=True),
+                         log=said.append, clock=lambda: 1000.0)
+        self.assertEqual(0, len(p))
+        self.assertTrue(any('一条出口都没有' in x for x in said))
+        # 空池不能让主循环崩：pick 给 None，soonest 给个正数
+        self.assertIsNone(p.pick(PATH))
+        self.assertGreater(p.soonest(PATH), 0.0)
 
     def test_describe_marks_them(self):
         p = self.cpool(exits=['http://1.2.3.4:8080'])

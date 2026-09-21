@@ -116,17 +116,27 @@ class ExitPool:
         #: 标了同出口的子程序。它们永远进不了 _exits，所以不能拿「在不在池子里」
         #: 当「说过没说过」——那样每 20 秒一次报到就刷一行，一天四千多行。
         self._same: set[str] = set()
-        #: 因为 use_buyer_exits=false 而被谢绝过的子程序。同样只说一次。
+        #: 因为 use_buyer=false 而被谢绝过的子程序。同样只说一次。
         self._declined: set[str] = set()
         self._turn = 0
         link = dict(cfg.get("link") or {})
         #: 要不要借买手的转发口。配了自己的代理池、或者买手跟主程序同一个
         #: 网关时可以关掉——关掉之后买手照样报到、照样收信号，只是不当出口。
-        self.borrow = bool(link.get("use_buyer_exits", True))
-        # 直连永远在池子里：就算一个子程序都没上线，主程序也得能干活
-        d = self._make("direct", None, self.clock())
-        d.permanent = True
-        self._exits["direct"] = d
+        #: 要不要借买手的转发口。配了自己的代理池、或者买手跟主程序同一个
+        #: 网关时可以关掉——关掉之后买手照样报到、照样收信号，只是不当出口。
+        #: 老配置写的是 use_buyer_exits，兼容着读。
+        self.borrow = bool(link.get("use_buyer", link.get("use_buyer_exits", True)))
+        #: 要不要用本机直连出口。想让库存请求全走干净代理、彻底不碰本机 IP 时
+        #: 关掉它——Akamai 那 10 秒降级是按出口 IP 判的，本机一旦被盯上，
+        #: 留着它反而把脏 IP 混进巡检。关掉后必须有别的出口（代理或买手），
+        #: 否则主程序没有任何口可用。
+        self.use_direct = bool(link.get("use_direct", True))
+        # 直连默认在池子里：就算一个子程序都没上线，主程序也得能干活。
+        # 但 use_direct=false 时不建它——那是「只走干净出口」的明确要求。
+        if self.use_direct:
+            d = self._make("direct", None, self.clock())
+            d.permanent = True
+            self._exits["direct"] = d
         # 配置里的代理出口：主程序自己的口，不依赖任何买手在不在线。
         # 每条各有各的会话、熔断、节奏，跟借来的口一视同仁。
         self._configured: set[str] = set()
@@ -139,6 +149,16 @@ class ExitPool:
             self._rebalance()
             self.log(f"[出口] 配置了 {len(self._configured)} 条代理出口："
                      f"{'、'.join(sorted(self._configured))}")
+        # **关了直连就必须有替代出口，否则主程序等于瞎子。**
+        if not self.use_direct:
+            if not self._configured and not self.borrow:
+                raise SystemExit(
+                    "link 里 use_direct=false、use_buyer=false，又没配 link.exits"
+                    "——主程序没有任何出口可用，无法刷库存")
+            if not self._configured:
+                self.log("[出口] ⚠️ use_direct=false 且没配 link.exits：主程序现在"
+                         "一条出口都没有，要等买手报到（use_buyer=true）后才开始刷。"
+                         "买手都没上线的这段时间是全盲的。")
 
     def _make(self, who: str, proxy: str | None, now: float) -> Exit:
         pacer = build_pacer(self.cfg, sprint=self.sprint, log=lambda *a: None)
@@ -237,7 +257,7 @@ class ExitPool:
         if not self.borrow:
             if who not in self._declined:
                 self._declined.add(who)
-                self.log(f"[出口] {who} 报到，但 link.use_buyer_exits=false，"
+                self.log(f"[出口] {who} 报到，但 link.use_buyer=false，"
                          f"不借它的口（信号照收）")
             return
         with self._lock:
@@ -370,7 +390,9 @@ class ExitPool:
         with self._lock:
             waits = [max(e.cooldown(path), e.due_at - now)
                      for e in self._exits.values() if e.client]
-        return max(0.0, min(waits)) if waits else 0.0
+        # 空池（use_direct=false 且买手还没上线）时 min([]) 会炸——
+        # 返回一个正数让主循环按 TICK 空转着等，别崩。
+        return max(0.0, min(waits)) if waits else 1.0
 
     def describe(self) -> str:
         with self._lock:

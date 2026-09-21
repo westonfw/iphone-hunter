@@ -50,7 +50,8 @@
     "master_stale": 90,
     "same_exit_as_master": false,
     "exits": [],
-    "use_buyer_exits": true,
+    "use_direct": true,
+    "use_buyer": true,
     "proxy_port": 0,
     "enlist_every": 20,
     "beat_every": 10
