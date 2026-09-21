@@ -101,9 +101,9 @@
     "pickup_phone": "",
     "fast_path": true,
     "pickup_time": "earliest",
-    "pickup_city": "上海",
-    "pickup_state": "上海",
-    "pickup_district": "杨浦区"
+    "pickup_city": "你所在的城市",
+    "pickup_state": "你所在的省/直辖市",
+    "pickup_district": "你所在的区"
   },
   "watch": [],
   "quiet_hours": {
