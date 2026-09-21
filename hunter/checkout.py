@@ -1576,7 +1576,7 @@ class OrderPlacer:
     CAMP_REBUILD = "rebuild"
 
     def camp(self, page, t0: float, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 30.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0):
         """守株待兔版的 place：停在结账页反复打 search，命中就下单。
 

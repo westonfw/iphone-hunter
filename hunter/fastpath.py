@@ -1326,7 +1326,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 30.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1378,10 +1378,46 @@ class FastCheckout:
             return False, "⚠️ 上膛失败", f"{e}"
 
         # 进来时若主程序已经在报货（wake 已 set），直接进热档；否则冷档续会话。
-        hot_until = (clock() + hot_seconds
-                     if (wake is not None and wake.is_set()) else 0.0)
+        # 一个会话第一发 search 8~10s、之后全 1~3s（2026-09-22 buyerB 实测：同一
+        # 会话稀疏打 6 发、间隔几分钟，除首发外都 1~3s）——**会话预热过就整段是热的，
+        # 不用一直发也不凉**。所以：开场先打一发把 10 秒烧掉，之后**只跟着主程序
+        # 信号发** search，别定时空打（免得频繁 checkoutx 被 541）。
+        # 保活（点对话框、切 tab、续期）不受这个限制，照常按短 tick 做。
         shots = 0
-        last_shot = clock()   # 量「距上一发多久」，验证会话热多久会凉
+
+        def one_search(hot: bool):
+            """打一发 search，记耗时，命中就下单。返回 place 结果或 None。"""
+            nonlocal shots
+            data = self.step2_store(page)
+            shots += 1
+            ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
+            self.log(f"[蹲守] 第 {shots} 发 search {ms}ms（{'信号' if hot else '预热'}）"
+                     + ("　← 首发那 10 秒是一次性的，之后就热了" if shots == 1 else ""))
+            if self.arm_from_search(page, data):
+                self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
+                         f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
+                return self._place_from_armed(page, t0)
+            return None
+
+        #: 保活 tick：多久做一次 keep_awake（点对话框/切 tab）。客户端「还在吗」是
+        #: 60 秒倒计时，15 秒一次足够在它走完前点掉。这动作是纯 DOM，不打服务端。
+        keep_tick = min(15.0, idle_cadence)
+        last_extend = clock()
+        hot_until = clock() + hot_seconds if (wake is not None and wake.is_set()) else 0.0
+        try:
+            # 预热：进场先打一发，把 10 秒首发烧掉，会话即热。
+            r = one_search(hot=False)
+            if r is not None:
+                return r
+        except SessionExpired:
+            return False, "rebuild", "预热 search 时会话过期，重建"
+        except Blocked as e:
+            self.failure_kind = "blocked"
+            self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
+            return False, "⚠️ 预热被拦", f"{e}。checkoutx 被 541，冷却后重建。"
+        except Stalled as e:
+            self.log(f"[蹲守] 预热 search 没推进（{e}），接着蹲")
+
         try:
             while True:
                 if stop():
@@ -1391,39 +1427,27 @@ class FastCheckout:
                         f"蹲了 {clock() - t0:.0f}s（打了 {shots} 发 search），"
                         f"到重建点，换个新会话接着蹲")
 
-                # 每一轮先把「还在吗」对话框点掉、踹醒客户端计时器——不然它倒计时
-                # 到 0 会把页面跳去超时页，会话就废了（我们的后台 fetch 重置不了
-                # 那个客户端计时器，见 keep_awake）。
+                # 保活（不受 search 频率限制）：每 tick 点掉「还在吗」对话框、切取货
+                # tab、踹醒客户端计时器；服务端会话每 idle_cadence 秒用续期接口保一次。
                 self.keep_awake(page)
-
-                # **一直打 search，冷热只差在间隔。**
-                # 有数据的部分（2026-09-21 22:34 一个会话）：首发 10110ms，其后 90
-                # 多发全 400~700ms、间隔约 10s——所以那 10 秒是「会话第一发」的一次性
-                # 开销，预热时先烧掉它是稳的。
-                # **没数据、待验证**：间隔拉到 idle_cadence（默认 30s）时会话还热不热、
-                # 多久凉回 10 秒——只有约 10s 连续间隔的样本。所以下面每发都记
-                # 「距上一发多久 + 这发多少 ms」，用真实运行把衰减曲线量出来再定间隔。
                 hot = clock() < hot_until
                 try:
-                    gap = clock() - last_shot
-                    data = self.step2_store(page)
-                    shots += 1
-                    last_shot = clock()
-                    ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
-                    self.log(f"[蹲守] 第 {shots} 发 search {ms}ms"
-                             f"（{'热' if hot else '冷'}档，距上一发 {gap:.0f}s）"
-                             + ("　← 首发预热，那 10 秒是一次性的" if shots == 1 else ""))
-                    if self.arm_from_search(page, data):
-                        self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
-                                 f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
-                        return self._place_from_armed(page, t0)
+                    if hot:
+                        # 主程序报了货：打 search（此时会话已热，~1~3s），命中就下单。
+                        r = one_search(hot=True)
+                        if r is not None:
+                            return r
+                    elif clock() - last_extend >= idle_cadence:
+                        # 空闲：不 search，只用续期接口保服务端会话（就是「我还在」）。
+                        self.extend_session(page)
+                        last_extend = clock()
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
                     self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
                     back = max(cadence * 3, self.retry_after)
-                    self.log(f"[蹲守] search 被拦（{e}），"
-                             f"退避 {back:.0f}s——节奏太密会被 Akamai 盯上，见 README 坑 9")
+                    self.log(f"[蹲守] {'search' if hot else '续期'}被拦（{e}），"
+                             f"退避 {back:.0f}s——见 README 坑 9")
                     _, woke = self._nap(wake, back, stop, clock, sleep)
                     if stop():
                         return False, "已停止", "退避中收到停止信号"
@@ -1431,15 +1455,15 @@ class FastCheckout:
                         hot_until = clock() + hot_seconds
                     continue
                 except Stalled as e:
-                    self.log(f"[蹲守] 这一发没推进（{e}），当没货接着蹲")
+                    self.log(f"[蹲守] 这一发没推进（{e}），接着蹲")
 
-                # 节奏跟主程序：热档密打、冷档慢打（都在保持会话热 + 自己发现货）。
-                wait = cadence if clock() < hot_until else idle_cadence
+                # 热档按 cadence 密打（覆盖放货窗口那一小簇），空闲按 keep_tick 只保活。
+                wait = cadence if clock() < hot_until else keep_tick
                 stopped, woke = self._nap(wake, wait, stop, clock, sleep)
                 if stopped:
                     return False, "已停止", "等待中收到停止信号"
                 if woke:
-                    # 主程序报货了：进热档，接下来 hot_seconds 内密打 search。
+                    # 主程序报货了：进热档，接下来 hot_seconds 内跟着信号打 search。
                     hot_until = clock() + hot_seconds
         except KeyboardInterrupt:
             if self.submitted:

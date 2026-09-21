@@ -135,75 +135,78 @@ if __name__ == "__main__":
 
 
 class CadenceTests(unittest.TestCase):
-    """节奏跟主程序：安静时冷档（久），收到信号进热档（密）。"""
+    """空闲按 keep_tick 只保活，收到信号才进热档按 cadence 打 search。"""
 
     def fc(self):
         return placer(store="R581", stores=["R581"], place_order=False,
                       stk_timeout_ms=50)
 
-    def test_idle_uses_the_cold_cadence(self):
+    def test_idle_naps_the_keepalive_tick_not_the_search_cadence(self):
         import threading
-        page = FakePage([FUL] + [MISS] * 5)
+        page = FakePage([FUL] + [MISS] * 8)
         fc = self.fc()
         waits = []
-        wake = threading.Event()
-        # 记录每次 nap 请求的间隔；第 3 发后停
         n = [0]
         def fake_nap(w, seconds, stop, clock, sleep):
             waits.append(seconds)
             n[0] += 1
-            return (n[0] >= 3, False)   # 第 3 次让它停
+            return (n[0] >= 3, False)   # 没信号，第 3 次停
         fc._nap = fake_nap
-        fc.camp(page, wake=wake, cadence=8, idle_cadence=240, hot_seconds=60,
-                max_seconds=1e9, clock=lambda: 1000.0, sleep=lambda *_: None)
-        # 没有信号 → 全是冷档 240
-        self.assertTrue(all(w == 240 for w in waits), waits)
+        fc.camp(page, wake=threading.Event(), cadence=8, idle_cadence=240,
+                hot_seconds=60, max_seconds=1e9,
+                clock=lambda: 1000.0, sleep=lambda *_: None)
+        # 空闲 nap 走的是保活 tick（min(15, idle_cadence)=15），不是 240
+        self.assertTrue(all(w == 15 for w in waits), waits)
 
-    def test_a_signal_switches_to_hot_cadence(self):
+    def test_a_signal_switches_to_the_hot_cadence(self):
         import threading
-        page = FakePage([FUL] + [MISS] * 5)
+        page = FakePage([FUL] + [MISS] * 8)
         fc = self.fc()
         waits = []
-        wake = threading.Event()
         n = [0]
         def fake_nap(w, seconds, stop, clock, sleep):
             waits.append(seconds)
             n[0] += 1
-            # 第 1 次 nap 返回「被信号敲醒」→ 之后应进热档
-            return (n[0] >= 3, n[0] == 1)
+            return (n[0] >= 3, n[0] == 1)   # 第 1 次 nap 敲醒 → 之后热档
         fc._nap = fake_nap
         t = [1000.0]
         def clock():
             t[0] += 1
             return t[0]
-        fc.camp(page, wake=wake, cadence=8, idle_cadence=240, hot_seconds=60,
-                max_seconds=1e9, clock=clock, sleep=lambda *_: None)
-        # 第 1 次冷档，被敲醒后第 2、3 次热档
-        self.assertEqual(240, waits[0])
-        self.assertEqual(8, waits[1])
+        fc.camp(page, wake=threading.Event(), cadence=8, idle_cadence=240,
+                hot_seconds=60, max_seconds=1e9,
+                clock=clock, sleep=lambda *_: None)
+        self.assertEqual(15, waits[0])   # 空闲：保活 tick
+        self.assertEqual(8, waits[1])    # 被信号敲醒后：热档 cadence
 
 
 class KeepAliveTests(unittest.TestCase):
-    """空闲时用续期接口保活（不空打 search），并踹醒客户端计时器点掉「还在吗」。"""
+    """预热打一发烧掉 10 秒；之后空闲不 search、只续期保活；信号才 search。"""
 
     def fc(self):
         return placer(store="R581", stores=["R581"], place_order=False,
                       stk_timeout_ms=50)
 
-    def test_idle_keeps_searching_to_stay_warm(self):
-        # 冷档也一直打 search（保持会话热：首发 10s 是一次性的，之后 ~500ms）。
-        page = FakePage([FUL] + [MISS] * 5)
+    def test_primes_once_then_idle_extends_not_searches(self):
+        page = FakePage([FUL] + [MISS] * 8)
         fc = self.fc()
+        t = [1000.0]
+        def clock():
+            t[0] += 1        # 时间会走，续期间隔才到得了
+            return t[0]
         n = [0]
         def stop():
             n[0] += 1
-            return n[0] > 2
-        fc.camp(page, cadence=0, idle_cadence=0, max_seconds=1e9,
-                stop=stop, clock=lambda: 1000.0, sleep=lambda *_: None)
+            return n[0] > 6
+        fc.camp(page, cadence=1, idle_cadence=1, hot_seconds=0, max_seconds=1e9,
+                stop=stop, clock=clock, sleep=lambda *_: None)
         actions = [c["query"] for c in page.calls]
-        self.assertTrue(any("search" in q for q in actions), actions)
-        # 不再用 extendSession
-        self.assertFalse(any("extendSessionUrl" in q for q in actions), actions)
+        searches = [q for q in actions if "_a=search" in q]
+        extends = [q for q in actions if "extendSessionUrl" in q]
+        # 预热只打了 1 发 search（没有信号，不再空打）
+        self.assertEqual(1, len(searches), actions)
+        # 空闲靠续期接口保活
+        self.assertTrue(len(extends) >= 1, actions)
 
     def test_keep_awake_logs_only_when_it_does_something(self):
         from unittest.mock import Mock
