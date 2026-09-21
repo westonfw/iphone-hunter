@@ -64,20 +64,25 @@ class CampLoopTests(unittest.TestCase):
                       stk_timeout_ms=50, **kw)
 
     def test_it_camps_until_stock_then_places(self):
-        # step1 + 两发 MISS + 一发 HIT + step3~6
+        # 热档（主程序报了货）：step1 + 两发 MISS 的 search + 一发 HIT + step3~6。
+        # 冷档只续会话不打 search，所以命中场景必须是热档（wake set + hot 够久）。
         page = FakePage([FUL, MISS, MISS, HIT, CONTACT, BANKS, MONTHS, REVIEW])
         fc = self.fc()
-        ok, stage, _ = fc.camp(page, cadence=0, idle_cadence=0, max_seconds=100,
+        wake = threading.Event()
+        wake.set()
+        ok, stage, _ = fc.camp(page, wake=wake, cadence=0, hot_seconds=1e9,
+                               max_seconds=100,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertTrue(ok, stage)
         self.assertIn("Review", stage)
 
     def test_a_wake_signal_fires_search_at_once(self):
-        page = FakePage([FUL, MISS, HIT, CONTACT, BANKS, MONTHS, REVIEW])
+        page = FakePage([FUL, HIT, CONTACT, BANKS, MONTHS, REVIEW])
         fc = self.fc()
         wake = threading.Event()
         wake.set()
-        ok, stage, _ = fc.camp(page, wake=wake, cadence=999, idle_cadence=999, hot_seconds=0, max_seconds=100,
+        ok, stage, _ = fc.camp(page, wake=wake, cadence=0, hot_seconds=1e9,
+                               max_seconds=100,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertTrue(ok, stage)
 
@@ -176,3 +181,35 @@ class CadenceTests(unittest.TestCase):
         # 第 1 次冷档，被敲醒后第 2、3 次热档
         self.assertEqual(240, waits[0])
         self.assertEqual(8, waits[1])
+
+
+class KeepAliveTests(unittest.TestCase):
+    """空闲时用续期接口保活（不空打 search），并踹醒客户端计时器点掉「还在吗」。"""
+
+    def fc(self):
+        return placer(store="R581", stores=["R581"], place_order=False,
+                      stk_timeout_ms=50)
+
+    def test_idle_extends_the_session_instead_of_searching(self):
+        # 冷档：step1 之后每轮打的是 extendSession，不是 search
+        page = FakePage([FUL] + [{"status": 200, "json": {}}] * 5)
+        fc = self.fc()
+        n = [0]
+        def stop():
+            n[0] += 1
+            return n[0] > 2
+        fc.camp(page, cadence=0, idle_cadence=0, max_seconds=1e9,
+                stop=stop, clock=lambda: 1000.0, sleep=lambda *_: None)
+        # 打出去的请求里有 extendSession，没有 search
+        actions = [c["query"] for c in page.calls]
+        self.assertTrue(any("extendSessionUrl" in q for q in actions), actions)
+        self.assertFalse(any("search" in q for q in actions), actions)
+
+    def test_keep_awake_clicks_the_dialog(self):
+        # keep_awake 返回点了什么就记一行；FakePage.evaluate(单参) 返回非空即视为点到
+        page = FakePage([])
+        fc = self.fc()
+        logs = []
+        fc.log = lambda *a: logs.append(" ".join(str(x) for x in a))
+        fc.keep_awake(page)
+        self.assertTrue(any("会话对话框" in x for x in logs))

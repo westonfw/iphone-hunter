@@ -809,6 +809,81 @@ class FastCheckout:
 
     # ---------- 底层 ----------
 
+    #: 结账页的会话续期接口（模型里 checkout.session.extendSessionUrl）。
+    #: 就是「还在吗」对话框上「我还在/继续」按钮点的那个——空闲蹲守时拿它保活，
+    #: 比每 8 秒空打一发 10 秒的 search 便宜得多，也不那么容易触发 checkoutx 的 541。
+    EXTEND_PATH = "/shop/checkoutx/session"
+    EXTEND_ACTION = "extendSessionUrl"
+    EXTEND_MODULE = "checkout.session"
+
+    #: 把客户端那个「5 分钟没交互就作废」的计时器踹醒，并点掉「还在吗」对话框。
+    #:
+    #: 关键：我们的 search / extend 都是后台 fetch，重置的是**服务端**的
+    #: interactionMs；而「还在吗」是页面 JS 的**客户端**倒计时，它只认真实的
+    #: 用户活动事件（mousemove / keydown / click），fetch 它不认。不管它，倒计时
+    #: 到 0 会把页面 goto 到 /shop/sorry/session_expired，会话就废了。
+    #: 所以这里派发几个合成活动事件重置客户端计时器，顺手把对话框的「继续」按钮
+    #: 点掉。返回点了什么，供日志排查真实选择器。
+    JS_KEEP_AWAKE = r"""
+    () => {
+        // 1) 合成用户活动，重置任何按「idle 事件」计时的客户端计时器
+        try {
+            const now = Date.now();
+            for (const type of ["mousemove", "keydown", "pointermove", "scroll"]) {
+                const ev = type === "keydown"
+                    ? new KeyboardEvent(type, {bubbles: true, key: "Shift"})
+                    : new Event(type, {bubbles: true});
+                document.dispatchEvent(ev);
+                window.dispatchEvent(ev);
+            }
+        } catch (e) {}
+        // 2) 找「还在吗 / 会话即将过期」对话框里的「继续 / 我还在」按钮点掉
+        const words = ["继续", "我还在", "还在", "保持", "Continue", "Keep", "Stay",
+                       "extend", "继续购物", "返回"];
+        const cands = [...document.querySelectorAll(
+            'button, a, [role=button], [data-autom]')];
+        for (const el of cands) {
+            const t = (el.innerText || el.textContent || "").trim();
+            const am = (el.getAttribute && (el.getAttribute("data-autom") || "")) || "";
+            if (!t && !am) continue;
+            const hay = (t + " " + am).toLowerCase();
+            if (words.some(w => hay.includes(w.toLowerCase()))) {
+                // 只点看得见的，别误点隐藏的
+                const box = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                if (box && box.width > 0 && box.height > 0) {
+                    try { el.click(); return "clicked:" + (t || am).slice(0, 30); }
+                    catch (e) {}
+                }
+            }
+        }
+        return "";
+    }
+    """
+
+    def extend_session(self, page) -> bool:
+        """打一发会话续期，保活。成功返回 True；被拦/过期交给调用方处理。"""
+        query = encode([("_a", self.EXTEND_ACTION), ("_m", self.EXTEND_MODULE)])
+        r = page.evaluate(JS_POST, [self.EXTEND_PATH, query, "", self.stk,
+                                    new_call_id(), "checkoutPage"]) or {}
+        status = r.get("status")
+        if status in BLOCK_CODES:
+            from .apple import parse_retry_after
+            self.retry_after = parse_retry_after(r.get("retry_after"))
+            raise Blocked(f"{self.EXTEND_ACTION} 被拦（{status}）")
+        dest = str((((r.get("json") or {}).get("head") or {}).get("data") or {}).get("url") or "")
+        if EXPIRED_URL in dest or "/shop/sorry/" in dest:
+            raise SessionExpired(f"续期时被指向超时页（{dest}）——会话已作废")
+        return status == 200
+
+    def keep_awake(self, page) -> None:
+        """踹醒客户端计时器 + 点掉「还在吗」对话框。失败不致命，下一轮再来。"""
+        try:
+            what = page.evaluate(self.JS_KEEP_AWAKE) or ""
+        except Exception:
+            return
+        if what:
+            self.log(f"[蹲守] 点掉了会话对话框（{what}）")
+
     def _post(self, page, path: str, action: str, module: str,
               fields: list[tuple[str, str]], model_page: str = "") -> dict:
         t0 = time.monotonic()
@@ -1195,7 +1270,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 240.0, hot_seconds: float = 60.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 60.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1207,7 +1282,7 @@ class FastCheckout:
         **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
         也是白打（今天的失败全是「主程序看到、search 没跟上」，没有反过来的），
         而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
-          * 主程序安静时 → **冷档**：`idle_cadence`（默认 240s，只为续会话，
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 180s，只为续会话，
             低于 interactionMs 那 5 分钟的作废线）。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 60s）再没有新信号就回冷档。
@@ -1256,18 +1331,33 @@ class FastCheckout:
                     return False, "rebuild", (
                         f"蹲了 {clock() - t0:.0f}s（打了 {shots} 发 search），"
                         f"到重建点，换个新会话接着蹲")
-                # 打一发 search
+
+                # 每一轮先把「还在吗」对话框点掉、踹醒客户端计时器——不然它倒计时
+                # 到 0 会把页面跳去超时页，会话就废了（我们的后台 fetch 重置不了
+                # 那个客户端计时器，见 keep_awake）。
+                self.keep_awake(page)
+
+                hot = clock() < hot_until
                 try:
-                    data = self.step2_store(page)
-                    shots += 1
+                    if hot:
+                        # 热档：主程序报了货，打一发真 search 探结账侧库存。
+                        data = self.step2_store(page)
+                        shots += 1
+                        if self.arm_from_search(page, data):
+                            self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
+                                     f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
+                            return self._place_from_armed(page, t0)
+                    else:
+                        # 冷档：主程序安静，search 打了也白打（它没看到货，结账侧
+                        # 更不会有）。只用便宜的续期接口保活——这就是「我还在」。
+                        self.extend_session(page)
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
-                    # checkoutx 被 541：别硬撞，退避久一点再蹲；节奏没控好会越撞越深。
                     self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
                     back = max(cadence * 3, self.retry_after)
-                    self.log(f"[蹲守] search 被拦（{e}），退避 {back:.0f}s——"
-                             f"节奏太密会被 Akamai 盯上，见 README 坑 9")
+                    self.log(f"[蹲守] {'search' if hot else '续期'}被拦（{e}），"
+                             f"退避 {back:.0f}s——节奏太密会被 Akamai 盯上，见 README 坑 9")
                     _, woke = self._nap(wake, back, stop, clock, sleep)
                     if stop():
                         return False, "已停止", "退避中收到停止信号"
@@ -1276,21 +1366,14 @@ class FastCheckout:
                     continue
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），当没货接着蹲")
-                    data = None
 
-                if data is not None and self.arm_from_search(page, data):
-                    self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
-                             f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
-                    return self._place_from_armed(page, t0)
-
-                # 没命中：节奏跟主程序——热档密打、冷档只续会话。谁先到走谁：
-                # 到点了 / 放货信号把 wake 敲醒。
+                # 节奏跟主程序：热档密打、冷档只续会话（间隔要 < 5 分钟作废线）。
                 wait = cadence if clock() < hot_until else idle_cadence
                 stopped, woke = self._nap(wake, wait, stop, clock, sleep)
                 if stopped:
                     return False, "已停止", "等待中收到停止信号"
                 if woke:
-                    # 主程序报货了：进热档，接下来 hot_seconds 内密打。
+                    # 主程序报货了：进热档，接下来 hot_seconds 内密打 search。
                     hot_until = clock() + hot_seconds
         except KeyboardInterrupt:
             if self.submitted:

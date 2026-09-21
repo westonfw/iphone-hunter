@@ -23,7 +23,7 @@ from .autobuy import BuyResult
 class CampWorker:
     def __init__(self, buyer, report, *, url: str,
                  in_stock_numbers=None, cadence: float = 8.0,
-                 idle_cadence: float = 240.0, hot_seconds: float = 60.0,
+                 idle_cadence: float = 180.0, hot_seconds: float = 60.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
         self.buyer = buyer          # AutoBuy

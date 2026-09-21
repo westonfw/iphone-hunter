@@ -88,7 +88,7 @@
     "camp": {
       "enabled": false,
       "cadence": 8,
-      "idle_cadence": 240,
+      "idle_cadence": 180,
       "hot_seconds": 60,
       "session_seconds": 1080
     },
