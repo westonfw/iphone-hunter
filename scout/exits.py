@@ -40,6 +40,9 @@ class Exit:
     #: 越过去就是拿着冲刺顶限流打，而那正是 541 续期的原因。
     floor_at: float = 0.0
     permanent: bool = False
+    #: 从 config 里配的代理出口。跟直连一样永不过期，跟买手借来的口不同：
+    #: 它不靠报到维持，也不会被报到顶掉。
+    configured: bool = False
     used: int = 0
 
     @property
@@ -60,6 +63,47 @@ class Exit:
         return br.left() if br else 0.0
 
 
+def configured_exits(raw, log=print) -> list[tuple[str, str]]:
+    """把 `link.exits` 解析成 [(id, 代理地址)]。
+
+    两种写法都认：
+
+        "exits": ["http://user:pass@1.2.3.4:8080", "socks5://5.6.7.8:1080"]
+        "exits": [{"id": "hk", "proxy": "http://1.2.3.4:8080"}]
+
+    没写 scheme 的按 http 代理处理；没给 id 的按顺序叫 proxy1、proxy2……
+    `direct` 是内置直连的名字，配了就跳过并说出来——顶掉它主程序会没有兜底。
+    坏条目一律跳过、不炸：一条配错不该让主程序起不来，别的出口还要干活。
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for n, item in enumerate(raw or (), start=1):
+        if isinstance(item, str):
+            who, proxy = "", item
+        elif isinstance(item, dict):
+            who = str(item.get("id") or item.get("name") or "").strip()
+            proxy = str(item.get("proxy") or item.get("url") or "")
+        else:
+            log(f"[出口] link.exits 第 {n} 条看不懂（{type(item).__name__}），跳过")
+            continue
+        proxy = proxy.strip()
+        if not proxy:
+            log(f"[出口] link.exits 第 {n} 条没有代理地址，跳过")
+            continue
+        if "://" not in proxy:
+            proxy = "http://" + proxy
+        who = who or f"proxy{n}"
+        if who == "direct":
+            log("[出口] link.exits 里的出口不能叫 direct，那是内置直连的名字，跳过")
+            continue
+        if who in seen:
+            log(f"[出口] link.exits 里 {who} 重复了，只留第一条")
+            continue
+        seen.add(who)
+        out.append((who, proxy))
+    return out
+
+
 class ExitPool:
     """主程序的所有出口。线程安全——注册来自总线线程，取用来自巡检线程。"""
 
@@ -72,11 +116,29 @@ class ExitPool:
         #: 标了同出口的子程序。它们永远进不了 _exits，所以不能拿「在不在池子里」
         #: 当「说过没说过」——那样每 20 秒一次报到就刷一行，一天四千多行。
         self._same: set[str] = set()
+        #: 因为 use_buyer_exits=false 而被谢绝过的子程序。同样只说一次。
+        self._declined: set[str] = set()
         self._turn = 0
+        link = dict(cfg.get("link") or {})
+        #: 要不要借买手的转发口。配了自己的代理池、或者买手跟主程序同一个
+        #: 网关时可以关掉——关掉之后买手照样报到、照样收信号，只是不当出口。
+        self.borrow = bool(link.get("use_buyer_exits", True))
         # 直连永远在池子里：就算一个子程序都没上线，主程序也得能干活
         d = self._make("direct", None, self.clock())
         d.permanent = True
         self._exits["direct"] = d
+        # 配置里的代理出口：主程序自己的口，不依赖任何买手在不在线。
+        # 每条各有各的会话、熔断、节奏，跟借来的口一视同仁。
+        self._configured: set[str] = set()
+        for who, proxy in configured_exits(link.get("exits"), log=self.log):
+            e = self._make(who, proxy, self.clock())
+            e.permanent = e.configured = True
+            self._exits[who] = e
+            self._configured.add(who)
+        if self._configured:
+            self._rebalance()
+            self.log(f"[出口] 配置了 {len(self._configured)} 条代理出口："
+                     f"{'、'.join(sorted(self._configured))}")
 
     def _make(self, who: str, proxy: str | None, now: float) -> Exit:
         pacer = build_pacer(self.cfg, sprint=self.sprint, log=lambda *a: None)
@@ -167,6 +229,16 @@ class ExitPool:
             # 可能一条出口都不剩，主程序整个停摆。
             self.log("[出口] 拒绝：link.id 不能叫 direct，那是内置直连的名字，"
                      "顶掉它会把主程序自己的出口也弄丢")
+            return
+        if who in self._configured:
+            self.log(f"[出口] 拒绝：{who} 是 link.exits 里配好的代理出口的名字，"
+                     f"子程序另起一个 link.id")
+            return
+        if not self.borrow:
+            if who not in self._declined:
+                self._declined.add(who)
+                self.log(f"[出口] {who} 报到，但 link.use_buyer_exits=false，"
+                         f"不借它的口（信号照收）")
             return
         with self._lock:
             if direct:
@@ -302,8 +374,8 @@ class ExitPool:
 
     def describe(self) -> str:
         with self._lock:
-            bits = [f"{e.id}{'(直连)' if e.direct else ''}×{e.used}"
-                    for e in self._exits.values()]
+            bits = [f"{e.id}{'(直连)' if e.direct else '(代理)' if e.configured else ''}"
+                    f"×{e.used}" for e in self._exits.values()]
         return "、".join(bits) or "（空）"
 
     def close(self) -> None:

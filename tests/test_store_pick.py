@@ -390,8 +390,8 @@ class FastAddFetchTests(unittest.TestCase):
         with patch('hunter.fastpath.atb_add_fetch') as fetch, \
              patch('hunter.fastpath.prepare_bag',
                    return_value={'ok': True, 'kept': True, 'state': {'x': 1}}):
-            ok, st = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
-        self.assertTrue(ok)
+            ok, st, known = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
+        self.assertTrue(ok and known)
         fetch.assert_called_once()
         page.goto.assert_not_called()
 
@@ -401,7 +401,7 @@ class FastAddFetchTests(unittest.TestCase):
         with patch('hunter.fastpath.atb_add_fetch', side_effect=RuntimeError('boom')), \
              patch('hunter.fastpath.prepare_bag',
                    return_value={'ok': True, 'kept': True, 'state': None}):
-            ok, _ = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
+            ok, _, _ = ab._fast_add(page, 'https://x/p', 'MJ/A', 'tok')
         self.assertTrue(ok)
         page.goto.assert_called_once()
 
@@ -411,6 +411,7 @@ class FastAddFetchTests(unittest.TestCase):
         with patch('hunter.fastpath.atb_add_fetch'), \
              patch('hunter.fastpath.prepare_bag',
                    return_value={'ok': True, 'kept': False}):
-            ok, st = ab._fast_add(Mock(), 'https://x/p', 'MJ/A', 'tok')
+            ok, st, known = ab._fast_add(Mock(), 'https://x/p', 'MJ/A', 'tok')
         self.assertFalse(ok)
+        self.assertTrue(known)
         self.assertIsNone(st)

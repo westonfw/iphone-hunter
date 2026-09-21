@@ -557,3 +557,78 @@ class AllBlockedTests(unittest.TestCase):
         p = self.pool()
         self.block(p, 'direct', 90.0); self.block(p, 'b', 30.0)
         self.assertEqual(30.0, p.all_blocked(self.PATH))
+
+
+class ConfiguredExitTests(PoolTests):
+    """config 里直接配的代理出口：不经过任何买手，永不过期。"""
+
+    def cfg(self, **link):
+        return dict(CFG, link=link)
+
+    def cpool(self, **link):
+        self.now = [1000.0]
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            return ExitPool(self.cfg(**link), log=lambda *a: None,
+                            clock=lambda: self.now[0])
+
+    def test_configured_proxies_are_there_from_the_start(self):
+        p = self.cpool(exits=['http://u:p@1.2.3.4:8080', 'socks5://5.6.7.8:1080'])
+        self.assertEqual(3, len(p))
+        self.assertEqual('http://u:p@1.2.3.4:8080', p._exits['proxy1'].proxy)
+        self.assertEqual('socks5://5.6.7.8:1080', p._exits['proxy2'].proxy)
+        self.assertTrue(p._exits['proxy1'].configured)
+
+    def test_dict_form_names_the_exit(self):
+        p = self.cpool(exits=[{'id': 'hk', 'proxy': '1.2.3.4:8080'}])
+        self.assertIn('hk', p._exits)
+        # 没写 scheme 按 http 代理
+        self.assertEqual('http://1.2.3.4:8080', p._exits['hk'].proxy)
+
+    def test_bad_entries_are_skipped_not_fatal(self):
+        said = []
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            p = ExitPool(self.cfg(exits=['', 42, {'id': 'direct', 'proxy': 'http://x:1'},
+                                        'http://ok:1', {'id': 'dup', 'proxy': 'http://a:1'},
+                                        {'id': 'dup', 'proxy': 'http://b:1'}]),
+                         log=said.append, clock=lambda: 1000.0)
+        self.assertEqual({'direct', 'proxy4', 'dup'}, set(p._exits))
+        self.assertEqual('http://a:1', p._exits['dup'].proxy)
+        self.assertTrue(any('direct' in x for x in said))
+
+    def test_configured_exits_never_go_stale(self):
+        p = self.cpool(exits=['http://1.2.3.4:8080'])
+        self.add(p, 'b')
+        self.now[0] += 10_000
+        p.prune()
+        self.assertEqual({'direct', 'proxy1'}, set(p._exits))
+
+    def test_configured_exits_rotate_like_any_other(self):
+        p = self.cpool(exits=['http://1.2.3.4:8080'])
+        self.ready_now(p)
+        picked = set()
+        for _ in range(2):
+            e = p.pick(PATH)
+            picked.add(e.id)
+            e.due_at = self.now[0] + 100
+        self.assertEqual({'direct', 'proxy1'}, picked)
+
+    def test_a_child_cannot_take_a_configured_name(self):
+        p = self.cpool(exits=[{'id': 'hk', 'proxy': 'http://1.2.3.4:8080'}])
+        self.add(p, 'hk', ip='10.0.0.9')
+        self.assertEqual('http://1.2.3.4:8080', p._exits['hk'].proxy)
+        self.assertEqual(2, len(p))
+
+    def test_not_borrowing_keeps_children_out(self):
+        said = []
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            p = ExitPool(self.cfg(exits=['http://1.2.3.4:8080'], use_buyer_exits=False),
+                         log=said.append, clock=lambda: 1000.0)
+        self.add(p, 'b')
+        self.add(p, 'b')
+        self.assertEqual({'direct', 'proxy1'}, set(p._exits))
+        self.assertEqual(1, sum('use_buyer_exits' in x for x in said))
+
+    def test_describe_marks_them(self):
+        p = self.cpool(exits=['http://1.2.3.4:8080'])
+        self.assertIn('proxy1(代理)', p.describe())
+        self.assertIn('direct(直连)', p.describe())

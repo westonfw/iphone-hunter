@@ -512,6 +512,39 @@ class AutoBuy:
         self.bagged_part = ""
         return f"购物袋已清空（{r.get('removed', 0)} 件）" if r.get("removed") else "购物袋本来就是空的"
 
+    def _warm_add_via_page(self, page, buy_url: str, part: str) -> str:
+        """接口加购没进袋时的兜底：走产品页真点一次加购。返回空串=进袋了。
+
+        为什么值得这一趟 700KB：预热的全部意义是**提前把结账墙撞掉**，而进结账
+        必须袋里有货。接口加购靠的 as_atb 是一次性的，清袋后 cookie 里那个用过的
+        token 会让下一轮的 GET 静默失败——2026-09-20 机器 B 每轮预热都卡在这里，
+        于是每次真放货都得当场登录。产品页这条路必到袋（不折抵/不 AppleCare
+        选好再点加购），顺带让页面重新种一个新鲜的 as_atb，接口加购下轮又能用。
+        """
+        from .fastpath import prepare_bag, wait_for_bag_count
+        try:
+            page.goto(buy_url, timeout=self.timeout * 2, wait_until='domcontentloaded')
+        except Exception as e:
+            return f'探路加购没进袋，退产品页也打不开（{type(e).__name__}）'
+        self._await_options(page)
+        self._pick(page, 'tradein', self.trade_in_text)
+        self._pick(page, 'applecare', self.applecare_text)
+        ok, why = self._wait_add_button(page)
+        if not ok:
+            return f'探路加购没进袋，产品页也点不了加购（{why}）'
+        try:
+            page.locator(SEL_ADD_TO_CART).first.click(timeout=self.timeout)
+        except Exception as e:
+            return f'探路加购没进袋，产品页点加购失败（{type(e).__name__}）'
+        wait_for_bag_count(page, cap_ms=2000)
+        st = prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
+                         log=self.log)
+        if st.get('kept'):
+            self.log('[预热] 接口加购没进袋，已退产品页点加购补进（顺带种回 as_atb）')
+            return ''
+        # 产品页都没能进袋：多半是掉登录，把结论留给随后的登录检查。
+        return f"探路加购没进袋（{st.get('reason') or '产品页加购后袋里仍没有它'}）"
+
     def warm_checkout_session(self, ctx, page, buy_url: str) -> str:
         """空闲期把结账那道登录墙撞掉，别让它出现在放货的关键路径上。
 
@@ -548,18 +581,34 @@ class AutoBuy:
             if not token:
                 return '读不到 atbtoken（加载过产品页仍没有），跳过结账预热'
             self.log('[预热] atbtoken 原来没有，已加载一次产品页把它种上')
-        try:
-            page.goto(atb_add_url(buy_url, part, token), timeout=self.timeout,
-                      wait_until='domcontentloaded')
-        except Exception as e:
-            return f'探路加购失败：{type(e).__name__}'
+        # **先看袋里有什么，再决定加不加。** 上一单失败会把目标型号留在袋里
+        # （同型号重试的快路要靠它），这时直接再加一台探路型号就成了两条——
+        # 接着 prepare_bag 把两条一起删掉、报「探路加购没进袋」，外层据此
+        # 误判登录态、白付一次 10~25s 的登录。2026-09-20 08:57、09:43、09:51
+        # 三行「删了 2 件」全是这个形状：不是重复加购，是遗留 + 探路。
+        # 袋里正好就是探路型号时连加都不用加，省一个 token；不是就先清掉。
+        # 读不到（页面还在 about:blank 上）就照旧走加购，复核那一步会兜住。
         st = prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
                          log=self.log)
+        if not (st.get('ok') and st.get('kept')):
+            try:
+                page.goto(atb_add_url(buy_url, part, token), timeout=self.timeout,
+                          wait_until='domcontentloaded')
+            except Exception as e:
+                return f'探路加购失败：{type(e).__name__}'
+            st = prepare_bag(page, want_part=part, want_origin=REGIONS[self.region],
+                             log=self.log)
         if not st.get('kept'):
-            # 别乱猜原因：2026-09-20 实测 5 次「没进袋」全都是**掉登录**，而这句
-            # 原来咬定「token 用过了」，紧跟着的回退探针又打「⚠️ 没登录」，两行
-            # 自相矛盾。真正的结论由那条探针给，这里只说没进袋。
-            return f"探路加购没进袋（{st.get('reason') or '原因见随后的登录检查'}）"
+            # **接口加购没进袋不能就此放弃——那正是每次结账都要登录的病根。**
+            # as_atb 是一次性的：上一轮预热用过、清了袋，cookie 里却还留着那个
+            # 用过的 token，这一轮拿它再发 GET 服务端 200 但袋子不动（日志里的
+            # 「token 多半已用过」）。于是预热没进结账、没撞墙，放货那一刻的
+            # fire 只能当场登录 8~31s。退回产品页老老实实点一次加购：既把探路
+            # 商品实打实放进袋，又让页面 JS 重新种一个新鲜的 as_atb——下一轮的
+            # 接口加购也跟着能用了。这一趟 700KB 花在空闲期，不占抢购时间。
+            note = self._warm_add_via_page(page, buy_url, part)
+            if note:
+                return note
         before = _pages(ctx)
         try:
             landed = self._enter_checkout(ctx, page, part)
@@ -986,7 +1035,14 @@ class AutoBuy:
                          f"（省下一次整页加载）")
             # 袋里没有：先试接口加购（一个 GET，实测 388ms）。不成再退产品页。
             if fast and not bagged_ok and token:
-                bagged_ok, fresh = self._fast_add(page, product_url, want_part, token)
+                bagged_ok, fresh, known = self._fast_add(page, product_url, want_part,
+                                                         token)
+                if not known:
+                    # 加购已经发出去、袋子却读不到：不能再点一次加购去赌，
+                    # 那正是「两台同型号」的来路。下一轮 prepare_bag 会重读真实状态。
+                    return BuyResult(False, "购物袋状态读不到，没敢再加", page.url,
+                                     "快加购已发出但复核不了袋子；再加一次可能变成两台。"
+                                     "本次停手，下一轮按真实购物袋重来。")
                 if bagged_ok:
                     self.bagged_part = want_part
                     # 复核刚读到的那份状态直接交给 bag_to_checkout，别再 fetch 一次
@@ -1478,7 +1534,8 @@ class AutoBuy:
         袋子纹丝不动。所以返回值一律以 prepare_bag 复核的结果为准，绝不看状态码。
         失败时调用方老实退回产品页那条路。
 
-        返回 (进袋了没有, 复核时读到的购物袋状态)。状态是给紧接着的
+        返回 (进袋了没有, 复核时读到的购物袋状态, 袋子读到了没有)。第三项为
+        False 时前两项没有意义——调用方必须停手，不能退回产品页再加。状态是给紧接着的
         bag_to_checkout 用的——它要的是同一份东西，递过去就少 fetch 一次。
         放货那一刻一次袋状态读要 2.5 秒，那是整趟 21 秒里的一大块。
         状态可能为 None（读法变了、或者固件没带），那时候它自己重读，只是慢一点。
@@ -1501,11 +1558,25 @@ class AutoBuy:
         # 复核：这一步不能省，加购失败没有任何显式信号
         st = prepare_bag(page, want_part=want_part,
                          want_origin=REGIONS[self.region], log=self.log)
-        ok = bool(st.get("ok") and st.get("kept"))
+        if not st.get("ok"):
+            # **读不到袋子 ≠ 没进袋。** 加购那个 GET 多半已经生效了，这时按
+            # 「没进袋」退回产品页再点一次加购，袋里就是两台同型号——进结账前
+            # 的数量校验会把这一单整个否掉。先再读一次；还读不到就交给调用方
+            # 停手，宁可这一轮不下，也不往袋里瞎加。
+            try:
+                page.wait_for_timeout(400)
+            except Exception:
+                pass
+            st = prepare_bag(page, want_part=want_part,
+                             want_origin=REGIONS[self.region], log=self.log)
+        known = bool(st.get("ok"))
+        ok = bool(known and st.get("kept"))
         el = (time.monotonic() - t0) * 1000
-        self.log(f"[自动下单] {'快加购成功' if ok else '⚠️ 快加购没进袋（原因见日志上一条）'}"
-                 f"（{el:.0f}ms，{how}，未加载产品页）")
-        return ok, (st.get("state") if ok else None)
+        what = ("快加购成功" if ok else
+                "⚠️ 快加购后读不到购物袋，不敢再加" if not known else
+                "⚠️ 快加购没进袋（原因见日志上一条）")
+        self.log(f"[自动下单] {what}（{el:.0f}ms，{how}，未加载产品页）")
+        return ok, (st.get("state") if ok else None), known
 
     def _await_options(self, page, cap_ms: int = 8000, step_ms: int = 100) -> float:
         """等产品页把必选项分区渲染出来。返回实际等了多少毫秒。

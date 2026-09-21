@@ -862,12 +862,24 @@ class CheckoutWarmupRegressions(unittest.TestCase):
 
     def test_it_adds_enters_checkout_and_clears_the_login_wall(self):
         ab, page = self.buyer(), self.page()
-        note = self.warm(ab, page, {'ok': True, 'kept': True},
-                         landed='https://secure7.www.apple.com.cn/shop/signIn')
+        # 先读一次袋子（空），再探路加购，加完复核
+        empty, kept = {'ok': True, 'kept': False, 'removed': 0}, {'ok': True, 'kept': True}
+        ab._enter_checkout.return_value = self.page(
+            'https://secure7.www.apple.com.cn/shop/signIn')
+        with patch('hunter.fastpath.prepare_bag', side_effect=[empty, kept]):
+            note = ab.warm_checkout_session(ab._ctx, page, self.URL)
         self.assertIn('撞掉', note)
         ab._sign_in.assert_called_once()
         self.assertTrue(any('add-to-cart=add-to-cart' in c.args[0]
                             for c in page.goto.call_args_list))
+
+    def test_a_probe_already_in_the_bag_is_not_added_again(self):
+        """上一单留在袋里的正好是探路型号：直接用，别叠成两条。"""
+        ab, page = self.buyer(), self.page()
+        note = self.warm(ab, page, {'ok': True, 'kept': True})
+        self.assertIn('本来就没墙', note)
+        self.assertFalse(any('add-to-cart=add-to-cart' in c.args[0]
+                             for c in page.goto.call_args_list))
 
     def test_no_wall_is_reported_as_already_ready(self):
         ab, page = self.buyer(), self.page()
@@ -1613,8 +1625,8 @@ class OneFetchLessRegressions(unittest.TestCase):
         page.goto.side_effect = lambda u, **kw: None
         with patch('hunter.fastpath.prepare_bag',
                    return_value={'ok': True, 'kept': True, 'state': dict(self.STATE)}):
-            ok, st = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
-        self.assertTrue(ok)
+            ok, st, known = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
+        self.assertTrue(ok and known)
         self.assertEqual(1, st['count'])
 
     def test_a_failed_fast_add_hands_back_nothing(self):
@@ -1622,8 +1634,9 @@ class OneFetchLessRegressions(unittest.TestCase):
         page = Mock()
         page.goto.side_effect = lambda u, **kw: None
         with patch('hunter.fastpath.prepare_bag', return_value={'ok': True, 'kept': False}):
-            ok, st = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
+            ok, st, known = ab._fast_add(page, self.URL, 'MJT84CH/A', 'tok')
         self.assertFalse(ok)
+        self.assertTrue(known)
         self.assertIsNone(st)
 
     def test_the_state_is_used_once_and_dropped(self):
@@ -1866,5 +1879,7 @@ class SoldOutVerdictRegressions(unittest.TestCase):
         with self.assertRaises(Stalled) as cm:
             fc.select_store(Mock())
         msg = str(cm.exception)
-        self.assertIn('不止一件', msg)
+        # 进结账前已经核过袋里只有 1 台，判词不能再往购物袋上赖
+        self.assertIn('不同步', msg)
+        self.assertNotIn('不止一件', msg)
         self.assertNotIn('已经没货了', msg)
