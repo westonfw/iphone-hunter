@@ -860,7 +860,7 @@ class FastCheckout:
                 'button, a, label, [role=tab], [role=radio], [role=button]')];
             for (const el of cands) {
                 const t = txt(el);
-                if (!(t.includes("到店取货") || t.includes("到店自取")) || !vis(el)) continue;
+                if (!(t.includes("我要取货") || t.includes("到店取货") || t.includes("到店自取")) || !vis(el)) continue;
                 // 已经选中就别再点
                 const sel = (el.getAttribute && el.getAttribute("aria-selected") === "true")
                           || (el.getAttribute && el.getAttribute("aria-checked") === "true")
