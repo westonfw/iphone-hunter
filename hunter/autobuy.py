@@ -1173,7 +1173,10 @@ class AutoBuy:
                 self.abort_when_gone and callable(self.stock_live)) else None,
             log=self.log,
         )
-        if self._gone(want_part, "进结账"):
+        # **守株待兔不做「没货就别进结账」预判。** camp 的全部意义就是提前进结账、
+        # 停在那儿蹲着等货——此刻监控报没货正是常态。这道 _gone 是给冷启动的
+        # 一次性尝试用的（明知没货就别白烧一趟六步），跟 camp 的目标正相反。
+        if self._camp is None and self._gone(want_part, "进结账"):
             return BuyResult(False, "货已经没了，没进结账", page.url,
                              "监控在这一刻已经报无货，再走结账只是白烧请求。")
         # 优先接口入口；仅在目标已核对、入口未建立时允许购物袋页面建立会话。

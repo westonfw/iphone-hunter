@@ -233,3 +233,48 @@ class AutoBuyOnlyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CampBypassesGoneTests(unittest.TestCase):
+    """守株待兔进结账前不做「监控没货就停手」的预判——它就是要进去蹲着等货。"""
+    URL = 'https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJYE4CH/A'
+    CHECKOUT = 'https://secure8.www.apple.com.cn/shop/checkout'
+
+    def setUp(self):
+        self.ab = AutoBuy({'pickup_store_numbers': ['R581'], 'abort_when_gone': True},
+                          Path('/tmp'), log=lambda *a: None)
+        # 监控此刻报「没货」——冷启动会据此停手，camp 必须无视它
+        self.ab.stock_live = lambda part=None: False
+        self.page = Mock()
+        self.page.url = self.URL
+        self.page.goto.side_effect = lambda url, **kw: setattr(self.page, 'url', url)
+        self.ab._settle = Mock()
+        for t in ('hunter.fastpath.prepare_bag', 'hunter.autobuy.watch_checkout_block'):
+            p = patch(t, return_value={'ok': True} if 'prepare' in t else {})
+            p.start(); self.addCleanup(p.stop)
+
+    def test_cold_start_aborts_when_monitor_says_gone(self):
+        # 对照：非 camp 模式，监控报没货 → 进结账前停手
+        with patch('hunter.fastpath.bag_to_checkout', return_value=self.CHECKOUT):
+            r = self.ab._drive(Mock(), self.page, self.URL, False)
+        self.assertFalse(r.ok)
+        self.assertIn('没进结账', r.stage)
+
+    def test_camp_enters_checkout_despite_gone(self):
+        # camp 模式：无视「没货」，一路进到结账、调 placer.camp
+        p = Mock(no_retry=False, retriable=True, fast_ordered=False, blocked=False,
+                 result_url='', secure_host='')
+        p.camp.return_value = (False, 'rebuild', '会话到期', '')
+        self.ab._camp = {'wake': None, 'stop': lambda: False,
+                         'cadence': 8, 'idle_cadence': 240, 'hot_seconds': 60,
+                         'max_seconds': 1080}
+        def entry(*a, **k):
+            self.page.url = self.CHECKOUT
+            return self.page
+        self.ab._enter_checkout = Mock(side_effect=entry)
+        with patch('hunter.fastpath.bag_to_checkout', return_value=self.CHECKOUT), \
+             patch('hunter.autobuy.OrderPlacer', return_value=p):
+            r = self.ab._drive(Mock(), self.page, self.URL, False)
+        p.camp.assert_called_once()           # 真的进了蹲守
+        p.place.assert_not_called()            # 没走冷启动的 place
+        self.assertTrue(r.rebuild)             # rebuild 透传给了 CampWorker
