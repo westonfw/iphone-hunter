@@ -17,8 +17,18 @@ scout 那边把它配成 `{"rotating": true}` 的出口，就能「只走这台�
 ## 前提：IP 得真的能用
 
 这 200 个 IP 必须**真配在网卡上、且回程能路由**。跨子网时把 `rp_filter` 设成 2 或 0，
-否则绑了源 IP 也会被内核丢包。先逐个验一遍（见 `ips.txt.example` 里的命令），
-把出 `000` 的剔掉。建议用**国内 IP**：监控打的是金山云国内 CDN，延迟低、也更像真人。
+否则绑了源 IP 也会被内核丢包。建议用**国内 IP**：监控打的是金山云国内 CDN，
+延迟低、也更像真人。
+
+不用手工列 + 逐个 curl，直接用 `list-ips.py`：它枚举本机所有 global scope 的
+IPv4，**绑每个 IP 当源地址去连 apple.com.cn:443**，连得上才算真能出网（附加 IP
+常有「挂着但出不去」的，绑源一试就现原形），并发测、几秒测完，只留通过的：
+
+```bash
+python3 tools/list-ips.py               # 枚举 + 验证，能用的打到屏幕，坏的说明原因
+python3 tools/list-ips.py -o ips.txt    # 直接写进 ips.txt（只写通过的）
+python3 tools/list-ips.py --no-check    # 只枚举、不验证（全列出来）
+```
 
 ## 快速起
 

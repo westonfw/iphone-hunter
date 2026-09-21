@@ -1,13 +1,9 @@
 # 出站 IP 池：一行一个，只写确实挂在本机网卡、且能出网的公网 IP。
 # 井号后是注释。空行忽略。改好后存成 ips.txt（去掉 .example）。
 #
-# 先验一遍哪些能用：
-#   ip -4 addr show | awk '/inet /{print $2}' | cut -d/ -f1
-#   for ip in $(cat ips.txt); do
-#     code=$(curl --interface "$ip" -s -o /dev/null -m 8 -w '%{http_code}' https://www.apple.com.cn/)
-#     echo "$ip -> $code"
-#   done
-# 出 000 / 连不上的别放进来（脚本会内部跳过坏 IP，但一开始就剔掉更省事）。
+# 别手写：用同目录的 list-ips.py 自动枚举 + 验证，直接生成这个文件：
+#   python3 tools/list-ips.py -o ips.txt
+# 它绑每个本机 IP 连 apple.com.cn:443，只写真能出网的那些。
 
 203.0.113.11
 203.0.113.12
