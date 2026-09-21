@@ -1162,6 +1162,152 @@ class FastCheckout:
             return data
         return self._no_store_left(first, first_data, first_miss)
 
+    def _preferred_ready(self, data: dict) -> list[str]:
+        """这一发 search 里，落在配置边界内、结账侧说有货的门店，按偏好排。"""
+        ready = [sid for sid, ok, _ in self.store_availability(data) if ok]
+        pref = [x for x in self.stores if x in ready]
+        extra = [x for x in ready if x not in self.stores
+                 and (not self.allow or x in self.allow)]
+        return _dedupe(pref + extra)
+
+    def arm_from_search(self, page, data: dict) -> bool:
+        """看这一发 search 的结果，能上膛就上膛（返回 True）。绝不抛异常、绝不退。
+
+        守株待兔的核心判定，跟 select_store 的区别是**不主动重打 search**：
+          * 当前门店这一发就有时段 → 直接上膛（self.slot / store_used 都置好）。
+          * 当前门店没时段，但结账侧有别的首选门店有货 → 把 self.store 改成它，
+            返回 False；下一发 search 会选它，多蹲一轮就能上膛。
+          * 一家有货的都没有 → 返回 False，接着蹲。
+
+        分出来是为了让蹲守循环能「打一发、看一眼、不行就等下一次触发」，而不是
+        像冷启动那样一口气把所有候选门店的 search 都打完（那是十几秒 × N）。
+        """
+        try:
+            self.take_slot(data)
+            self.store_used = self.store
+            return True
+        except Stalled:
+            pass
+        cand = [x for x in self._preferred_ready(data) if x != self.store]
+        if cand:
+            # 下一发 search 改选这家有货的；不在这里立刻重打，交给蹲守节奏决定。
+            self.store = cand[0]
+        return False
+
+    def camp(self, page, *, wake=None, stop=None, cadence: float = 10.0,
+             max_seconds: float = 1080.0, clock=time.monotonic,
+             sleep=None) -> tuple[bool, str, str]:
+        """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
+
+        这是对付「结账链条比放货窗口长」的正解——把链条砍到只剩 search 一步：
+        提前上膛到 Fulfillment-init，放货时不再付「加购→进结账→step1」那 6~7 秒，
+        而是**贴着窗口连续查**，总有一发 search 的读库存时刻落进窗口。
+
+        参数
+        ----
+        wake : 有 `.wait(timeout)` / `.is_set()` / `.clear()` 的对象（threading.Event）。
+               放货信号一来就 set()，让下一发 search 立刻打，不必等满 cadence。
+        stop : callable() -> bool。要收工就返回 True（进程要关、买够了）。
+        cadence : 空闲时两发 search 的最小间隔（秒）。**像人一样**，别打成 541——
+                  checkoutx 是会返 541 的那族端点，1~2 秒一发几分钟就被盯上。
+        max_seconds : 这个会话最多蹲多久。必须 < 20 分钟的 TTL（默认 18 分钟）。
+                      到点返回 stage='rebuild'，让调用方重建会话再蹲。
+
+        返回 (ok, stage, detail)。stage 里这几个是给调用方看的信号：
+          'rebuild'  —— 蹲够了或会话过期，重建后接着蹲。
+          其余同 _run（成功/驳回/结果不明/限流/…）。
+        """
+        stop = stop or (lambda: False)
+        sleep = sleep or time.sleep
+        t0 = clock()
+        deadline = t0 + max(1.0, float(max_seconds))
+        try:
+            self.bring = page.bring_to_front
+        except Exception:
+            pass
+        self.stk = self.wait_for_stk(page)
+        if not self.stk:
+            return False, "⚠️ 读不到 x-aos-stk", "不在结账页上，或页面还没加载完。"
+        try:
+            self.step1_pickup(page)   # 上膛：停在这里，后面只反复打 search
+        except SessionExpired:
+            return False, "rebuild", "会话过期，重建"
+        except (Stalled, Blocked) as e:
+            return False, "⚠️ 上膛失败", f"{e}"
+
+        shots = 0
+        try:
+            while True:
+                if stop():
+                    return False, "已停止", "收到停止信号，退出蹲守"
+                if clock() >= deadline:
+                    return False, "rebuild", (
+                        f"蹲了 {clock() - t0:.0f}s（打了 {shots} 发 search），"
+                        f"到重建点，换个新会话接着蹲")
+                # 打一发 search
+                try:
+                    data = self.step2_store(page)
+                    shots += 1
+                except SessionExpired:
+                    return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
+                except Blocked as e:
+                    # checkoutx 被 541：别硬撞，退避久一点再蹲；节奏没控好会越撞越深。
+                    self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
+                    back = max(cadence * 3, self.retry_after)
+                    self.log(f"[蹲守] search 被拦（{e}），退避 {back:.0f}s——"
+                             f"节奏太密会被 Akamai 盯上，见 README 坑 9")
+                    if self._nap(wake, back, stop, clock, sleep):
+                        return False, "已停止", "退避中收到停止信号"
+                    continue
+                except Stalled as e:
+                    self.log(f"[蹲守] 这一发没推进（{e}），当没货接着蹲")
+                    data = None
+
+                if data is not None and self.arm_from_search(page, data):
+                    self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
+                             f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
+                    return self._place_from_armed(page, t0)
+
+                # 没命中：等到 cadence 到点，或放货信号把 wake 敲醒，谁先到走谁
+                if self._nap(wake, cadence, stop, clock, sleep):
+                    return False, "已停止", "等待中收到停止信号"
+        except KeyboardInterrupt:
+            if self.submitted:
+                self.log("[蹲守] ⚠️ 中断时下单那一发已送出，订单可能已创建，去订单页确认")
+            raise
+        except SessionExpired:
+            return False, "rebuild", "会话过期，重建"
+        except Blocked as e:
+            self.failure_kind = "blocked"
+            return False, "⚠️ 结账被限流", f"{e}。别硬撞，见 README 坑 9。"
+        except Stalled as e:
+            self.failure_kind = "stalled"
+            return False, "⚠️ 步骤没生效", f"{e}"
+        except Exception as e:
+            self.failure_kind = "error"
+            return False, f"⚠️ {type(e).__name__}", f"{e}"
+
+    def _nap(self, wake, seconds: float, stop, clock, sleep) -> bool:
+        """睡 seconds，但放货信号（wake）一来就提前醒。返回 True 表示要停了。
+
+        没有 wake 就退化成分片 sleep，好让 stop() 及时生效——不然一觉睡满
+        十几秒，进程要关都关不掉。
+        """
+        seconds = max(0.0, float(seconds))
+        if wake is not None:
+            try:
+                wake.wait(seconds)   # 被 set() 就立刻返回
+                wake.clear()
+            except Exception:
+                sleep(seconds)
+            return bool(stop())
+        end = clock() + seconds
+        while clock() < end:
+            if stop():
+                return True
+            sleep(min(0.25, end - clock()))
+        return bool(stop())
+
     def _search_worth_retry(self) -> bool:
         """再打一枪值不值：监控明说没货了就别打，其余（有货 / 问不出）都打。"""
         probe = self.still_live
@@ -1550,6 +1696,40 @@ class FastCheckout:
         try:
             self.step1_pickup(page)
             self.select_store(page)
+            return self._place_from_armed(page, t0)
+        except KeyboardInterrupt:
+            if self.submitted:
+                self.log("[快车道] ⚠️ 中断时「立即下单」那一发**已经送出去了**，"
+                         "订单可能已经创建：去 apple.com.cn/shop/order/list 或邮箱"
+                         "确认，别急着再下一单。")
+            raise
+        except SessionExpired as e:
+            self.failure_kind = "session_expired"
+            return False, "⚠️ 结账会话已过期", (
+                f"{e}。**在这条链路上重试没有意义**——要重新登录、"
+                f"从购物袋重新走一遍。（Apple 的结账会话 5 分钟没交互就作废。）")
+        except Stalled as e:
+            self.failure_kind = "stalled"
+            return False, "⚠️ 步骤没生效", (
+                f"{e}。已经改动过的服务端状态和页面可能不一致，"
+                f"本次尝试已停止，不再自动操作页面。")
+        except Blocked as e:
+            self.failure_kind = "blocked"
+            return False, "⚠️ 结账被限流", (
+                f"{e}。这是 Akamai 的拦截，不是页面问题——**别重试**，"
+                f"越撞退避越深。见 README 坑 9。")
+        except Exception as e:
+            self.failure_kind = "error"
+            return False, f"⚠️ {type(e).__name__}", f"{e}。本次尝试已停止。"
+
+    def _place_from_armed(self, page, t0) -> tuple[bool, str, str]:
+        """门店和取货时段已经选好（self.slot 已置）之后：走完 step3–6 + 下单。
+
+        从 `_run` 里抽出来，好让守株待兔（camp）命中一发 search、上膛之后
+        直接复用这条尾巴，不必把冷启动那套重写一遍。异常仍由调用方的
+        try/except 统一接（_run 和 camp 各自包一层）。
+        """
+        if True:
             contact = self.step3_to_contact(page)
             billing = self.step4_to_billing(page, contact)
 
@@ -1605,37 +1785,6 @@ class FastCheckout:
                     return True, "✅ 待付款订单已创建", (
                         f"跳转到 {final}。"
                         f"请尽快按订单页面显示的期限扫码支付——**本工具不代付款**。")
-        except KeyboardInterrupt:
-            # KeyboardInterrupt 是 BaseException，下面的 except Exception 接不住它——
-            # 而最该喊一嗓子的恰恰是这一刻。submitted 在发包**之前**就置位，为的
-            # 就是这种「请求已经离开本机、进程马上要死」的时候还能说清楚。
-            #
-            # 2026-09-18 23:50 实测：六步走完 4 秒后按了 Ctrl+C，那台机器每发要
-            # 8～10 秒，中断正落在「立即下单」那一发的途中。请求照样到了 Apple，
-            # 订单真的建好了，而日志里连「已提交」都没有——人以为没走到那步。
-            if self.submitted:
-                self.log("[快车道] ⚠️ 中断时「立即下单」那一发**已经送出去了**，"
-                         "订单可能已经创建：去 apple.com.cn/shop/order/list 或邮箱"
-                         "确认，别急着再下一单。")
-            raise
-        except SessionExpired as e:
-            self.failure_kind = "session_expired"
-            return False, "⚠️ 结账会话已过期", (
-                f"{e}。**在这条链路上重试没有意义**——要重新登录、"
-                f"从购物袋重新走一遍。（Apple 的结账会话 5 分钟没交互就作废。）")
-        except Stalled as e:
-            self.failure_kind = "stalled"
-            return False, "⚠️ 步骤没生效", (
-                f"{e}。已经改动过的服务端状态和页面可能不一致，"
-                f"本次尝试已停止，不再自动操作页面。")
-        except Blocked as e:
-            self.failure_kind = "blocked"
-            return False, "⚠️ 结账被限流", (
-                f"{e}。这是 Akamai 的拦截，不是页面问题——**别重试**，"
-                f"越撞退避越深。见 README 坑 9。")
-        except Exception as e:
-            self.failure_kind = "error"
-            return False, f"⚠️ {type(e).__name__}", f"{e}。本次尝试已停止。"
 
         total = time.monotonic() - t0
         detail = " / ".join(f"{a} {d * 1000:.0f}ms" for a, d in self.timings)
