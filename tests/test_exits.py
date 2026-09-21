@@ -684,6 +684,8 @@ class RotatingExitTests(PoolTests):
             return ExitPool(self.cfg(**link), log=lambda *a: None,
                             clock=lambda: self.now[0])
 
+    cpool = rpool
+
     def test_rotating_is_parsed_from_the_dict(self):
         p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
                                'rotating': True}])
@@ -729,6 +731,41 @@ class RotatingExitTests(PoolTests):
         br = Breaker(**ROTATING_BREAKER)
         br.trip(0.0)
         self.assertTrue(br.ready())
+
+    def test_done_renews_the_connection_each_round(self):
+        """每轮换一条新连接——不换的话 keep-alive 会把请求全钉在同一个 IP 上，
+        照样被 541（2026-09-21 实测：复用连接 421 次全 541）。"""
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        e.client.renew_session = Mock()
+        p.done(e, cost=1.0)
+        e.client.renew_session.assert_called_once()
+
+    def test_a_block_also_renews_the_connection(self):
+        """被 541 更要换 IP：不换的话下一发还钉在这个已经 541 的 IP 上。"""
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        e.client.renew_session = Mock()
+        p.blocked(e, retry_after=0.0)
+        e.client.renew_session.assert_called_once()
+
+    def test_a_plain_proxy_does_not_renew_each_round(self):
+        """单 IP 代理不该每轮换连接——它就一个 IP，换了也没用，白扔 keep-alive。"""
+        p = self.cpool(exits=['http://1.2.3.4:8080'])
+        e = p._exits['proxy1']
+        e.client.renew_session = Mock()
+        p.done(e, cost=1.0)
+        e.client.renew_session.assert_not_called()
+
+    def test_a_failed_renew_does_not_break_the_round(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        e.client.renew_session = Mock(side_effect=RuntimeError('boom'))
+        p.done(e, cost=1.0)   # 不抛
+        self.assertEqual(self.now[0], e.due_at)
 
     def test_describe_marks_multi_ip(self):
         p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',

@@ -338,6 +338,20 @@ class ExitPool:
             e.used += 1
             return e
 
+    def _renew(self, e: Exit) -> None:
+        """丢掉这条出口当前的连接，下一次请求会新开一条——对轮换代理就是换 IP。
+
+        调用方必须已持有 _lock。renew 失败不致命：大不了这一轮还复用旧连接，
+        下一轮再试，别让一次 renew 异常把整条巡检打断。
+        """
+        c = e.client
+        if c is None:
+            return
+        try:
+            c.renew_session()
+        except Exception as ex:
+            self.log(f"[出口] {e.id} 换连接失败（{type(ex).__name__}），下一轮再试")
+
     def done(self, e: Exit, cost: float = 1.0) -> None:
         """一条出口刚打完，记账 + 排下一次，顺便跟别人岔开。
 
@@ -349,6 +363,13 @@ class ExitPool:
             if e.rotating:
                 # 不做流控：请求回来立刻可以发下一个。代理中转本身有耗时，
                 # 单线程顺序发，天然就是节奏，不需要预算也不需要错峰。
+                #
+                # **每轮换一条新连接。** 轮换代理是「每个 CONNECT 换一个 IP」，
+                # 而 curl_cffi 的 Session 默认 keep-alive——不换连接的话，几百个
+                # 请求会全挤在第一条隧道、钉死同一个 IP，照样被 541（2026-09-21
+                # 实测：复用连接发 421 次全 541，而一次性 curl 每次新连接全 200）。
+                # renew_session 丢掉当前连接、默认不换身份，下一轮就走新隧道、新 IP。
+                self._renew(e)
                 e.due_at = self.clock()
                 return
             if e.pacer:
@@ -367,7 +388,9 @@ class ExitPool:
             # 轮换出口不做 AIMD。retry_after 直接用：pickup 的 541 通常没给
             # Retry-After（=0，立刻换个 IP 再发）；而代理自己挂了那种网络错误，
             # scout.poll 传的是 FAIL_COOLDOWN（30s），照它退避、别捶一个死代理。
+            # 被拦更要换连接：不换的话下一发还钉在这个已经 541 的 IP 上。
             with self._lock:
+                self._renew(e)
                 e.due_at = self.clock() + max(0.0, retry_after)
             return
         if e.pacer:
