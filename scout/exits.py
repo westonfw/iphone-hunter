@@ -43,6 +43,9 @@ class Exit:
     #: 从 config 里配的代理出口。跟直连一样永不过期，跟买手借来的口不同：
     #: 它不靠报到维持，也不会被报到顶掉。
     configured: bool = False
+    #: 代理背后是多个 IP、自己轮换。标了它就不做流控：请求回来立刻发下一个，
+    #: 541 不深退避（换 IP 就好）。见 ExitPool.done/blocked。
+    rotating: bool = False
     used: int = 0
 
     @property
@@ -63,26 +66,33 @@ class Exit:
         return br.left() if br else 0.0
 
 
-def configured_exits(raw, log=print) -> list[tuple[str, str]]:
-    """把 `link.exits` 解析成 [(id, 代理地址)]。
+def configured_exits(raw, log=print) -> list[tuple[str, str, bool]]:
+    """把 `link.exits` 解析成 [(id, 代理地址, 是否多IP轮换)]。
 
     两种写法都认：
 
         "exits": ["http://user:pass@1.2.3.4:8080", "socks5://5.6.7.8:1080"]
-        "exits": [{"id": "hk", "proxy": "http://1.2.3.4:8080"}]
+        "exits": [{"id": "pool", "proxy": "http://1.2.3.4:8080", "rotating": true}]
+
+    `rotating`（别名 `multi_ip`）标一条代理**背后是多个 IP、代理自己轮换**：
+    这时主程序对它**不做流控**——一个请求回来立刻发下一个（代理中转本身有
+    耗时，天然就是节奏），被 541 也不深退避（下一个请求就换了 IP）。只有代理
+    自己挂了/连不上才退避。默认 false，当成单 IP、照常限速和熔断。
 
     没写 scheme 的按 http 代理处理；没给 id 的按顺序叫 proxy1、proxy2……
     `direct` 是内置直连的名字，配了就跳过并说出来——顶掉它主程序会没有兜底。
     坏条目一律跳过、不炸：一条配错不该让主程序起不来，别的出口还要干活。
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, bool]] = []
     seen: set[str] = set()
     for n, item in enumerate(raw or (), start=1):
+        rotating = False
         if isinstance(item, str):
             who, proxy = "", item
         elif isinstance(item, dict):
             who = str(item.get("id") or item.get("name") or "").strip()
             proxy = str(item.get("proxy") or item.get("url") or "")
+            rotating = bool(item.get("rotating") or item.get("multi_ip"))
         else:
             log(f"[出口] link.exits 第 {n} 条看不懂（{type(item).__name__}），跳过")
             continue
@@ -100,8 +110,14 @@ def configured_exits(raw, log=print) -> list[tuple[str, str]]:
             log(f"[出口] link.exits 里 {who} 重复了，只留第一条")
             continue
         seen.add(who)
-        out.append((who, proxy))
+        out.append((who, proxy, rotating))
     return out
+
+
+#: 轮换代理的熔断配置：冷却 0 秒 = 被 541 不静默。一条 541 只是背后 200 个 IP
+#: 里的某一个被限了，下一个请求本就换了 IP，静默整条代理反而把好 IP 全废了。
+#: 代理自己挂了那种网络错误由 scout.poll 的 FAIL_COOLDOWN 单独管，不受这个影响。
+ROTATING_BREAKER = {"cooldowns": (0.0,), "heal_after": 1.0}
 
 
 class ExitPool:
@@ -140,8 +156,8 @@ class ExitPool:
         # 配置里的代理出口：主程序自己的口，不依赖任何买手在不在线。
         # 每条各有各的会话、熔断、节奏，跟借来的口一视同仁。
         self._configured: set[str] = set()
-        for who, proxy in configured_exits(link.get("exits"), log=self.log):
-            e = self._make(who, proxy, self.clock())
+        for who, proxy, rotating in configured_exits(link.get("exits"), log=self.log):
+            e = self._make(who, proxy, self.clock(), rotating=rotating)
             e.permanent = e.configured = True
             self._exits[who] = e
             self._configured.add(who)
@@ -160,7 +176,8 @@ class ExitPool:
                          "一条出口都没有，要等买手报到（use_buyer=true）后才开始刷。"
                          "买手都没上线的这段时间是全盲的。")
 
-    def _make(self, who: str, proxy: str | None, now: float) -> Exit:
+    def _make(self, who: str, proxy: str | None, now: float,
+              rotating: bool = False) -> Exit:
         pacer = build_pacer(self.cfg, sprint=self.sprint, log=lambda *a: None)
         # **绝不把 pacer.acquire 挂到 client.before_request 上。** 那个函数是同步
         # 睡眠：令牌不够时它会在请求里原地睡，而这个进程只有一个巡检线程——一条
@@ -168,8 +185,10 @@ class ExitPool:
         # 早就超过买手 90 秒的失联阈值了）。预算改由调度器兑现：每轮打完
         # `done(e, cost)` 把真实用量记账，`next_delay` 自然会把下一次推到
         # 预算允许的时刻，而等待发生在**挑出口之前**，不占着别人的位置。
-        return Exit(id=who, proxy=proxy, client=self._client(proxy),
-                    pacer=pacer, due_at=self._spread(now, pacer), seen_at=now)
+        # 轮换出口立刻就绪（due_at=now），不参与错峰——它本来就是能多快多快。
+        return Exit(id=who, proxy=proxy, client=self._client(proxy, rotating=rotating),
+                    pacer=pacer, rotating=rotating,
+                    due_at=now if rotating else self._spread(now, pacer), seen_at=now)
 
     def _period(self) -> float:
         """错峰用的周期：取**最快**那条出口的目标间隔。
@@ -226,12 +245,12 @@ class ExitPool:
             return want + keep
         return want
 
-    def _client(self, proxy: str | None) -> AppleClient:
+    def _client(self, proxy: str | None, rotating: bool = False) -> AppleClient:
         return AppleClient(
             region=self.cfg.get("region", "cn"),
             timeout=int(self.cfg.get("timeout", 15)),
             proxy=proxy,
-            breaker=breaker_settings(self.cfg),
+            breaker=dict(ROTATING_BREAKER) if rotating else breaker_settings(self.cfg),
         )
 
     # ---------- 注册 ----------
@@ -327,6 +346,11 @@ class ExitPool:
         不阻塞：等待体现为 due_at 往后推，不是在请求里原地睡。
         """
         with self._lock:
+            if e.rotating:
+                # 不做流控：请求回来立刻可以发下一个。代理中转本身有耗时，
+                # 单线程顺序发，天然就是节奏，不需要预算也不需要错峰。
+                e.due_at = self.clock()
+                return
             if e.pacer:
                 e.pacer.spend(max(0.0, cost))
                 delay = e.pacer.next_delay(max(1.0, cost))
@@ -339,6 +363,13 @@ class ExitPool:
 
         被拦之前发出去的那几个请求照样要记账——它们是真的打出去了。
         """
+        if e.rotating:
+            # 轮换出口不做 AIMD。retry_after 直接用：pickup 的 541 通常没给
+            # Retry-After（=0，立刻换个 IP 再发）；而代理自己挂了那种网络错误，
+            # scout.poll 传的是 FAIL_COOLDOWN（30s），照它退避、别捶一个死代理。
+            with self._lock:
+                e.due_at = self.clock() + max(0.0, retry_after)
+            return
         if e.pacer:
             e.pacer.on_blocked(retry_after)
         self.done(e, cost)
@@ -396,7 +427,8 @@ class ExitPool:
 
     def describe(self) -> str:
         with self._lock:
-            bits = [f"{e.id}{'(直连)' if e.direct else '(代理)' if e.configured else ''}"
+            bits = [f"{e.id}"
+                    f"{'(直连)' if e.direct else '(代理·多IP)' if e.rotating else '(代理)' if e.configured else ''}"
                     f"×{e.used}" for e in self._exits.values()]
         return "、".join(bits) or "（空）"
 

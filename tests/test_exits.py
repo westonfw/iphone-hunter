@@ -670,3 +670,67 @@ class ConfiguredExitTests(PoolTests):
         p = self.cpool(exits=['http://1.2.3.4:8080'])
         self.assertIn('proxy1(代理)', p.describe())
         self.assertIn('direct(直连)', p.describe())
+
+
+class RotatingExitTests(PoolTests):
+    """多 IP 轮换代理：不做流控，请求回来立刻发下一个；541 不深退避。"""
+
+    def cfg(self, **link):
+        return dict(CFG, link=link)
+
+    def rpool(self, **link):
+        self.now = [1000.0]
+        with patch('scout.exits.AppleClient', side_effect=lambda **k: self.client()):
+            return ExitPool(self.cfg(**link), log=lambda *a: None,
+                            clock=lambda: self.now[0])
+
+    def test_rotating_is_parsed_from_the_dict(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}])
+        self.assertTrue(p._exits['pool'].rotating)
+
+    def test_multi_ip_is_an_alias(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'multi_ip': True}])
+        self.assertTrue(p._exits['pool'].rotating)
+
+    def test_a_plain_proxy_is_not_rotating(self):
+        p = self.rpool(exits=['http://1.2.3.4:8080'])
+        self.assertFalse(p._exits['proxy1'].rotating)
+
+    def test_done_fires_the_next_request_immediately(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        self.now[0] = 2000.0
+        p.done(e, cost=1.0)
+        self.assertEqual(2000.0, e.due_at)   # 立刻可用，不推后
+
+    def test_a_541_retries_at_once_not_after_a_long_cooldown(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        self.now[0] = 2000.0
+        p.blocked(e, retry_after=0.0, cost=1.0)   # pickup 的 541 通常没 Retry-After
+        self.assertEqual(2000.0, e.due_at)
+
+    def test_a_dead_proxy_still_backs_off(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}], use_direct=False)
+        e = p._exits['pool']
+        self.now[0] = 2000.0
+        p.blocked(e, retry_after=30.0, cost=1.0)   # scout.poll 的 FAIL_COOLDOWN
+        self.assertEqual(2030.0, e.due_at)
+
+    def test_rotating_breaker_never_silences(self):
+        """轮换出口的熔断冷却为 0：被 541 也照样 ready，不会把整条代理停掉。"""
+        from scout.exits import ROTATING_BREAKER
+        from hunter.pacing import Breaker
+        br = Breaker(**ROTATING_BREAKER)
+        br.trip(0.0)
+        self.assertTrue(br.ready())
+
+    def test_describe_marks_multi_ip(self):
+        p = self.rpool(exits=[{'id': 'pool', 'proxy': 'http://1.2.3.4:8080',
+                               'rotating': True}])
+        self.assertIn('pool(代理·多IP)', p.describe())
