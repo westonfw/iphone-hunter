@@ -1194,7 +1194,8 @@ class FastCheckout:
             self.store = cand[0]
         return False
 
-    def camp(self, page, *, wake=None, stop=None, cadence: float = 10.0,
+    def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
+             idle_cadence: float = 240.0, hot_seconds: float = 60.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1203,24 +1204,25 @@ class FastCheckout:
         提前上膛到 Fulfillment-init，放货时不再付「加购→进结账→step1」那 6~7 秒，
         而是**贴着窗口连续查**，总有一发 search 的读库存时刻落进窗口。
 
-        参数
-        ----
-        wake : 有 `.wait(timeout)` / `.is_set()` / `.clear()` 的对象（threading.Event）。
-               放货信号一来就 set()，让下一发 search 立刻打，不必等满 cadence。
-        stop : callable() -> bool。要收工就返回 True（进程要关、买够了）。
-        cadence : 空闲时两发 search 的最小间隔（秒）。**像人一样**，别打成 541——
-                  checkoutx 是会返 541 的那族端点，1~2 秒一发几分钟就被盯上。
-        max_seconds : 这个会话最多蹲多久。必须 < 20 分钟的 TTL（默认 18 分钟）。
-                      到点返回 stage='rebuild'，让调用方重建会话再蹲。
+        **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
+        也是白打（今天的失败全是「主程序看到、search 没跟上」，没有反过来的），
+        而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 240s，只为续会话，
+            低于 interactionMs 那 5 分钟的作废线）。
+          * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
+            密打，持续 `hot_seconds`（默认 60s）再没有新信号就回冷档。
+        放货信号一来立刻插一发、并进热档，不必等满当前间隔。
 
-        返回 (ok, stage, detail)。stage 里这几个是给调用方看的信号：
-          'rebuild'  —— 蹲够了或会话过期，重建后接着蹲。
-          其余同 _run（成功/驳回/结果不明/限流/…）。
+        max_seconds：这个会话最多蹲多久，必须 < 20 分钟 TTL（默认 18 分钟）。
+        返回 (ok, stage, detail)；stage=='rebuild' 表示会话该重建，不是失败。
         """
         stop = stop or (lambda: False)
         sleep = sleep or time.sleep
         t0 = clock()
         deadline = t0 + max(1.0, float(max_seconds))
+        cadence = max(1.0, float(cadence))
+        idle_cadence = max(cadence, float(idle_cadence))
+        hot_seconds = max(0.0, float(hot_seconds))
         try:
             self.bring = page.bring_to_front
         except Exception:
@@ -1235,6 +1237,9 @@ class FastCheckout:
         except (Stalled, Blocked) as e:
             return False, "⚠️ 上膛失败", f"{e}"
 
+        # 进来时若主程序已经在报货（wake 已 set），直接进热档；否则冷档续会话。
+        hot_until = (clock() + hot_seconds
+                     if (wake is not None and wake.is_set()) else 0.0)
         shots = 0
         try:
             while True:
@@ -1256,8 +1261,11 @@ class FastCheckout:
                     back = max(cadence * 3, self.retry_after)
                     self.log(f"[蹲守] search 被拦（{e}），退避 {back:.0f}s——"
                              f"节奏太密会被 Akamai 盯上，见 README 坑 9")
-                    if self._nap(wake, back, stop, clock, sleep):
+                    _, woke = self._nap(wake, back, stop, clock, sleep)
+                    if stop():
                         return False, "已停止", "退避中收到停止信号"
+                    if woke:
+                        hot_until = clock() + hot_seconds
                     continue
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），当没货接着蹲")
@@ -1268,9 +1276,15 @@ class FastCheckout:
                              f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
                     return self._place_from_armed(page, t0)
 
-                # 没命中：等到 cadence 到点，或放货信号把 wake 敲醒，谁先到走谁
-                if self._nap(wake, cadence, stop, clock, sleep):
+                # 没命中：节奏跟主程序——热档密打、冷档只续会话。谁先到走谁：
+                # 到点了 / 放货信号把 wake 敲醒。
+                wait = cadence if clock() < hot_until else idle_cadence
+                stopped, woke = self._nap(wake, wait, stop, clock, sleep)
+                if stopped:
                     return False, "已停止", "等待中收到停止信号"
+                if woke:
+                    # 主程序报货了：进热档，接下来 hot_seconds 内密打。
+                    hot_until = clock() + hot_seconds
         except KeyboardInterrupt:
             if self.submitted:
                 self.log("[蹲守] ⚠️ 中断时下单那一发已送出，订单可能已创建，去订单页确认")
@@ -1287,26 +1301,28 @@ class FastCheckout:
             self.failure_kind = "error"
             return False, f"⚠️ {type(e).__name__}", f"{e}"
 
-    def _nap(self, wake, seconds: float, stop, clock, sleep) -> bool:
-        """睡 seconds，但放货信号（wake）一来就提前醒。返回 True 表示要停了。
+    def _nap(self, wake, seconds: float, stop, clock, sleep) -> tuple[bool, bool]:
+        """睡 seconds，但放货信号（wake）一来就提前醒。返回 (要不要停, 是不是被信号敲醒)。
 
+        「被信号敲醒」这一位让调用方切热档——主程序报货了，接下来该密打。
         没有 wake 就退化成分片 sleep，好让 stop() 及时生效——不然一觉睡满
-        十几秒，进程要关都关不掉。
+        几分钟，进程要关都关不掉。
         """
         seconds = max(0.0, float(seconds))
         if wake is not None:
+            woke = False
             try:
-                wake.wait(seconds)   # 被 set() 就立刻返回
+                woke = bool(wake.wait(seconds))   # 被 set() 返回 True，超时返回 False
                 wake.clear()
             except Exception:
                 sleep(seconds)
-            return bool(stop())
+            return bool(stop()), woke
         end = clock() + seconds
         while clock() < end:
             if stop():
-                return True
+                return True, False
             sleep(min(0.25, end - clock()))
-        return bool(stop())
+        return bool(stop()), False
 
     def _search_worth_retry(self) -> bool:
         """再打一枪值不值：监控明说没货了就别打，其余（有货 / 问不出）都打。"""

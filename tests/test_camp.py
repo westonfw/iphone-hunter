@@ -67,7 +67,7 @@ class CampLoopTests(unittest.TestCase):
         # step1 + 两发 MISS + 一发 HIT + step3~6
         page = FakePage([FUL, MISS, MISS, HIT, CONTACT, BANKS, MONTHS, REVIEW])
         fc = self.fc()
-        ok, stage, _ = fc.camp(page, cadence=0, max_seconds=100,
+        ok, stage, _ = fc.camp(page, cadence=0, idle_cadence=0, max_seconds=100,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertTrue(ok, stage)
         self.assertIn("Review", stage)
@@ -77,7 +77,7 @@ class CampLoopTests(unittest.TestCase):
         fc = self.fc()
         wake = threading.Event()
         wake.set()
-        ok, stage, _ = fc.camp(page, wake=wake, cadence=999, max_seconds=100,
+        ok, stage, _ = fc.camp(page, wake=wake, cadence=999, idle_cadence=999, hot_seconds=0, max_seconds=100,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertTrue(ok, stage)
 
@@ -89,7 +89,7 @@ class CampLoopTests(unittest.TestCase):
         def clock():
             t[0] += 5      # 每次问时间就前进 5s
             return t[0]
-        ok, stage, _ = fc.camp(page, cadence=0, max_seconds=20,
+        ok, stage, _ = fc.camp(page, cadence=0, idle_cadence=0, max_seconds=20,
                                clock=clock, sleep=lambda *_: None)
         self.assertFalse(ok)
         self.assertEqual("rebuild", stage)
@@ -101,7 +101,7 @@ class CampLoopTests(unittest.TestCase):
         def stop():
             calls[0] += 1
             return calls[0] > 3
-        ok, stage, _ = fc.camp(page, stop=stop, cadence=0, max_seconds=1e9,
+        ok, stage, _ = fc.camp(page, stop=stop, cadence=0, idle_cadence=0, max_seconds=1e9,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertFalse(ok)
         self.assertIn("停止", stage)
@@ -111,7 +111,7 @@ class CampLoopTests(unittest.TestCase):
                    "data": {"url": "https://www.apple.com.cn/shop/sorry/session_expired"}}}}
         page = FakePage([FUL, expired])
         fc = self.fc()
-        ok, stage, _ = fc.camp(page, cadence=0, max_seconds=100,
+        ok, stage, _ = fc.camp(page, cadence=0, idle_cadence=0, max_seconds=100,
                                clock=self._fake_clock(), sleep=lambda *_: None)
         self.assertFalse(ok)
         self.assertEqual("rebuild", stage)
@@ -127,3 +127,52 @@ class CampLoopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CadenceTests(unittest.TestCase):
+    """节奏跟主程序：安静时冷档（久），收到信号进热档（密）。"""
+
+    def fc(self):
+        return placer(store="R581", stores=["R581"], place_order=False,
+                      stk_timeout_ms=50)
+
+    def test_idle_uses_the_cold_cadence(self):
+        import threading
+        page = FakePage([FUL] + [MISS] * 5)
+        fc = self.fc()
+        waits = []
+        wake = threading.Event()
+        # 记录每次 nap 请求的间隔；第 3 发后停
+        n = [0]
+        def fake_nap(w, seconds, stop, clock, sleep):
+            waits.append(seconds)
+            n[0] += 1
+            return (n[0] >= 3, False)   # 第 3 次让它停
+        fc._nap = fake_nap
+        fc.camp(page, wake=wake, cadence=8, idle_cadence=240, hot_seconds=60,
+                max_seconds=1e9, clock=lambda: 1000.0, sleep=lambda *_: None)
+        # 没有信号 → 全是冷档 240
+        self.assertTrue(all(w == 240 for w in waits), waits)
+
+    def test_a_signal_switches_to_hot_cadence(self):
+        import threading
+        page = FakePage([FUL] + [MISS] * 5)
+        fc = self.fc()
+        waits = []
+        wake = threading.Event()
+        n = [0]
+        def fake_nap(w, seconds, stop, clock, sleep):
+            waits.append(seconds)
+            n[0] += 1
+            # 第 1 次 nap 返回「被信号敲醒」→ 之后应进热档
+            return (n[0] >= 3, n[0] == 1)
+        fc._nap = fake_nap
+        t = [1000.0]
+        def clock():
+            t[0] += 1
+            return t[0]
+        fc.camp(page, wake=wake, cadence=8, idle_cadence=240, hot_seconds=60,
+                max_seconds=1e9, clock=clock, sleep=lambda *_: None)
+        # 第 1 次冷档，被敲醒后第 2、3 次热档
+        self.assertEqual(240, waits[0])
+        self.assertEqual(8, waits[1])

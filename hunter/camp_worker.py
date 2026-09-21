@@ -22,15 +22,21 @@ from .autobuy import BuyResult
 
 class CampWorker:
     def __init__(self, buyer, report, *, url: str,
-                 in_stock_numbers=None, cadence: float = 10.0,
+                 in_stock_numbers=None, cadence: float = 8.0,
+                 idle_cadence: float = 240.0, hot_seconds: float = 60.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
         self.buyer = buyer          # AutoBuy
         self.report = report
         self.url = url
         self.in_stock_numbers = list(in_stock_numbers or [])
-        #: 空闲时两发 search 的最小间隔。像人一样，别打成 541。
+        #: 主程序报货后热档密打的间隔。像人一样，别打成 541。
         self.cadence = max(1.0, float(cadence))
+        #: 主程序安静时的冷档间隔——只为续会话（< interactionMs 的 5 分钟），
+        #: search 打了也白打（主程序没看到货，结账侧更不可能有）。
+        self.idle_cadence = max(self.cadence, float(idle_cadence))
+        #: 收到放货信号后热档持续多久，之后没有新信号就回冷档。
+        self.hot_seconds = max(0.0, float(hot_seconds))
         #: 一段会话最多蹲多久，必须 < 20 分钟 TTL。
         self.session_seconds = max(30.0, float(session_seconds))
         #: 一段结束到重新上膛之间的喘息，避免出错时空转打满 CPU。
@@ -84,14 +90,17 @@ class CampWorker:
 
     def _run(self):
         self.log(f"[蹲守] 开始守株待兔：{self.url}"
-                 f"（{self.cadence:.0f}s 一发续会话，{self.session_seconds / 60:.0f} 分钟重建）")
+                 f"（主程序报货时 {self.cadence:.0f}s 一发，安静时 {self.idle_cadence:.0f}s "
+                 f"续会话，{self.session_seconds / 60:.0f} 分钟重建）")
         try:
             while not self.closed:
                 try:
                     result = self.buyer.camp(
                         self.url, self.in_stock_numbers,
                         wake=self.wake, stop=lambda: self.closed,
-                        cadence=self.cadence, session_seconds=self.session_seconds)
+                        cadence=self.cadence, idle_cadence=self.idle_cadence,
+                        hot_seconds=self.hot_seconds,
+                        session_seconds=self.session_seconds)
                 except Exception as e:
                     result = BuyResult(False, "蹲守流程异常", self.url,
                                        f"{type(e).__name__}: {e}")

@@ -1575,7 +1575,8 @@ class OrderPlacer:
     #: camp 返回这个 stage 前缀 = 「会话到期/蹲够了，重建后接着蹲」，不是失败。
     CAMP_REBUILD = "rebuild"
 
-    def camp(self, page, t0: float, *, wake=None, stop=None, cadence: float = 10.0,
+    def camp(self, page, t0: float, *, wake=None, stop=None, cadence: float = 8.0,
+             idle_cadence: float = 240.0, hot_seconds: float = 60.0,
              max_seconds: float = 1080.0):
         """守株待兔版的 place：停在结账页反复打 search，命中就下单。
 
@@ -1596,7 +1597,8 @@ class OrderPlacer:
         fc = self._build_fc()
         try:
             ok, stage, detail = fc.camp(page, wake=wake, stop=stop,
-                                        cadence=cadence, max_seconds=max_seconds)
+                                        cadence=cadence, idle_cadence=idle_cadence,
+                                        hot_seconds=hot_seconds, max_seconds=max_seconds)
         except Exception as e:
             ok, stage, detail = False, "⚠️ 蹲守异常，已停止", f"{type(e).__name__}: {e}"
         finally:

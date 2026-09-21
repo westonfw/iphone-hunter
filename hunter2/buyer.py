@@ -152,7 +152,9 @@ class Buyer:
                 self.autobuy, self._report,
                 url=self._buy_url(self.camp_part),
                 in_stock_numbers=self.only_stores,
-                cadence=float(camp_cfg.get("cadence", 10)),
+                cadence=float(camp_cfg.get("cadence", 8)),
+                idle_cadence=float(camp_cfg.get("idle_cadence", 240)),
+                hot_seconds=float(camp_cfg.get("hot_seconds", 60)),
                 session_seconds=float(camp_cfg.get("session_seconds", 1080)),
                 log=log)
             self.log(f"[买手] 守株待兔模式：蹲 {self.note_of.get(self.camp_part) or self.camp_part}"

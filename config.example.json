@@ -87,7 +87,9 @@
     "clear_bag_before_add": true,
     "camp": {
       "enabled": false,
-      "cadence": 10,
+      "cadence": 8,
+      "idle_cadence": 240,
+      "hot_seconds": 60,
       "session_seconds": 1080
     },
     "max_orders": 1,
