@@ -21,9 +21,12 @@ from .autobuy import BuyResult
 
 
 class CampWorker:
+    #: 被拦后的静默阶梯（秒），按连续被拦次数取档（第 1 次只看 retry_after）。
+    COOLDOWNS = (120.0, 240.0, 300.0)
+
     def __init__(self, buyer, report, *, url: str,
                  in_stock_numbers=None, cadence: float = 8.0,
-                 idle_cadence: float = 90.0, hot_seconds: float = 25.0,
+                 idle_cadence: float = 180.0, hot_seconds: float = 25.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
         self.buyer = buyer          # AutoBuy
@@ -35,8 +38,9 @@ class CampWorker:
         #: 冷档（主程序安静）间隔。也一直打 search，只是慢些——目的是把会话**保温**：
         #: 凉的 search 一发 20s（2026-09-22 起两个买手实测，之前 8~10s），隔几分钟
         #: 打一发的会话下一发才是 1~3s。只续期不 search 保不住热（15fd1bc 试过，
-        #: 09-23 13:53 放货信号 1s 内打出去、17.6s 才回）。90s 一发也顺带把
-        #: interactionMs 压着不弹「还在吗」。session 内实测不吃 541。
+        #: 09-23 13:53 放货信号 1s 内打出去、17.6s 才回）。但 90s 一发 92 分钟
+        #: 68 个 POST 就 541（09-23 16:11），180s 一发实测仍是 1~3s，就用 180。
+        #: 也顺带把 interactionMs 压着不弹「还在吗」。
         self.idle_cadence = max(self.cadence, float(idle_cadence))
         #: 收到放货信号后热档持续多久，之后没有新信号就回冷档。
         self.hot_seconds = max(0.0, float(hot_seconds))
@@ -124,7 +128,12 @@ class CampWorker:
                 back = float(getattr(result, "retry_after", 0.0) or 0.0)
                 if back > 0 and not result.ok:
                     self._fails += 1
-                    pause = max(self.rebuild_pause, back)
+                    # 连击加档：跟主程序的熔断器一个思路（README「被拦之后」），
+                    # 静默期里探一次就续一次，越探越出不来，所以越连击停得越久。
+                    # 第一次按对方给的 retry_after 来，连击才上阶梯。
+                    ladder = (self.COOLDOWNS[min(self._fails, len(self.COOLDOWNS)) - 1]
+                              if self._fails > 1 else 0.0)
+                    pause = max(self.rebuild_pause, back, ladder)
                     self.log(f"[蹲守] {result.stage}——静默冷却 {pause:.0f}s 再重新上膛"
                              f"（连续第 {self._fails} 次）")
                     # 一直进不去就说一句：多半是这个 IP/账号在 checkoutx 上被限了。

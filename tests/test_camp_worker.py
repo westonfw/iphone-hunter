@@ -108,7 +108,8 @@ if __name__ == "__main__":
 
 
 class BlockedCooldownTests(unittest.TestCase):
-    """上膛被 541：静默冷却、不推送，攒到 5 次才说一句——别 3 秒一撞、别刷通知。"""
+    """上膛被 541：静默冷却、不推送，攒到 5 次才说一句——别 3 秒一撞、别刷通知。
+    连击加档 120 → 240 → 300：静默期里每探一次都在续封，越连击停得越久。"""
     URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/MJYE4CH/A"
 
     def worker(self, seq):
@@ -124,12 +125,12 @@ class BlockedCooldownTests(unittest.TestCase):
         return BuyResult(False, "⚠️ 上膛被拦", self.URL, retriable=False, retry_after=120.0)
 
     def test_a_block_is_silent_and_cools_down(self):
-        # 3 次上膛被拦 → 成单收工。前 3 次不推送、各冷却 120s。
+        # 3 次上膛被拦 → 成单收工。前 3 次不推送，冷却按阶梯 120/240/300。
         b, w = self.worker([self.blocked(), self.blocked(), self.blocked(),
                             BuyResult(True, "ok", self.URL, quota_done=True)])
         w._run()
         self.assertEqual(1, len(self.reports))     # 只有成单那次推送
-        self.assertEqual([120.0, 120.0, 120.0], self.naps)  # 成单后 break，不再 pause
+        self.assertEqual([120.0, 240.0, 300.0], self.naps)  # 成单后 break，不再 pause
 
     def test_five_in_a_row_warns_once(self):
         # 连着 5 次被拦：第 5 次推一条「进不去」提醒

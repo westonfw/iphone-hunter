@@ -279,6 +279,12 @@ class AutoBuy:
         #: 上一轮打的是哪个型号、什么时候打完的。同型号重试时用来决定要不要走
         #: 「先问购物袋」的快路。用墙上时钟，因为它要跨越很长的空闲期。
         self._last_part, self._last_at = "", 0.0
+        #: 上一轮被 541 拦了：下一轮进结账前**强制回一次主站**（真的加载一页）。
+        #: 进程内重建默认「页面已在主站就不导航」，但 checkoutx 的 541 绑在当前
+        #: 页面的会话/传感器状态上：09-22 00:52 buyerB、09-23 16:25 buyerA 都是
+        #: 同一会话里探了十几分钟全 541，重启（走了 goto /shop/bag）几十秒后第一
+        #: 发就过；而不导航的重建过不去。重启做对的事就是这一次页面加载。
+        self._reload_next = False
         self.order_placed = False
         # 预热用的常驻会话
         self._pwctx = self._pw = self._ctx = self._page = None
@@ -849,7 +855,7 @@ class AutoBuy:
 
     def camp(self, url: str, in_stock_numbers: list[str] | None = None,
              *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 90.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              session_seconds: float = 1080.0) -> BuyResult:
         """守株待兔一段：加购目标型号 → 进结账 → 停在 step1 反复打 search。
 
@@ -1038,11 +1044,13 @@ class AutoBuy:
                 here = page.url or ""
             except Exception:
                 here = ""
-            if _on_main(here, self.region):
+            if _on_main(here, self.region) and not self._reload_next:
                 # 已经在主站上了，一趟导航都不用——袋子是 fetch 出来的，不看 DOM。
                 self.log(f"[自动下单] {why}：页面已在主站，直接问购物袋")
             else:
-                self.log(f"[自动下单] {why}：先回主站，产品页能不碰就不碰")
+                self.log(f"[自动下单] {why}：先回主站，产品页能不碰就不碰"
+                         + ("（上一轮被 541，换掉页面状态）" if self._reload_next else ""))
+                self._reload_next = False
                 try:
                     page.goto(f"{REGIONS[self.region]}/shop/bag", timeout=self.timeout,
                               wait_until="domcontentloaded")
@@ -1255,7 +1263,7 @@ class AutoBuy:
             c = self._camp
             outcome = placer.camp(page, t0, wake=c.get("wake"), stop=c.get("stop"),
                                   cadence=c.get("cadence", 8.0),
-                                  idle_cadence=c.get("idle_cadence", 90.0),
+                                  idle_cadence=c.get("idle_cadence", 180.0),
                                   hot_seconds=c.get("hot_seconds", 25.0),
                                   max_seconds=c.get("max_seconds", 1080.0))
         else:
@@ -1386,6 +1394,8 @@ class AutoBuy:
             return BuyResult(ok, stage, url, detail, order_id=order_id,
                              retriable=False)
         retriable = getattr(placer, "retriable", True)
+        if getattr(placer, "blocked", False) is True:
+            self._reload_next = True
         return BuyResult(ok, stage, url, detail, order_id=order_id,
                          retriable=retriable,
                          # 配置类的死局（不是自提、没有门店编号）才判死这个型号；

@@ -108,8 +108,8 @@ def cmd_doctor(args) -> int:
               f"   ← 单账号一次只能蹲一个，由 buyer_offset 挑；只有它放货才有意义")
         print(f"    camp.cadence(热档) = {camp.get('cadence', 8)}s"
               f"   ← 主程序报货后密打的间隔")
-        print(f"    camp.idle_cadence(冷档) = {camp.get('idle_cadence', 90)}s"
-              f"   ← 空闲时慢打 search 保温的间隔；凉了的会话一发要 20s，保温着才是 1~3s")
+        print(f"    camp.idle_cadence(冷档) = {camp.get('idle_cadence', 180)}s"
+              f"   ← 空闲时慢打 search 保温的间隔；凉了的会话一发要 20s，保温着才是 1~3s；别低于 180，checkoutx 每小时几十个 POST 就 541")
         print(f"    camp.session_seconds = {camp.get('session_seconds', 1080)}s"
               f"   ← 多久重建会话，必须 < 20 分钟 TTL")
     return 0 if ok else 1

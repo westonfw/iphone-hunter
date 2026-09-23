@@ -208,6 +208,22 @@ class KeepAliveTests(unittest.TestCase):
         # 不再用续期接口——search 本身就是交互
         self.assertEqual(0, len(extends), actions)
 
+    def test_search_541_leaves_the_session_instead_of_probing(self):
+        # 预热 MISS，下一发保温 541 → 立刻退出这段蹲守，标 blocked；不在原会话里探
+        page = FakePage([FUL, MISS, {"status": 541, "json": None}, MISS, MISS])
+        fc = self.fc()
+        t = [1000.0]
+        def clock():
+            t[0] += 1
+            return t[0]
+        ok, stage, detail = fc.camp(page, cadence=1, idle_cadence=1, hot_seconds=0,
+                                    max_seconds=1e9, clock=clock, sleep=lambda *_: None)
+        self.assertFalse(ok)
+        self.assertIn("被拦", stage)
+        self.assertEqual("blocked", fc.failure_kind)
+        searches = [c for c in page.calls if "_a=search" in c["query"]]
+        self.assertEqual(2, len(searches))   # 预热 + 被拦那一发，之后没再探
+
     def test_idle_search_waits_for_the_idle_cadence(self):
         page = FakePage([FUL] + [MISS] * 8)
         fc = self.fc()

@@ -1326,7 +1326,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 90.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1338,12 +1338,15 @@ class FastCheckout:
         **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
         也是白打（失败全是「主程序看到、search 没跟上」，没有反过来的），
         而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
-          * 主程序安静时 → **冷档**：`idle_cadence`（默认 90s）慢打 search 保温。
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 180s）慢打 search 保温。
             **不能只续期不 search**：一个会话里冷的 search 要 20s（2026-09-22 起
             两个买手 150+ 发无一例外，之前是 8~10s），而放货窗口只有 6~15s；
             只有隔几分钟就打一发的会话，下一发才是 1~3s（buyerB 09-22 00:00~00:40
             的实测）。预热那一发回来不等于热了：紧跟着 2s 后再打仍要 17s。
-            search 本身就是交互，顺带把 5 分钟空闲计时也续了。
+            search 本身就是交互，顺带把 5 分钟空闲计时也续了。但也别密：
+            checkoutx/fulfillment 有按出口 IP 的累计预算，09-23 90s 一发跑了
+            92 分钟、68 个 POST 就 541（09-21 10s 一发 12 分钟 ~70 个也是）；
+            180s 一发实测仍是 1~3s（buyerB 09-22 00:16~00:31）。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
@@ -1448,16 +1451,17 @@ class FastCheckout:
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
+                    # **被 541 就退出这个会话，别在里面接着探。** 静默期里每一次
+                    # 探测都在给封禁续期（README「被拦之后：静默，不是降速」）：
+                    # 2026-09-23 16:11 起在同一会话里每 100s 探一发，13 分钟 8 发
+                    # 全 541；停下来换个新会话，第一发就过了。交给 CampWorker
+                    # 静默冷却（≥120s，连击加档）再重新上膛。
+                    self.failure_kind = "blocked"
                     self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
-                    back = max(cadence * 3, self.retry_after)
                     self.log(f"[蹲守] {'信号' if hot else '保温'} search 被拦（{e}），"
-                             f"退避 {back:.0f}s——见 README 坑 9")
-                    _, woke = self._nap(wake, back, stop, clock, sleep)
-                    if stop():
-                        return False, "已停止", "退避中收到停止信号"
-                    if woke:
-                        hot_until = clock() + hot_seconds
-                    continue
+                             f"这个会话不再探——静默冷却后换会话（打了 {shots} 发）")
+                    return False, "⚠️ search 被拦", (
+                        f"{e}。checkoutx 被 541，静默冷却后换个新会话重建。")
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），接着蹲")
 

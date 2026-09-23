@@ -260,6 +260,24 @@ class CampBypassesGoneTests(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertIn('没进结账', r.stage)
 
+    def test_blocked_forces_a_main_site_reload_next_round(self):
+        # 上一轮 camp 被 541 → 下一轮进结账前强制 goto 主站（重启做对的那件事）
+        p = Mock(no_retry=False, retriable=False, fast_ordered=False, blocked=True,
+                 retry_after=0.0, result_url='', secure_host='')
+        p.camp.return_value = (False, '⚠️ search 被拦', '541', '')
+        self.ab._camp = {'wake': None, 'stop': lambda: False,
+                         'cadence': 8, 'idle_cadence': 180, 'hot_seconds': 25,
+                         'max_seconds': 1080}
+        def entry(*a, **k):
+            self.page.url = self.CHECKOUT
+            return self.page
+        self.ab._enter_checkout = Mock(side_effect=entry)
+        with patch('hunter.fastpath.bag_to_checkout', return_value=self.CHECKOUT), \
+             patch('hunter.autobuy.OrderPlacer', return_value=p):
+            r = self.ab._drive(Mock(), self.page, self.URL, False)
+        self.assertTrue(r.retry_after >= 120)
+        self.assertTrue(self.ab._reload_next)
+
     def test_camp_enters_checkout_despite_gone(self):
         # camp 模式：无视「没货」，一路进到结账、调 placer.camp
         p = Mock(no_retry=False, retriable=True, fast_ordered=False, blocked=False,
