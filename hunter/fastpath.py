@@ -606,6 +606,17 @@ def stall_hints(data, limit: int = 4) -> str:
             continue
         walked.add(id(cur))
         if isinstance(cur, dict):
+            # **每个模块的 `m` 是服务端这次真正要给人看的消息**，形如
+            # [{"level": "ERROR", "text": "<p>此商品不可在你选择的地点取货。…</p>"}]
+            # （2026-09-23 21:30 手动实录：continueFromBillingToReview 被拦在
+            # billing 时 `billing.m` 就是它，配套 billingErrorMessageKey=
+            # transaction.offer.availability.lost）。正常响应里是 null。优先报它。
+            for item in (cur.get("m") or []) if isinstance(cur.get("m"), list) else []:
+                if isinstance(item, dict) and str(item.get("text") or "").strip():
+                    txt = " ".join(re.sub(r"<[^>]+>", " ", str(item["text"])).split())[:120]
+                    if txt not in seen:
+                        seen.add(txt)
+                        out.insert(0, f"{item.get('level') or 'm'}={txt}")
             for k, v in cur.items():
                 kl = str(k).lower()
                 if k == "b":
@@ -1036,6 +1047,10 @@ class FastCheckout:
         selectFulfillmentLocationAction 和 search 都只会原样回 billing——09-23
         22:02 和 22:11 两次 availability.lost 之后就是这样，20 发全「没推进」，
         卡了 3 分多钟，而那几分钟门店一直在放货。
+
+        availability.lost 的意思（21:30 手动实录，billing.m 里的原话）：
+        「此商品不可在你选择的地点取货。请选择其他地点或送货选项。」——走到付款页
+        时那家店已经没这台机器了，Apple 在 billing→review 这一步复核库存。
         """
         return self._post(page, "/shop/checkoutx", "Fulfillment-init", "", [],
                           query=encode([("_s", "Fulfillment-init")]))

@@ -559,10 +559,13 @@ class StallHintTemplateTests(unittest.TestCase):
         模板，不是服务端这次说的话。09-23 22:12 把它们当成了地址配置错。"""
         from hunter.fastpath import stall_hints
         data = {"body": {"checkout": {"fulfillment": {
+            "m": [{"level": "ERROR", "text": "<p>此商品不可在你选择的地点取货。请选择其他地点或送货选项。</p>"}],
             "d": {"billingErrorMessageKey": "transaction.offer.availability.lost"},
             "b": {"provinceCityDistrict": {"p": {"valid": {"then": {"error": "请选择区。"},
                                                           "else": {"then": {"error": "请选择城市。"}}}}},
                   "timeSlotValue": {"p": {"valid": {"then": {"error": "请选择一个时段。"}}}}}}}}}
         got = stall_hints(data)
         self.assertIn("availability.lost", got)
-        self.assertNotIn("请选择", got)
+        self.assertNotIn("请选择区", got)
+        # 服务端真正给人看的那句排最前，HTML 标签去掉
+        self.assertTrue(got.startswith("ERROR=此商品不可在你选择的地点取货。请选择其他地点或送货选项。"), got)

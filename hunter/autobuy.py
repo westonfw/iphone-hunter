@@ -963,6 +963,12 @@ class AutoBuy:
                     headless=self.headless,
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 900},
+                    # Playwright 自己启动的 Chrome 默认带 --enable-automation：
+                    # navigator.webdriver 变 true、页面顶上挂「正受自动化控制」横幅。
+                    # 挂到你自己的 Chrome 那条路没有这两样（2026-09-23 实测），
+                    # 兜底模式也别带。
+                    ignore_default_args=["--enable-automation"],
+                    args=["--disable-blink-features=AutomationControlled"],
                     **kw,
                 )
                 return ctx, False
