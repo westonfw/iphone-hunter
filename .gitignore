@@ -17,3 +17,8 @@ logs*/
 .purchase.lock
 order-attempt.json
 launch-state.json
+
+# 代理的真实 IP 清单（监控池 + 每个账号一份），只提交 .example
+tools/ips.txt
+tools/buyer-*.txt
+tools/proxy.env

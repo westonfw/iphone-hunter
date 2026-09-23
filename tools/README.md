@@ -4,8 +4,8 @@
 公网 IP，代理让每个请求从不同的 IP 出站，摊薄 Apple 对 `(IP + 端点)` 的累计限流。
 scout 那边把它配成 `{"rotating": true}` 的出口，就能「只走这台、单线程尽快刷」。
 
-> **只喂库存监控，不喂结账。** 结账（买手）需要**固定一个 IP 全程不变**——中途换
-> IP 会立刻被 Akamai 判会话作废。别把买手的浏览器挂到这台轮换代理上。
+> **轮换口只喂库存监控。** 结账（买手）需要**固定一个 IP 全程不变**——中途换 IP
+> 会立刻被 Akamai 判会话作废。买手走 `--buyer` 开出来的固定口，见下面「结账也走它」。
 
 ## 它解决什么
 
@@ -77,6 +77,62 @@ journalctl -u rotating-proxy -f          # 看转发/拒绝/坏 IP 统计
 `rotating: true` 让主程序对它不做流控；`use_direct: false` 把本机直连摘掉，库存请求
 全走这台代理。跑起来后 scout 日志里这条出口显示成 `pool(代理·多IP)`，库存行尾是
 `(pool)`。
+
+## 结账也走它：给每个买手一个固定 IP 口
+
+IP 分成两类文件，都是一行一个：
+
+```
+tools/ips.txt        监控库存的轮换池
+tools/buyer-a.txt    buyerA 结账用的：第一行当前用，后面备用
+tools/buyer-b.txt
+tools/buyer-c.txt
+```
+
+```bash
+cp tools/buyer-a.txt.example tools/buyer-a.txt   # 每个账号一份，填自己的 IP
+python3 tools/rotating-proxy.py --port 8080 --user hunter \
+    --buyer 8081=buyer-a.txt --buyer 8082=buyer-b.txt --buyer 8083=buyer-c.txt \
+    --allow 买手A机器的公网IP --allow 买手B和C机器的公网IP
+```
+
+不想手敲这一长串就用启动脚本 `tools/run-proxy.sh`：它自动把同目录的 `buyer-*.txt` 按文件名
+顺序挂到 8081、8082、8083…，密码、端口、免密来源从同目录的 `proxy.env` 读：
+
+```bash
+cat > tools/proxy.env <<'EOT'
+ROTPROXY_PASS=强密码
+ROTPROXY_ALLOW="买手A机器的公网IP 买手B和C机器的公网IP"
+EOT
+chmod 600 tools/proxy.env
+tools/run-proxy.sh
+```
+
+- `--buyer 端口=文件`：**一个账号一个口、一份文件。** 这个端口只从自己文件里的 IP 出站，
+  平时用第一行那个，不会自己换。账号之间、账号和 ips.txt 之间的 IP **不能重叠**，重叠拒绝
+  启动：结账会话绑 IP，两个账号走同一个 IP 就是同一个 IP 上开两条结账链路；541 也按 IP
+  记，一个账号撞的会连累另一个。当前 IP 连不上不会换别的顶上（换了等于把会话作废），只回
+  502 并在日志里喊。
+- **被 541 之后换 IP**：买手对固定口发 `GET /rotate`，它把当前 IP 标为烧过、切到最久没烧
+  的那个、掐断这个口上所有在转的隧道（Chrome 会复用旧隧道，不掐断新请求还从旧 IP 走），
+  买手立刻回主站重建会话，静默期从 120~300 秒变成 3 秒。`GET /ip` 看当前。每个账号的
+  文件里放两三个 IP 才有得换，只有一行的口被 541 只能干等。
+- `--allow IP|CIDR`：这些来源免密。Chrome 的代理设置（--proxy-server / PAC）带不了
+  密码，不放行的话每次起 Chrome 都弹密码框。轮换口照旧要密码。控制请求（/ip、/rotate）
+  也认 `Authorization: Basic`，所以 `autobuy.proxy` 写成 `http://hunter:密码@IP:8081`
+  也行：PAC 只取主机和端口，密码只给控制请求用。
+- 固定口多放行了 `cdn-apple.com` / `mzstatic.com`：结账页的静态资源、Apple ID 登录框、
+  Apple Pay 脚本在那儿，不放行页面就残缺。
+
+买手那边 `config.json`：
+
+```json
+"autobuy": { "proxy": "http://代理服务器IP:8081" }
+```
+
+然后 `hunter connect --launch` 重新起 Chrome：它会带一段 PAC，只把 Apple 的域指到这个
+口，其余流量直连。已经开着的 Chrome 改不了代理，得重起。买手启动时会读
+chrome://version 核对启动参数，没带代理就在日志里喊。
 
 ## 安全边界
 

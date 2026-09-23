@@ -183,8 +183,12 @@ def cmd_connect(args) -> int:
         return 0
 
     if args.launch:
-        ok, msg = launch_debug_chrome(port=port)
+        proxy = str(ab.get("proxy") or "").strip()
+        ok, msg = launch_debug_chrome(port=port, proxy=proxy)
         print(f"\n{'✓' if ok else '✗'} {msg}")
+        if ok and proxy:
+            print(f"\n结账流量（Apple 的域）走代理 {proxy}，其余直连。代理那边要用 --allow 放行"
+                  "这台机器的公网 IP，否则 Chrome 会弹代理密码框。")
         if ok:
             print("\n浏览器已打开购物袋页。**现在在里面登录你的 Apple ID**（只需这一次），")
             print("顺便确认收货地址和付款方式都在。然后跑：")

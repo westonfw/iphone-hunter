@@ -18,6 +18,11 @@ Type=simple
 # 密码放这个文件（chmod 600），别写进 service：ROTPROXY_PASS=...
 EnvironmentFile=/opt/rotating-proxy/proxy.env
 WorkingDirectory=/opt/rotating-proxy
+# 结账也走它的话：每个账号一份 IP 文件（一行一个），在后面加
+#   --buyer 8081=/opt/rotating-proxy/buyer-a.txt --buyer 8082=/opt/rotating-proxy/buyer-b.txt --allow 买手机器公网IP
+# 见 tools/README.md
+# 或者直接用启动脚本（自动挂 buyer-*.txt、读同目录 proxy.env）：
+#   ExecStart=/opt/rotating-proxy/run-proxy.sh
 ExecStart=/usr/bin/python3 -u /opt/rotating-proxy/rotating-proxy.py --port 8080 --user hunter --ips /opt/rotating-proxy/ips.txt
 Restart=always
 RestartSec=3

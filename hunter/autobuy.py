@@ -19,6 +19,7 @@ import json
 import os
 import re
 import subprocess
+from urllib.parse import urlparse
 import time
 import urllib.error
 import urllib.request
@@ -249,6 +250,14 @@ class AutoBuy:
         self.mode = self.cfg.get("mode", "auto")
         self.cdp_url = self.cfg.get("cdp_url", "")
         self.cdp_port = int(self.cfg.get("cdp_port", DEFAULT_CDP_PORT))
+        #: 结账走的固定 IP 代理（tools/rotating-proxy.py 的 --sticky 口），如
+        #: "http://1.2.3.4:8081"。留空直连。只对 Apple 的域生效，其余流量直连。
+        self.proxy = str(self.cfg.get("proxy") or "").strip()
+        #: 固定口的控制接口：被 541 之后换出口 IP。没配代理就是 None。
+        self.proxyctl = None
+        if self.proxy:
+            from .proxyctl import ProxyControl
+            self.proxyctl = ProxyControl(self.proxy)
         self.profile = root / self.cfg.get("profile_dir", ".browser-profile")
         self.headless = bool(self.cfg.get("headless", False))
         self.trade_in_text = self.cfg.get("trade_in", "不折抵")
@@ -935,6 +944,49 @@ class AutoBuy:
                 else:
                     self.log("[自动下单] 浏览器保持打开，等你确认付款")
 
+    def switch_exit(self, why: str = "") -> str:
+        """被 541 了：让固定口换一个出站 IP。换成了返回新 IP，否则返回空串。
+
+        换 IP 只对「按 IP 记的封」有用，也就是 checkoutx 的 541。换完调用方要
+        立刻回主站重建会话——旧会话绑在旧 IP 上，接着用只会一路 541。
+        """
+        if self.proxyctl is None:
+            return ""
+        from .proxyctl import ProxyControlError
+        try:
+            got = self.proxyctl.rotate()
+        except (ProxyControlError, ValueError) as e:
+            self.log(f"[自动下单] ⚠️ 换出口 IP 失败（{e}），只能按老办法静默冷却")
+            return ""
+        if not got.get("rotated"):
+            self.log(f"[自动下单] 固定口只有一个 IP（{got.get('ip')}），换不了，静默冷却")
+            return ""
+        self.log(f"[自动下单] {why or '被拦'}——出口 IP 已换：{got.get('previous')} → {got.get('ip')}"
+                 f"（这个口共 {got.get('pool')} 个），立刻重建会话")
+        return str(got.get("ip") or "")
+
+    def _check_proxy_flag(self, ctx) -> None:
+        """配了 autobuy.proxy 但挂的是别人起的 Chrome：代理只能在启动参数里给，
+        挂上去之后改不了。读一眼 chrome://version 的命令行，没带就喊出来——
+        不然以为结账走了代理，其实还是本机出口。尽力而为，读不到不算错。"""
+        try:
+            page = ctx.new_page()
+            try:
+                page.goto("chrome://version", timeout=5000)
+                cmdline = page.locator("#command_line").inner_text(timeout=3000)
+            finally:
+                page.close()
+        except Exception as e:
+            self.log(f"[自动下单] 读不到 Chrome 启动参数（{type(e).__name__}），"
+                     f"没法确认结账是不是走了代理 {self.proxy}")
+            return
+        if "--proxy-pac-url" in cmdline or "--proxy-server" in cmdline:
+            self.log(f"[自动下单] 结账走代理 {self.proxy}（Chrome 启动参数里带着）")
+        else:
+            self.log(f"[自动下单] ⚠️ 配了 autobuy.proxy={self.proxy}，但这个 Chrome 启动时"
+                     f"没带代理参数——结账现在还是本机出口。用 `hunter connect --launch` "
+                     f"重新起 Chrome 才会走代理")
+
     def _launch(self, pw):
         """返回 (context, attached)。attached=True 表示挂在用户自己的 Chrome 上。"""
         if self.mode in ("auto", "cdp"):
@@ -945,6 +997,8 @@ class AutoBuy:
                 ctx = browser.contexts[0] if browser.contexts else browser.new_context()
                 self.log(f"[自动下单] 已挂到你的 Chrome（{url} / {info.get('Browser','?')}）"
                          f"——用你自己的登录态，不读取 profile 目录")
+                if self.proxy:
+                    self._check_proxy_flag(ctx)
                 return ctx, True
             if self.mode == "cdp":
                 tried = "、".join(cdp_candidates(self.cdp_url, self.cdp_port))
@@ -963,6 +1017,7 @@ class AutoBuy:
                     headless=self.headless,
                     locale="zh-CN",
                     viewport={"width": 1440, "height": 900},
+                    **({"proxy": playwright_proxy(self.proxy)} if self.proxy else {}),
                     # Playwright 自己启动的 Chrome 默认带 --enable-automation：
                     # navigator.webdriver 变 true、页面顶上挂「正受自动化控制」横幅。
                     # 挂到你自己的 Chrome 那条路没有这两样（2026-09-23 实测），
@@ -992,6 +1047,9 @@ class AutoBuy:
                 return self._drive_inner(ctx, page, url, False, in_stock, in_stock_numbers)
         except Blocked as e:
             self._reload_next = True   # 购物袋/入口被 541 也绑在页面状态上，下一轮回主站
+            if self.switch_exit("购买链路被 541"):
+                return BuyResult(False, "⚠️ 购买链路被限流，已换出口", page.url, str(e),
+                                 retriable=False, retry_after=3.0)
             return BuyResult(False, "⚠️ 购买链路被限流，已停止", page.url, str(e),
                              retriable=False, retry_after=max(120, e.retry_after))
         except QuotaReached as e:
@@ -1803,8 +1861,66 @@ def windows_userprofile() -> str | None:
         return None
 
 
+#: 结账代理只接管这些域（含子域）：跟 tools/rotating-proxy.py 放行的一致。
+#: 其余流量直连——那台代理只转 Apple，别的走它只会被 403。
+PROXY_HOSTS = ("apple.com.cn", "apple.com", "icloud.com.cn", "cdn-apple.com", "mzstatic.com")
+
+
+def proxy_pac(proxy_url: str) -> str:
+    """把 autobuy.proxy 变成 PAC 脚本：Apple 的域走代理，其余 DIRECT。
+
+    Chrome 的 --proxy-server 是全局的、--proxy-bypass-list 只能写「不走代理的」，
+    表达不了「只有 Apple 走」；PAC 可以。代理凭据 PAC 带不了，所以那台代理
+    用 --allow 放行买手机器的 IP。
+    """
+    u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    if not u.hostname or not u.port:
+        raise ValueError(f"autobuy.proxy 要写成 http://IP:端口，看不懂：{proxy_url!r}")
+    scheme = (u.scheme or "http").lower()
+    kind = {"http": "PROXY", "https": "HTTPS", "socks5": "SOCKS5", "socks": "SOCKS"}.get(scheme)
+    if not kind:
+        raise ValueError(f"autobuy.proxy 不支持 {scheme}://，用 http:// 或 socks5://")
+    conds = " || ".join(f'dnsDomainIs(host, ".{d}") || host == "{d}"' for d in PROXY_HOSTS)
+    return (f"function FindProxyForURL(url, host) {{\n"
+            f"  if ({conds}) return \"{kind} {u.hostname}:{u.port}\";\n"
+            f"  return \"DIRECT\";\n}}\n")
+
+
+def proxy_pac_url(proxy_url: str) -> str:
+    import base64
+    return ("data:application/x-ns-proxy-autoconfig;base64,"
+            + base64.b64encode(proxy_pac(proxy_url).encode()).decode())
+
+
+def playwright_proxy(proxy_url: str) -> dict:
+    """兜底模式（Playwright 自己起 Chrome）用的 proxy 参数：这条路能带用户名密码。"""
+    u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
+    out = {"server": f"{u.scheme or 'http'}://{u.hostname}:{u.port}",
+           "bypass": ""}
+    # Playwright 的 bypass 是「不走代理的」，写不出「只有 Apple 走」；兜底模式
+    # 是临时应急，全走代理也行——反正那台只转 Apple，别的 403 掉。
+    del out["bypass"]
+    if u.username:
+        out["username"] = u.username
+        out["password"] = u.password or ""
+    return out
+
+
+def debug_chrome_cmd(exe: str, port: int, profile: str, headless: bool = False,
+                     proxy: str = "") -> list[str]:
+    """起调试 Chrome 的完整命令行。拆出来是为了能测：代理有没有带上。"""
+    cmd = [exe, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+           "--no-first-run", "--no-default-browser-check"]
+    if proxy:
+        cmd.append(f"--proxy-pac-url={proxy_pac_url(proxy)}")
+    if headless:
+        cmd.append("--headless=new")
+    cmd.append("https://www.apple.com.cn/shop/bag")
+    return cmd
+
+
 def launch_debug_chrome(port: int = DEFAULT_CDP_PORT, profile_name: str = ".iphone-hunter-chrome",
-                        headless: bool = False, log=print) -> tuple[bool, str]:
+                        headless: bool = False, log=print, proxy: str = "") -> tuple[bool, str]:
     """起一个开着调试端口的 Chrome，返回 (成功, 说明)。
 
     为什么必须用独立 profile：Chrome 136 起 --remote-debugging-port 对**默认
@@ -1829,13 +1945,13 @@ def launch_debug_chrome(port: int = DEFAULT_CDP_PORT, profile_name: str = ".ipho
         profile = str(Path.home() / profile_name)
         kind = "Linux Chrome"
 
-    cmd = [exe, f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
-           "--no-first-run", "--no-default-browser-check"]
-    if headless:
-        cmd.append("--headless=new")
-    cmd.append("https://www.apple.com.cn/shop/bag")
+    try:
+        cmd = debug_chrome_cmd(exe, port, profile, headless=headless, proxy=proxy)
+    except ValueError as e:
+        return False, str(e)
 
-    log(f"[Chrome] 启动 {kind}，profile={profile}")
+    log(f"[Chrome] 启动 {kind}，profile={profile}"
+        + (f"，Apple 的域走代理 {proxy}（其余直连）" if proxy else ""))
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:

@@ -66,6 +66,7 @@
     "mode": "auto",
     "cdp_url": "",
     "cdp_port": 9222,
+    "proxy": "",
     "headless": false,
     "profile_dir": ".browser-profile",
     "trade_in": "不折抵",

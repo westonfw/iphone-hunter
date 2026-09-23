@@ -660,6 +660,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.pickup_store_numbers` | 老配置里的写法，跟 `pickup.stores` 是同一件事，只在后者没写时才认。新配置写 `pickup.stores` 就行 |
 | `autobuy.mode` | `auto`（默认）/ `cdp` / `profile` |
 | `autobuy.cdp_url` | 锁定调试端口地址；留空自动探测 |
+| `autobuy.proxy` | 结账走的**固定 IP** 代理，如 `http://代理服务器IP:8081`，留空直连。配了之后 `hunter connect --launch` 起的 Chrome 会带一段 PAC：只有 Apple 的域（apple.com.cn / apple.com / icloud.com.cn / cdn-apple.com / mzstatic.com）走这个代理，其余直连。**必须是固定 IP 的口**，结账会话被 Akamai 绑在 IP 上，中途换 IP 就作废——用 `tools/rotating-proxy.py --buyer 端口=IP文件` 给每个账号开一个口、一份 IP 文件，别指到轮换口，账号之间也别共用 IP。Chrome 的代理设置带不了密码，代理那边用 `--allow 买手机器公网IP` 免密。挂到别人起的 Chrome 时改不了代理，程序会读 chrome://version 核对启动参数，没带就在日志里喊。**被 541 之后换 IP**：账号的 IP 文件里有备用行时，买手被拦就对它 `GET /rotate` 换一个干净 IP 并立刻重建会话，不再干等 120/240/300 秒的静默期；控制请求要么来自 `--allow` 放行的机器，要么地址里带 `user:pass`（PAC 用不上，只给控制请求用） |
 | `autobuy.trade_in` / `autobuy.applecare` | 两个必选项选哪个，默认「不折抵」「不加 AppleCare」 |
 
 ---
