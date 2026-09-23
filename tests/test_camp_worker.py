@@ -93,12 +93,42 @@ class WorkerTests(unittest.TestCase):
         b = FakeBuyer([])
         w = CampWorker(b, lambda *a: None, url=URL, in_stock_numbers=["R581", "R359"],
                        log=lambda *a: None)
-        w.observe("MJY64CH/A", [Mock(store="R359"), Mock(store="R581")])
+        w.observe("MJY64CH/A", [Mock(store="R359", observed=5.0), Mock(store="R581", observed=1.0)])
         self.assertEqual("R359", w.hint.get("store"))
+        self.assertEqual(1, w.hint.get("seq"))
         self.assertTrue(w.wake.is_set())
         # 不在配置边界内的店不带
-        w.observe("MJY64CH/A", [Mock(store="R999")])
+        w.observe("MJY64CH/A", [Mock(store="R999", observed=9.0)])
         self.assertEqual("R359", w.hint.get("store"))
+        # 同一家店再报不换 seq；换店才 +1
+        w.observe("MJY64CH/A", [Mock(store="R359", observed=6.0)])
+        self.assertEqual(1, w.hint.get("seq"))
+        w.observe("MJY64CH/A", [Mock(store="R581", observed=7.0), Mock(store="R359", observed=6.0)])
+        self.assertEqual(("R581", 2), (w.hint.get("store"), w.hint.get("seq")))
+
+    def test_freshest_store_wins_over_config_order(self):
+        # 候选按配置顺序 [R581, R359]，但 R359 是刚看到的 → hint 是 R359
+        b = FakeBuyer([])
+        w = CampWorker(b, lambda *a: None, url=URL, in_stock_numbers=["R581", "R359"],
+                       log=lambda *a: None)
+        w.observe("MJY64CH/A", [Mock(store="R581", observed=100.0), Mock(store="R359", observed=130.0)])
+        self.assertEqual("R359", w.hint.get("store"))
+        # 同一时刻看到（快照）→ 取列表靠前的（配置顺序）
+        w.observe("MJY64CH/A", [Mock(store="R581", observed=200.0), Mock(store="R359", observed=200.0)])
+        self.assertEqual("R581", w.hint.get("store"))
+
+    def test_dead_results_back_off_and_report_sparsely(self):
+        # 配置死局：不可重试 → 30/60/120 退避，第 1 次和每 5 次推送一条
+        seq = [BuyResult(False, "⚠️ 缺少取货门店编号", URL, retriable=False, fatal=True)] * 6 \
+              + [BuyResult(True, "已下单", URL, order_id="W1", quota_done=True)]
+        b = FakeBuyer(seq)
+        reports, naps = [], []
+        w = CampWorker(b, lambda res, *a: reports.append(res.stage), url=URL,
+                       rebuild_pause=0.0, log=lambda *a: None)
+        w._pause = lambda s: naps.append(s)
+        w._run()
+        self.assertEqual([30.0, 60.0, 120.0, 120.0, 120.0, 120.0], naps)
+        self.assertEqual(["⚠️ 缺少取货门店编号", "⚠️ 缺少取货门店编号", "已下单"], reports)  # 第 1、5 次 + 成单
 
     def test_observe_without_offers_does_not_wake(self):
         b = FakeBuyer([])

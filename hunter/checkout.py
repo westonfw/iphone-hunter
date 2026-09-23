@@ -1602,6 +1602,7 @@ class OrderPlacer:
         except Exception as e:
             ok, stage, detail = False, "⚠️ 蹲守异常，已停止", f"{type(e).__name__}: {e}"
         finally:
+            fc.settle_guard()          # 成单/结果不明的记录收尾，跟 run() 一样
             self._harvest_fc(fc, page)
         self.log(f"[蹲守] {stage}：{detail}")
         if self.fast_unknown:

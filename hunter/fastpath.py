@@ -551,7 +551,13 @@ def new_call_id() -> str:
     服务端不会校验它的内容，但缺了它请求形状就跟真实浏览器对不上。
     """
     a = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    b = format(int(time.time() * 1000), "x")[-8:]
+    # 后缀是 base36(Date.now())：09-19 HAR 里 `mu2ohjg9` 用 int(s, 36) 解回来
+    # 正好是那条请求的 startedDateTime（误差 ≤1ms）。原来用 hex 截 8 位，长度
+    # 一样但解不回时间——服务端校不校不知道，形状能对上就对上。
+    n, digits, b = int(time.time() * 1000), string.digits + string.ascii_lowercase, ""
+    while n:
+        n, r = divmod(n, 36)
+        b = digits[r] + b
     return f"{a}-{b}"
 
 
@@ -846,30 +852,13 @@ class FastCheckout:
             }
         } catch (e) {}
 
-        // 2) 把可见页面切到「到店取货」tab。camp 是靠后台 fetch 选的 RETAIL，
-        //    但页面 DOM 默认停在「快递」tab——切过去，可见状态才跟服务端一致，
-        //    弹窗/遮罩也才在对的 tab 上。**只点 tab/单选类控件，不点提交按钮**：
-        //    要求 role=tab/radio 或有 pickup 的 data-autom，且文字短（<=6 字），
-        //    这样绝不会撞「继续填写取货详情」那种流程长句。
-        try {
-            // **只认文字含「到店取货」**。上一版还按 data-autom 含 pickup/retail 找，
-            // 结果把地址字段「上海 徐汇区」（它的 data-autom 也带 pickup）点了——错的。
-            // 「到店取货」这四个字流程按钮（「继续填写取货详情」）、地址都不含，安全；
-            // 而且要求它是可点的 tab/单选/按钮类，别点到纯文本标题。
-            const cands = [...document.querySelectorAll(
-                'button, a, label, [role=tab], [role=radio], [role=button]')];
-            for (const el of cands) {
-                const t = txt(el);
-                if (!(t.includes("我要取货") || t.includes("到店取货") || t.includes("到店自取")) || !vis(el)) continue;
-                // 已经选中就别再点
-                const sel = (el.getAttribute && el.getAttribute("aria-selected") === "true")
-                          || (el.getAttribute && el.getAttribute("aria-checked") === "true")
-                          || /(\bselected\b|\bactive\b|--selected|is-selected)/i.test(el.className || "");
-                if (sel) break;
-                try { el.click(); did.push("pickup-tab:" + t.slice(0, 12)); break; }
-                catch (e) {}
-            }
-        } catch (e) {}
+        // 2) **不点「我要取货」tab。** 09-14/15/19 四份 HAR 都显示：页面一选到店
+        //    取货，JS 就在 0.03~0.09s 内自动补发 selectFulfillmentLocationAction
+        //    + search。camp 是后台 fetch 选的 RETAIL，可见 DOM 还停在快递 tab，
+        //    点它等于让页面自己再打一轮 fulfillment——而 search 每会话 10s 才放行
+        //    一发，页面那发排在我们预热发前面，首发就成了 20s（09-22 起每段会话
+        //    都是），还白烧 checkoutx 的 IP 预算。可见状态跟服务端不一致无所谓，
+        //    下单全走 fetch，不看 DOM。
 
         // 3) 关掉弹窗/遮罩。**只点明确的关闭控件**（aria-label / data-autom 含
         //    close/dismiss/关闭，或纯 × / ✕ 图标按钮），绝不点流程按钮。
@@ -953,7 +942,7 @@ class FastCheckout:
         if status in BLOCK_CODES:
             from .apple import parse_retry_after
             self.retry_after = parse_retry_after(r.get("retry_after"))
-            raise Blocked(f"{action} 被拦（{status}）")
+            raise Blocked(f"{action} 被拦（{status}）", r.get("retry_after"))
         if status != 200:
             raise RuntimeError(f"{action} 返回 {status}"
                                + (f"：{r['error']}" if r.get("error") else ""))
@@ -1391,20 +1380,45 @@ class FastCheckout:
         # 保活（点对话框、切 tab）不受 search 间隔限制，照常按短 tick 做。
         shots = 0
         last_shot = clock()
+        #: 上一发 search 返回的时刻：热档的 cadence 从它算。服务端每会话 10s 放行
+        #: 一发，紧挨着发只是排队；wake 每条心跳都会 set，不守这个的话 cadence 形同虚设。
+        last_return = clock()
+        #: 已经用过的信号 (store, seq)：同一条信号只覆盖一次选店，之后交给
+        #: arm_from_search 按结账侧库存换店——不然 hint 和换店互相打架，整段热档
+        #: 都在查同一家「有货但排不上时段」的店。
+        applied = None
+        #: 连续的网络/超时类软失败（fetch 超时、瞬时断连）：不值得为它丢掉整段会话。
+        soft_fails = 0
+        try:
+            page.bring_to_front()   # 后台标签会被 Chrome 降级，跟 _run 一样先拉到前台
+        except Exception:
+            pass
+
+        def hint_key():
+            h = hint or {}
+            store = str(h.get("store") or "").strip().upper()
+            return (store, h.get("seq")) if store else None
 
         def one_search(hot: bool):
             """打一发 search，记耗时，命中就下单。返回 place 结果或 None。"""
-            nonlocal shots, last_shot
+            nonlocal shots, last_shot, last_return, applied
             # **信号说哪家有货就查哪家。** search 的时段只挂在 selectStore 那一家
             # 上，而服务端每会话 10s 才放行一发；窗口内那唯一一发查配置里的第一家
             # 再换店，换完窗口早关了（2026-09-23 17:34、17:36 两次都是这么丢的）。
-            want = str((hint or {}).get("store") or "").strip().upper() if hot else ""
-            if want and want != self.store and (want in self.stores or
-                                                 not self.allow or want in self.allow):
-                self.log(f"[蹲守] 信号说 {want} 有货，这一发改查它（原选 {self.store}）")
-                self.store = want
+            # 同一条信号只覆盖一次：之后由 arm_from_search 按结账侧库存换店。
+            key = hint_key() if hot else None
+            if key is not None and key != applied:
+                applied = key
+                want = key[0]
+                if want != self.store and (want in self.stores or
+                                           not self.allow or want in self.allow):
+                    self.log(f"[蹲守] 信号说 {want} 有货，这一发改查它（原选 {self.store}）")
+                    self.store = want
             last_shot = clock()
-            data = self.step2_store(page)
+            try:
+                data = self.step2_store(page)
+            finally:
+                last_return = clock()
             shots += 1
             ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
             why = "信号" if hot else ("预热" if shots == 1 else "保温")
@@ -1418,7 +1432,18 @@ class FastCheckout:
             if armed:
                 self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
                          f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
-                return self._place_from_armed(page, t0)
+                try:
+                    return self._place_from_armed(page, t0)
+                except Stalled as e:
+                    if self.submitted:
+                        raise          # 单已经送出去了，结果归 step8 / 订单记录管
+                    # 第 3~6 步没走通（多半是那一格时段刚被别人拿走）：别退出会话，
+                    # 退出等于 30~40s 盲区，而放货是成串来的。复位到第 1 步接着蹲。
+                    self.log(f"[蹲守] 命中后没走通（{e}），复位到第 1 步接着蹲")
+                    self.slot = None
+                    self.step1_pickup(page)
+                    last_return = clock()
+                    return None
             return None
 
         #: 保活 tick：多久做一次 keep_awake（点对话框/切 tab）。客户端「还在吗」是
@@ -1426,18 +1451,22 @@ class FastCheckout:
         keep_tick = min(15.0, idle_cadence)
         hot_until = clock() + hot_seconds if (wake is not None and wake.is_set()) else 0.0
         try:
-            # 预热：进场先打一发，把 10 秒首发烧掉，会话即热。
-            r = one_search(hot=False)
+            # 预热：进场先打一发，把首发的等待烧掉。信号已经在等（重建/冷却期间
+            # 放的货）就按热档打——直接查信号里那家店，别先查配置第一家。
+            r = one_search(hot=bool(hot_until))
             if r is not None:
                 return r
         except SessionExpired:
             return False, "rebuild", "预热 search 时会话过期，重建"
         except Blocked as e:
             self.failure_kind = "blocked"
-            self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
+            self.retry_after = max(self.retry_after, getattr(e, "retry_after", 0.0) or 0.0)
             return False, "⚠️ 预热被拦", f"{e}。checkoutx 被 541，冷却后重建。"
         except Stalled as e:
             self.log(f"[蹲守] 预热 search 没推进（{e}），接着蹲")
+        except RuntimeError as e:
+            soft_fails += 1
+            self.log(f"[蹲守] 预热 search 出错（{e}），接着蹲")
 
         try:
             while True:
@@ -1448,21 +1477,26 @@ class FastCheckout:
                         f"蹲了 {clock() - t0:.0f}s（打了 {shots} 发 search），"
                         f"到重建点，换个新会话接着蹲")
 
-                # 保活（不受 search 频率限制）：每 tick 点掉「还在吗」对话框、切取货
-                # tab、踹醒客户端计时器。服务端那边靠下面的 search 本身续着。
+                # 保活（不受 search 频率限制）：每 tick 点掉「还在吗」对话框、
+                # 踹醒客户端计时器。服务端那边靠下面的 search 本身续着。
                 self.keep_awake(page)
                 hot = clock() < hot_until
+                # 热档到点 = 距上一发返回满 cadence；新一条信号（换了店或新 seq）
+                # 可以插队。wake 每条心跳都会 set，不这么守的话 cadence 形同虚设。
+                fresh = hot and hint_key() is not None and hint_key() != applied
+                due = clock() - last_return >= cadence
                 try:
-                    if hot:
+                    if hot and (fresh or due):
                         # 主程序报了货：打 search（会话保温着，~1~3s），命中就下单。
                         r = one_search(hot=True)
                         if r is not None:
                             return r
-                    elif clock() - last_shot >= idle_cadence:
+                    elif not hot and clock() - last_shot >= idle_cadence:
                         # 空闲：慢打一发保温，顺带续 5 分钟空闲计时、也能自己发现货。
                         r = one_search(hot=False)
                         if r is not None:
                             return r
+                    soft_fails = 0
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
@@ -1472,16 +1506,27 @@ class FastCheckout:
                     # 全 541；停下来换个新会话，第一发就过了。交给 CampWorker
                     # 静默冷却（≥120s，连击加档）再重新上膛。
                     self.failure_kind = "blocked"
-                    self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
+                    self.retry_after = max(self.retry_after, getattr(e, "retry_after", 0.0) or 0.0)
                     self.log(f"[蹲守] {'信号' if hot else '保温'} search 被拦（{e}），"
                              f"这个会话不再探——静默冷却后换会话（打了 {shots} 发）")
                     return False, "⚠️ search 被拦", (
                         f"{e}。checkoutx 被 541，静默冷却后换个新会话重建。")
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），接着蹲")
+                except RuntimeError as e:
+                    # fetch 超时 / 瞬时断连 / 非 200：一次不算数，连着 3 次才重建。
+                    # 原来任何一次都直接丢掉整段会话，30~40s 盲区，偏偏最容易在
+                    # 放货高峰的慢响应里触发。
+                    soft_fails += 1
+                    self.log(f"[蹲守] 这一发出错（{e}），连续第 {soft_fails} 次")
+                    if soft_fails >= 3:
+                        return False, "rebuild", f"连着 {soft_fails} 发 search 出错，换个会话"
 
-                # 热档按 cadence 密打（覆盖放货窗口那一小簇），空闲按 keep_tick 只保活。
-                wait = cadence if clock() < hot_until else keep_tick
+                # 热档：等到下一发到点（距上一发返回满 cadence）；空闲：按 keep_tick 只保活。
+                if clock() < hot_until:
+                    wait = max(0.0, last_return + cadence - clock())
+                else:
+                    wait = keep_tick
                 stopped, woke = self._nap(wake, wait, stop, clock, sleep)
                 if stopped:
                     return False, "已停止", "等待中收到停止信号"
@@ -1884,13 +1929,21 @@ class FastCheckout:
         try:
             return self._run(page)
         finally:
-            if self.submitted and self.submit_guard is not None:
-                # 跳回 checkout 也不能作为无订单的证明；都保留提交记录待核对。
-                status = 'confirmed' if not self.order_rejected(self.order_url) else 'unknown'
-                try:
-                    self.submit_guard.finish(status, self.order_url)
-                except OSError as e:
-                    self.log(f'[订单记录] 更新失败，保留提交前记录：{e}')
+            self.settle_guard()
+
+    def settle_guard(self) -> None:
+        """提交过就把订单记录收尾（confirmed / unknown）。run 和 camp 都必须调。
+
+        原来只有 run() 的 finally 调它：蹲守命中成单后记录永远停在 submitted，
+        配额不计数，下一轮 PurchaseGuard 把成功单当「结果不明」报出来要人核对。
+        """
+        if self.submitted and self.submit_guard is not None:
+            # 跳回 checkout 也不能作为无订单的证明；都保留提交记录待核对。
+            status = 'confirmed' if not self.order_rejected(self.order_url) else 'unknown'
+            try:
+                self.submit_guard.finish(status, self.order_url)
+            except OSError as e:
+                self.log(f'[订单记录] 更新失败，保留提交前记录：{e}')
 
     def _run(self, page) -> tuple[bool, str, str]:
         """执行同源结账；按 place_order 决定是否创建待付款订单。"""

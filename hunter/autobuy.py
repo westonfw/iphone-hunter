@@ -985,6 +985,7 @@ class AutoBuy:
                     return BuyResult(False, '已停止', page.url, retriable=False)
                 return self._drive_inner(ctx, page, url, False, in_stock, in_stock_numbers)
         except Blocked as e:
+            self._reload_next = True   # 购物袋/入口被 541 也绑在页面状态上，下一轮回主站
             return BuyResult(False, "⚠️ 购买链路被限流，已停止", page.url, str(e),
                              retriable=False, retry_after=max(120, e.retry_after))
         except QuotaReached as e:
@@ -1386,8 +1387,9 @@ class AutoBuy:
         if not ok and stage == OrderPlacer.CAMP_REBUILD:
             # 蹲守会话到期：不是失败、不推送，让外层重建后接着蹲。
             return BuyResult(False, stage, url, detail, retriable=True, rebuild=True)
-        if ok:
+        if ok and (order_id or getattr(placer, "fast_ordered", False)):
             # 成单了：通知和「别动这个标签」都要用它，但**不是**停止信号。
+            # stop_at_review / place_order=false 走到 Review 也是 ok，但没下单。
             self.order_placed = self._attempt_order = True
         if getattr(placer, "no_retry", False):
             # 结果不明：这之后谁都别再动手，等人去看邮箱/订单列表。这才是停止信号。

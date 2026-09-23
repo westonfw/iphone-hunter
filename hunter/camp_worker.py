@@ -23,6 +23,9 @@ from .autobuy import BuyResult
 class CampWorker:
     #: 被拦后的静默阶梯（秒），按连续被拦次数取档（第 1 次只看 retry_after）。
     COOLDOWNS = (120.0, 240.0, 300.0)
+    #: 配置死局 / 不可重试的结论连着出现时的退避（秒）：原来 3s 一次重建 + 推送，
+    #: 一直失败就一直刷。第 1 次和之后每 5 次推送一条，其余只记日志。
+    DEAD_COOLDOWNS = (30.0, 60.0, 120.0)
 
     def __init__(self, buyer, report, *, url: str,
                  in_stock_numbers=None, cadence: float = 8.0,
@@ -57,6 +60,10 @@ class CampWorker:
         self.thread = None
         #: 连续「进不了结账入口」（541）的次数，攒到 5 次说一句。
         self._fails = 0
+        #: 连续不可重试结论的次数
+        self._dead = 0
+        #: 信号序号：每条带店的信号 +1，蹲守据此认「这是新的一条」
+        self._seq = 0
         #: 放货信号：收到所蹲型号的 sighting 就 set()，让蹲守里的 search 立刻打。
         self.wake = threading.Event()
         #: 信号带的门店：{"store": "R359"}。蹲守下一发 search 直接选这家，
@@ -79,10 +86,20 @@ class CampWorker:
 
     def observe(self, part, offers, unavailable=(), definitive=True) -> None:
         if part == self.part and offers:
-            # 候选已按（型号优先级, 门店名次）排好，第一家就是最想去的有货店。
-            store = str(getattr(offers[0], "store", "") or "").strip().upper()
+            # **取最新看到的那家**，不是配置排最前的那家：买手的候选按（型号名次,
+            # 配置名次）排，R581 还在候选里没过期时 R359 放货，排第一的仍是 R581。
+            # 同一时刻看到的（快照）observed 相同，max 取列表里靠前的，即配置顺序。
+            def seen(o):
+                try:
+                    return float(getattr(o, "observed", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+            best = max(offers, key=seen)
+            store = str(getattr(best, "store", "") or "").strip().upper()
             if store and (not self.in_stock_numbers or store in self.in_stock_numbers):
-                self.hint["store"] = store
+                if self.hint.get("store") != store:
+                    self._seq += 1
+                    self.hint.update(store=store, seq=self._seq)
             self.signal()
 
     def restock(self, part) -> None:
@@ -154,12 +171,26 @@ class CampWorker:
 
                 # 到这儿才是真结论（成单 / 结果不明 / 配置死局）：报出来。
                 self._fails = 0
-                self.report(result, self._title(), self.url)
-
                 if result.quota_done or getattr(self.buyer, "halt_for_human", False):
+                    self.report(result, self._title(), self.url)
                     self.halted = True
                     self.log(f"[蹲守] {result.detail or '收工'}")
                     break
+                dead = (not result.ok and (getattr(result, "fatal", False)
+                                           or not getattr(result, "retriable", True)))
+                if dead:
+                    # 配置死局（不是自提、没门店、没这个付款方式…）或入口反复失败：
+                    # 退避着重试，别 3 秒一次刷推送。
+                    self._dead += 1
+                    if self._dead == 1 or self._dead % 5 == 0:
+                        self.report(result, self._title(), self.url)
+                    pause = self.DEAD_COOLDOWNS[min(self._dead, len(self.DEAD_COOLDOWNS)) - 1]
+                    self.log(f"[蹲守] {result.stage}——{pause:.0f}s 后再试"
+                             f"（连续第 {self._dead} 次）")
+                    self._pause(pause)
+                    continue
+                self._dead = 0
+                self.report(result, self._title(), self.url)
                 self._pause(self.rebuild_pause)
         finally:
             try:

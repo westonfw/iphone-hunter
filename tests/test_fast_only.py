@@ -278,6 +278,31 @@ class CampBypassesGoneTests(unittest.TestCase):
         self.assertTrue(r.retry_after >= 120)
         self.assertTrue(self.ab._reload_next)
 
+    def test_reaching_review_without_ordering_is_not_an_order(self):
+        # stop_at_review / place_order=false：ok 但没下单 → order_placed 不置位
+        p = Mock(no_retry=False, retriable=True, fast_ordered=False, blocked=False,
+                 retry_after=0.0, result_url='', secure_host='')
+        r = self.ab._wrap(p, self.URL, True, "已到 Review", "", "")
+        self.assertTrue(r.ok)
+        self.assertFalse(self.ab.order_placed)
+        p2 = Mock(no_retry=False, retriable=True, fast_ordered=True, blocked=False,
+                  retry_after=0.0, result_url='', secure_host='')
+        r2 = self.ab._wrap(p2, self.URL, True, "已下单", "", "W123")
+        self.assertTrue(self.ab.order_placed)
+        self.assertTrue(r2.order_created)
+
+    def test_blocked_at_the_entrance_forces_a_reload_too(self):
+        from hunter.fastpath import Blocked
+        self.ab._camp = {'wake': None, 'stop': lambda: False,
+                         'cadence': 8, 'idle_cadence': 120, 'hot_seconds': 25,
+                         'max_seconds': 1080}          # camp 模式才会无视「没货」往里走
+        self.ab._enter_checkout = Mock(side_effect=Blocked("bag 被拦（541）"))
+        with patch('hunter.fastpath.bag_to_checkout', side_effect=Blocked("bag 被拦（541）")):
+            r = self.ab._drive(Mock(), self.page, self.URL, False)
+        self.assertFalse(r.ok)
+        self.assertTrue(r.retry_after >= 120)
+        self.assertTrue(self.ab._reload_next)
+
     def test_camp_enters_checkout_despite_gone(self):
         # camp 模式：无视「没货」，一路进到结账、调 placer.camp
         p = Mock(no_retry=False, retriable=True, fast_ordered=False, blocked=False,
