@@ -49,6 +49,25 @@ def bare_buyer(**over):
     return b
 
 
+class SignalLogTests(unittest.TestCase):
+    def test_a_sighting_is_logged_with_store_and_lag(self):
+        b = bare_buyer(only_stores=['R581', 'R359'], note_of={'P': 'Pro Max 256GB 红'})
+        b.heard_of(Sighting(part='P', store='R359', name='南京东路',
+                            at=time.time() - 0.4, src='scout'))
+        lines = [str(c.args[0]) for c in b.log.call_args_list]
+        hit = [x for x in lines if '放货信号' in x]
+        self.assertEqual(1, len(hit), lines)
+        self.assertIn('Pro Max 256GB 红 @ 南京东路（R359）', hit[0])
+        self.assertIn('（scout）', hit[0])
+        self.assertIn('当前候选 R359', hit[0])
+
+    def test_filtered_sightings_are_not_logged(self):
+        b = bare_buyer(only_stores=['R581'])
+        b.heard_of(Sighting(part='P', store='R999', name='别处', at=time.time()))
+        b.heard_of(Sighting(part='Q', store='R581', name='五角场', at=time.time()))
+        self.assertFalse([c for c in b.log.call_args_list if '放货信号' in str(c.args[0])])
+
+
 def saw(b, part='P', seen_ago=None, clear_ago=None, stock=None):
     """按「多少秒前」摆好买手看到的东西。
 

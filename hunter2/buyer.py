@@ -482,6 +482,13 @@ class Buyer:
                 if o.observed < cutoff:
                     del cur[store]
             batch = sorted(cur.values(), key=lambda o: (o.priority, o.store))
+        # 收到放货信号就记一笔：型号、门店、探针看到它到我们收到隔了多久。
+        # 没有这一行的话，「信号到底来没来、来得晚不晚」只能靠 search 的时间反推。
+        lag = max(0.0, time.time() - s.at) if s.at else 0.0
+        who = f"（{s.src}）" if s.src else ""
+        self.log(f"[买手] 放货信号：{self.note_of.get(s.part) or s.part} @ "
+                 f"{s.name or s.store}（{s.store}）{who}，探针看到后 {lag:.1f}s 送达，"
+                 f"当前候选 {'、'.join(o.store for o in batch)}")
         self.worker.observe(s.part, batch)
 
     def stock_live(self, part: str):
