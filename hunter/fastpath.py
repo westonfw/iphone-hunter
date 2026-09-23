@@ -1326,7 +1326,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 90.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1336,11 +1336,14 @@ class FastCheckout:
         而是**贴着窗口连续查**，总有一发 search 的读库存时刻落进窗口。
 
         **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
-        也是白打（今天的失败全是「主程序看到、search 没跟上」，没有反过来的），
+        也是白打（失败全是「主程序看到、search 没跟上」，没有反过来的），
         而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
-          * 主程序安静时 → **冷档**：`idle_cadence`（默认 30s）也一直打 search，
-            只是慢些——把会话保持热着（首发 10s 是一次性的，之后 ~500ms），
-            凉了下一发又要 10s；顺带续会话、也能自己发现货。
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 90s）慢打 search 保温。
+            **不能只续期不 search**：一个会话里冷的 search 要 20s（2026-09-22 起
+            两个买手 150+ 发无一例外，之前是 8~10s），而放货窗口只有 6~15s；
+            只有隔几分钟就打一发的会话，下一发才是 1~3s（buyerB 09-22 00:00~00:40
+            的实测）。预热那一发回来不等于热了：紧跟着 2s 后再打仍要 17s。
+            search 本身就是交互，顺带把 5 分钟空闲计时也续了。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
@@ -1377,22 +1380,23 @@ class FastCheckout:
         except Stalled as e:
             return False, "⚠️ 上膛失败", f"{e}"
 
-        # 进来时若主程序已经在报货（wake 已 set），直接进热档；否则冷档续会话。
-        # 一个会话第一发 search 8~10s、之后全 1~3s（2026-09-22 buyerB 实测：同一
-        # 会话稀疏打 6 发、间隔几分钟，除首发外都 1~3s）——**会话预热过就整段是热的，
-        # 不用一直发也不凉**。所以：开场先打一发把 10 秒烧掉，之后**只跟着主程序
-        # 信号发** search，别定时空打（免得频繁 checkoutx 被 541）。
-        # 保活（点对话框、切 tab、续期）不受这个限制，照常按短 tick 做。
+        # 进来时若主程序已经在报货（wake 已 set），直接进热档；否则冷档慢打保温。
+        # 曾经改成「预热一发之后只跟信号发、空闲只续期」（15fd1bc），结果 09-22 到
+        # 09-23 两个买手每一发信号 search 都是冷的 20s，13:53 那次放货信号 1s 内就
+        # 打出去了、17.6s 后才回，窗口早关了。续期接口保得住会话，保不住「热」。
+        # 保活（点对话框、切 tab）不受 search 间隔限制，照常按短 tick 做。
         shots = 0
+        last_shot = clock()
 
         def one_search(hot: bool):
             """打一发 search，记耗时，命中就下单。返回 place 结果或 None。"""
-            nonlocal shots
+            nonlocal shots, last_shot
+            last_shot = clock()
             data = self.step2_store(page)
             shots += 1
             ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
-            self.log(f"[蹲守] 第 {shots} 发 search {ms}ms（{'信号' if hot else '预热'}）"
-                     + ("　← 首发那 10 秒是一次性的，之后就热了" if shots == 1 else ""))
+            why = "信号" if hot else ("预热" if shots == 1 else "保温")
+            self.log(f"[蹲守] 第 {shots} 发 search {ms}ms（{why}）")
             if self.arm_from_search(page, data):
                 self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
                          f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
@@ -1402,7 +1406,6 @@ class FastCheckout:
         #: 保活 tick：多久做一次 keep_awake（点对话框/切 tab）。客户端「还在吗」是
         #: 60 秒倒计时，15 秒一次足够在它走完前点掉。这动作是纯 DOM，不打服务端。
         keep_tick = min(15.0, idle_cadence)
-        last_extend = clock()
         hot_until = clock() + hot_seconds if (wake is not None and wake.is_set()) else 0.0
         try:
             # 预热：进场先打一发，把 10 秒首发烧掉，会话即热。
@@ -1428,28 +1431,26 @@ class FastCheckout:
                         f"到重建点，换个新会话接着蹲")
 
                 # 保活（不受 search 频率限制）：每 tick 点掉「还在吗」对话框、切取货
-                # tab、踹醒客户端计时器；服务端会话每 idle_cadence 秒用续期接口保一次。
+                # tab、踹醒客户端计时器。服务端那边靠下面的 search 本身续着。
                 self.keep_awake(page)
                 hot = clock() < hot_until
                 try:
                     if hot:
-                        # 主程序报了货：打 search（此时会话已热，~1~3s），命中就下单。
+                        # 主程序报了货：打 search（会话保温着，~1~3s），命中就下单。
                         r = one_search(hot=True)
                         if r is not None:
                             return r
-                    elif clock() - last_extend >= idle_cadence:
-                        # 空闲：不 search，只用续期接口保服务端会话（就是「我还在」）。
-                        te = clock()
-                        self.extend_session(page)
-                        self.log(f"[蹲守] 续期保活（{(clock() - te) * 1000:.0f}ms）——"
-                                 f"重置服务端 5 分钟空闲计时，不查库存")
-                        last_extend = clock()
+                    elif clock() - last_shot >= idle_cadence:
+                        # 空闲：慢打一发保温，顺带续 5 分钟空闲计时、也能自己发现货。
+                        r = one_search(hot=False)
+                        if r is not None:
+                            return r
                 except SessionExpired:
                     return False, "rebuild", f"会话过期（打了 {shots} 发），重建"
                 except Blocked as e:
                     self.retry_after = getattr(e, "retry_after", 0.0) or 0.0
                     back = max(cadence * 3, self.retry_after)
-                    self.log(f"[蹲守] {'search' if hot else '续期'}被拦（{e}），"
+                    self.log(f"[蹲守] {'信号' if hot else '保温'} search 被拦（{e}），"
                              f"退避 {back:.0f}s——见 README 坑 9")
                     _, woke = self._nap(wake, back, stop, clock, sleep)
                     if stop():

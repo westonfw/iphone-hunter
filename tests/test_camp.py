@@ -181,18 +181,18 @@ class CadenceTests(unittest.TestCase):
 
 
 class KeepAliveTests(unittest.TestCase):
-    """预热打一发烧掉 10 秒；之后空闲不 search、只续期保活；信号才 search。"""
+    """预热打一发；之后空闲按 idle_cadence 慢打 search 保温（不用续期接口）；信号才密打。"""
 
     def fc(self):
         return placer(store="R581", stores=["R581"], place_order=False,
                       stk_timeout_ms=50)
 
-    def test_primes_once_then_idle_extends_not_searches(self):
+    def test_primes_then_idle_keeps_searching_slowly(self):
         page = FakePage([FUL] + [MISS] * 8)
         fc = self.fc()
         t = [1000.0]
         def clock():
-            t[0] += 1        # 时间会走，续期间隔才到得了
+            t[0] += 1        # 时间会走，冷档间隔才到得了
             return t[0]
         n = [0]
         def stop():
@@ -203,10 +203,27 @@ class KeepAliveTests(unittest.TestCase):
         actions = [c["query"] for c in page.calls]
         searches = [q for q in actions if "_a=search" in q]
         extends = [q for q in actions if "extendSessionUrl" in q]
-        # 预热只打了 1 发 search（没有信号，不再空打）
-        self.assertEqual(1, len(searches), actions)
-        # 空闲靠续期接口保活
-        self.assertTrue(len(extends) >= 1, actions)
+        # 预热 1 发 + 空闲慢打：凉的 search 要 20s，只续期保不住热
+        self.assertTrue(len(searches) >= 2, actions)
+        # 不再用续期接口——search 本身就是交互
+        self.assertEqual(0, len(extends), actions)
+
+    def test_idle_search_waits_for_the_idle_cadence(self):
+        page = FakePage([FUL] + [MISS] * 8)
+        fc = self.fc()
+        t = [1000.0]
+        def clock():
+            t[0] += 1
+            return t[0]
+        n = [0]
+        def stop():
+            n[0] += 1
+            return n[0] > 6
+        fc.camp(page, cadence=1, idle_cadence=1e6, hot_seconds=0, max_seconds=1e9,
+                stop=stop, clock=clock, sleep=lambda *_: None)
+        searches = [c["query"] for c in page.calls if "_a=search" in c["query"]]
+        # 间隔没到就只有预热那一发
+        self.assertEqual(1, len(searches))
 
     def test_keep_awake_logs_only_when_it_does_something(self):
         from unittest.mock import Mock

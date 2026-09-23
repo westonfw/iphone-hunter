@@ -23,7 +23,7 @@ from .autobuy import BuyResult
 class CampWorker:
     def __init__(self, buyer, report, *, url: str,
                  in_stock_numbers=None, cadence: float = 8.0,
-                 idle_cadence: float = 180.0, hot_seconds: float = 25.0,
+                 idle_cadence: float = 90.0, hot_seconds: float = 25.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
         self.buyer = buyer          # AutoBuy
@@ -32,11 +32,11 @@ class CampWorker:
         self.in_stock_numbers = list(in_stock_numbers or [])
         #: 主程序报货后热档密打的间隔。像人一样，别打成 541。
         self.cadence = max(1.0, float(cadence))
-        #: 冷档（主程序安静）间隔。也一直打 search，只是慢些——目的是把会话**保持
-        #: 热着**：那 10 秒只是一个会话第一发 search 的一次性开销，之后全是 ~500ms
-        #: （2026-09-21 实测同一会话 90+ 发，首发 10s、其余 0.5s）。会话凉了下一发
-        #: 又要 10 秒，所以冷档也别停，30s 一发既保热又把 interactionMs 压着不弹
-        #: 「还在吗」。session 内实测不吃 541。
+        #: 冷档（主程序安静）间隔。也一直打 search，只是慢些——目的是把会话**保温**：
+        #: 凉的 search 一发 20s（2026-09-22 起两个买手实测，之前 8~10s），隔几分钟
+        #: 打一发的会话下一发才是 1~3s。只续期不 search 保不住热（15fd1bc 试过，
+        #: 09-23 13:53 放货信号 1s 内打出去、17.6s 才回）。90s 一发也顺带把
+        #: interactionMs 压着不弹「还在吗」。session 内实测不吃 541。
         self.idle_cadence = max(self.cadence, float(idle_cadence))
         #: 收到放货信号后热档持续多久，之后没有新信号就回冷档。
         self.hot_seconds = max(0.0, float(hot_seconds))
