@@ -1325,7 +1325,7 @@ class FastCheckout:
             self.store = cand[0]
         return False
 
-    def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
+    def camp(self, page, *, wake=None, hint=None, stop=None, cadence: float = 8.0,
              idle_cadence: float = 120.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
@@ -1347,7 +1347,8 @@ class FastCheckout:
             checkoutx/fulfillment 有按出口 IP 的累计预算，09-23 90s 一发跑了
             92 分钟、68 个 POST 就 541（09-21 10s 一发 12 分钟 ~70 个也是）；
             180s 一发实测仍是 1~3s（buyerB 09-22 00:16~00:31），120 取折中。
-          * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
+          * 主程序报这个型号有货（wake 被 set，hint 带着哪家店）→ **热档**：这一发
+            直接 selectStore 信号里那家店，然后按 `cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
 
@@ -1394,13 +1395,27 @@ class FastCheckout:
         def one_search(hot: bool):
             """打一发 search，记耗时，命中就下单。返回 place 结果或 None。"""
             nonlocal shots, last_shot
+            # **信号说哪家有货就查哪家。** search 的时段只挂在 selectStore 那一家
+            # 上，而服务端每会话 10s 才放行一发；窗口内那唯一一发查配置里的第一家
+            # 再换店，换完窗口早关了（2026-09-23 17:34、17:36 两次都是这么丢的）。
+            want = str((hint or {}).get("store") or "").strip().upper() if hot else ""
+            if want and want != self.store and (want in self.stores or
+                                                 not self.allow or want in self.allow):
+                self.log(f"[蹲守] 信号说 {want} 有货，这一发改查它（原选 {self.store}）")
+                self.store = want
             last_shot = clock()
             data = self.step2_store(page)
             shots += 1
             ms = int((self.timings[-1][1] if self.timings else 0) * 1000)
             why = "信号" if hot else ("预热" if shots == 1 else "保温")
-            self.log(f"[蹲守] 第 {shots} 发 search {ms}ms（{why}）")
-            if self.arm_from_search(page, data):
+            asked = self.store
+            ready = self._preferred_ready(data)
+            armed = self.arm_from_search(page, data)
+            # 每发都说清看到了什么：没中的时候才分得清是查错店还是结账侧没货
+            self.log(f"[蹲守] 第 {shots} 发 search {ms}ms（{why}）· 查 {asked} · "
+                     f"结账侧有货 {'、'.join(ready) if ready else '无'}"
+                     + ("" if armed else " · 无时段"))
+            if armed:
                 self.log(f"[蹲守] 上膛命中：{self.store_used} 有时段"
                          f"（蹲了 {clock() - t0:.0f}s、第 {shots} 发），开始下单")
                 return self._place_from_armed(page, t0)

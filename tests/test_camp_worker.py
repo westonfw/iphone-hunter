@@ -88,6 +88,18 @@ class WorkerTests(unittest.TestCase):
         w.observe("MJY64CH/A", [object()])   # 所蹲型号
         self.assertTrue(w.wake.is_set())
 
+    def test_signal_carries_the_store_that_has_stock(self):
+        # 候选第一家是 R359 → hint 里带 R359，蹲守那一发直接查它
+        b = FakeBuyer([])
+        w = CampWorker(b, lambda *a: None, url=URL, in_stock_numbers=["R581", "R359"],
+                       log=lambda *a: None)
+        w.observe("MJY64CH/A", [Mock(store="R359"), Mock(store="R581")])
+        self.assertEqual("R359", w.hint.get("store"))
+        self.assertTrue(w.wake.is_set())
+        # 不在配置边界内的店不带
+        w.observe("MJY64CH/A", [Mock(store="R999")])
+        self.assertEqual("R359", w.hint.get("store"))
+
     def test_observe_without_offers_does_not_wake(self):
         b = FakeBuyer([])
         w = CampWorker(b, lambda *a: None, url=URL, log=lambda *a: None)

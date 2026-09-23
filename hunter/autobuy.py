@@ -854,7 +854,7 @@ class AutoBuy:
                            in_stock=in_stock, in_stock_numbers=in_stock_numbers)
 
     def camp(self, url: str, in_stock_numbers: list[str] | None = None,
-             *, wake=None, stop=None, cadence: float = 8.0,
+             *, wake=None, hint=None, stop=None, cadence: float = 8.0,
              idle_cadence: float = 120.0, hot_seconds: float = 25.0,
              session_seconds: float = 1080.0) -> BuyResult:
         """守株待兔一段：加购目标型号 → 进结账 → 停在 step1 反复打 search。
@@ -868,7 +868,7 @@ class AutoBuy:
         wake 是放货信号的 Event（收到该型号的 sighting 就 set），stop 是收工判据。
         cadence 是空闲时两发 search 的最小间隔，session_seconds 是多久重建（< TTL）。
         """
-        self._camp = {"wake": wake, "stop": stop, "cadence": cadence,
+        self._camp = {"wake": wake, "hint": hint, "stop": stop, "cadence": cadence,
                       "idle_cadence": idle_cadence, "hot_seconds": hot_seconds,
                       "max_seconds": session_seconds}
         try:
@@ -1261,7 +1261,8 @@ class AutoBuy:
 
         if self._camp is not None:
             c = self._camp
-            outcome = placer.camp(page, t0, wake=c.get("wake"), stop=c.get("stop"),
+            outcome = placer.camp(page, t0, wake=c.get("wake"), hint=c.get("hint"),
+                                  stop=c.get("stop"),
                                   cadence=c.get("cadence", 8.0),
                                   idle_cadence=c.get("idle_cadence", 120.0),
                                   hot_seconds=c.get("hot_seconds", 25.0),

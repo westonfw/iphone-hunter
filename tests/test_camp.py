@@ -180,6 +180,46 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual(8, waits[1])    # 被信号敲醒后：热档 cadence
 
 
+class SignalStoreTests(unittest.TestCase):
+    """信号带门店：热档那一发直接 selectStore 信号里的店，不先查配置第一家再换。"""
+
+    def test_hot_search_selects_the_hinted_store(self):
+        import threading
+        # 预热（R581，MISS）→ 信号说 R359 → 这一发就查 R359 且命中
+        page = FakePage([FUL, MISS, HIT, CONTACT, BANKS, MONTHS, REVIEW])
+        fc = placer(store="R581", stores=["R581", "R359"], place_order=False,
+                    stk_timeout_ms=50)
+        wake = threading.Event(); wake.set()
+        hint = {"store": "R359"}
+        t = [1000.0]
+        def clock():
+            t[0] += 1
+            return t[0]
+        fc.camp(page, wake=wake, hint=hint, cadence=1, idle_cadence=1e6,
+                hot_seconds=1e6, max_seconds=1e9, clock=clock, sleep=lambda *_: None)
+        bodies = [c["body"] for c in page.calls if "_a=search" in c["query"]]
+        self.assertEqual(2, len(bodies))
+        self.assertIn("selectStore=R581", bodies[0])   # 预热还是配置第一家
+        self.assertIn("selectStore=R359", bodies[1])   # 信号那一发直接查 R359
+        self.assertEqual("R359", fc.store_used)
+
+    def test_hint_outside_the_boundary_is_ignored(self):
+        import threading
+        page = FakePage([FUL, MISS, MISS])
+        fc = placer(store="R581", stores=["R581"], allow=["R581"], place_order=False,
+                    stk_timeout_ms=50)
+        wake = threading.Event(); wake.set()
+        n = [0]
+        def stop():
+            n[0] += 1
+            return n[0] > 2
+        fc.camp(page, wake=wake, hint={"store": "R999"}, stop=stop, cadence=0,
+                hot_seconds=1e6, max_seconds=1e9, clock=lambda: 1000.0,
+                sleep=lambda *_: None)
+        bodies = [c["body"] for c in page.calls if "_a=search" in c["query"]]
+        self.assertTrue(all("selectStore=R581" in b for b in bodies), bodies)
+
+
 class KeepAliveTests(unittest.TestCase):
     """预热打一发；之后空闲按 idle_cadence 慢打 search 保温（不用续期接口）；信号才密打。"""
 

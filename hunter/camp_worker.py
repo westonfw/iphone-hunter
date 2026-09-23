@@ -59,6 +59,10 @@ class CampWorker:
         self._fails = 0
         #: 放货信号：收到所蹲型号的 sighting 就 set()，让蹲守里的 search 立刻打。
         self.wake = threading.Event()
+        #: 信号带的门店：{"store": "R359"}。蹲守下一发 search 直接选这家，
+        #: 别先查配置里第一家再换店——结账侧 search 每会话 10s 才放行一发，
+        #: 放货窗口 4~6s，窗口内那唯一一发查错店就全没了（2026-09-23 17:34 实录）。
+        self.hint: dict = {}
         # Playwright 归这个线程，跟 PurchaseWorker 一样的约定
         self.buyer.cancelled = lambda: self.closed
         self.buyer.managed = True
@@ -75,6 +79,10 @@ class CampWorker:
 
     def observe(self, part, offers, unavailable=(), definitive=True) -> None:
         if part == self.part and offers:
+            # 候选已按（型号优先级, 门店名次）排好，第一家就是最想去的有货店。
+            store = str(getattr(offers[0], "store", "") or "").strip().upper()
+            if store and (not self.in_stock_numbers or store in self.in_stock_numbers):
+                self.hint["store"] = store
             self.signal()
 
     def restock(self, part) -> None:
@@ -106,7 +114,7 @@ class CampWorker:
                 try:
                     result = self.buyer.camp(
                         self.url, self.in_stock_numbers,
-                        wake=self.wake, stop=lambda: self.closed,
+                        wake=self.wake, hint=self.hint, stop=lambda: self.closed,
                         cadence=self.cadence, idle_cadence=self.idle_cadence,
                         hot_seconds=self.hot_seconds,
                         session_seconds=self.session_seconds)
