@@ -100,3 +100,33 @@ class CampWorkerSwitchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CredentialDecodingTests(unittest.TestCase):
+    def test_percent_encoded_password_is_decoded_before_basic_auth(self):
+        import base64
+        c = ProxyControl("http://hunter:Nw%40x@203.0.113.1:8081")
+        self.assertEqual("Basic " + base64.b64encode(b"hunter:Nw@x").decode(), c._auth)
+        from hunter.autobuy import playwright_proxy
+        self.assertEqual({"server": "http://203.0.113.1:8081", "username": "hunter", "password": "Nw@x"},
+                         playwright_proxy("http://hunter:Nw%40x@203.0.113.1:8081"))
+
+
+class BlockedBeforeArmingTests(unittest.TestCase):
+    """541 发生在上膛之前（页面被扔到 /shop/404、读不到 stk）也要按被拦报，
+    这样 CampWorker 才会走静默冷却 / 换出口 IP，而不是 30 秒一次地重撞。"""
+
+    def test_stk_failure_with_a_541_hit_becomes_a_blocked_result(self):
+        blocked = {"hits": [{"status": 541, "url": "x", "retry_after": 0.0}], "retry_after": 0.0}
+        r = AutoBuy._blocked_before_arming((False, "⚠️ 读不到 x-aos-stk", "不在结账页上"), blocked, "u")
+        self.assertIsNotNone(r)
+        self.assertFalse(r.ok)
+        self.assertEqual(120, r.retry_after)
+        self.assertIn("被限流", r.stage)
+
+    def test_other_outcomes_are_left_alone(self):
+        blocked = {"hits": [{"status": 541, "url": "x", "retry_after": 0.0}], "retry_after": 0.0}
+        self.assertIsNone(AutoBuy._blocked_before_arming((False, "rebuild", "到点"), blocked, "u"))
+        self.assertIsNone(AutoBuy._blocked_before_arming((True, "✅", ""), blocked, "u"))
+        self.assertIsNone(AutoBuy._blocked_before_arming(
+            (False, "⚠️ 读不到 x-aos-stk", ""), {"hits": [], "retry_after": 0.0}, "u"))

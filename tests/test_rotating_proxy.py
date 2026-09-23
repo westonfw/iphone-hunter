@@ -168,3 +168,19 @@ class RotateTests(unittest.TestCase):
         s._handle(conn)
         out = b"".join(c.args[0] for c in conn.sendall.call_args_list)
         self.assertIn(b"404", out)
+
+
+class ListenTests(unittest.TestCase):
+    def test_a_taken_port_is_reported_by_number_not_as_a_traceback(self):
+        import socket
+        holder = socket.socket(); holder.bind(("127.0.0.1", 0)); holder.listen(1)
+        port = holder.getsockname()[1]
+        s = rp.RotatingProxy(["1.1.1.1"], "u", "p", host="127.0.0.1", port=port, log=lambda *a: None)
+        try:
+            with self.assertRaises(OSError) as cm:
+                s.listen()
+            self.assertIn(str(port), str(cm.exception))
+            self.assertIn("另一份代理还在跑", str(cm.exception))
+        finally:
+            holder.close()
+

@@ -439,13 +439,27 @@ class RotatingProxy:
 
     # ---------- 服务器 ----------
 
-    def serve(self) -> None:
+    def listen(self) -> None:
+        """先把端口绑上。所有口都绑成功再开始服务——绑不上时报的是哪个端口被占，
+        而不是让固定口的线程先跑起来、轮换口最后才撞一串 traceback。"""
+        if self._srv is not None:
+            return
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((self.host, self.port))
+        try:
+            srv.bind((self.host, self.port))
+        except OSError as e:
+            srv.close()
+            raise OSError(f"端口 {self.host}:{self.port} 绑不上（{e.strerror or e}）——"
+                          f"另一份代理还在跑？看 ss -ltnp | grep :{self.port} 和 "
+                          f"systemctl status rotating-proxy") from e
         srv.listen(512)
         srv.settimeout(1.0)
         self._srv = srv
+
+    def serve(self) -> None:
+        self.listen()
+        srv = self._srv
         what = (f"固定口{'（' + self.label + '）' if self.label else ''}，出站 IP {self.ips[0]}"
                 + (f"（备用 {len(self.ips) - 1} 个，GET /rotate 换）" if len(self.ips) > 1 else
                    "（没有备用，被 541 只能干等）")
@@ -562,6 +576,12 @@ def main(argv=None) -> int:
         servers.append(RotatingProxy(lst, args.user, password, host=args.host, port=port,
                                      max_conns=args.max_conns, pinned=True, allow=allow,
                                      label=path.name))
+    try:
+        for srv in servers:
+            srv.listen()
+    except OSError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     threads = [threading.Thread(target=srv.serve, daemon=True) for srv in servers[1:]]
     for t in threads:
         t.start()

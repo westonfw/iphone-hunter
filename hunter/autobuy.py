@@ -19,7 +19,7 @@ import json
 import os
 import re
 import subprocess
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 import time
 import urllib.error
 import urllib.request
@@ -1332,12 +1332,36 @@ class AutoBuy:
                                   idle_cadence=c.get("idle_cadence", 120.0),
                                   hot_seconds=c.get("hot_seconds", 25.0),
                                   max_seconds=c.get("max_seconds", 1080.0))
+            hit = self._blocked_before_arming(outcome, blocked, page.url)
+            if hit is not None:
+                return hit
         else:
             if self._gone(want_part, "六步"):
                 return BuyResult(False, "货已经没了，没走六步", page.url,
                                  "结账会话已建好，但监控在这一刻已经报无货。")
             outcome = placer.place(page, t0)
         return self._wrap(placer, placer.result_url or page.url, *outcome)
+
+    @staticmethod
+    def _blocked_before_arming(outcome, blocked: dict, url: str):
+        """上膛之前就被 541 的那种失败，按「被拦」报，别按普通失败报。
+
+        实录（2026-09-24 00:37）：进结账那一刻 URL 还是 /shop/checkout，页面自己的
+        fulfillment XHR 被 541，前端把标签扔到 /shop/404，蹲守随后读不到 x-aos-stk。
+        这个结果原来走的是普通失败路径：30/60/120 秒一次地重试，每次都再撞一下
+        checkoutx，而被拦分支（静默冷却、或走代理时换出口 IP）根本没进去。
+        """
+        ok, stage = outcome[0], outcome[1]     # OrderPlacer.camp 回的是 4 元组（多一个订单号）
+        if ok or not blocked.get("hits") or "读不到 x-aos-stk" not in str(stage):
+            return None
+        ra = float(blocked.get("retry_after") or 0)
+        first = blocked["hits"][0]
+        return BuyResult(
+            False, "⚠️ 结账被限流（上膛前就被拦）", url,
+            f"结账页开了，但它的 fulfillment XHR 被边缘节点拦了（{first['status']}），"
+            f"前端把页面扔到了 /shop/404，蹲守读不到 x-aos-stk。这是限流不是页面问题。"
+            + (f"对方要求等 {ra:.0f}s。" if ra else ""),
+            retriable=False, retry_after=max(120, ra))
 
     def _enter_checkout(self, ctx, page, want_part, state=None):
         """登录前后共用一个入口，页面入口异常与接口异常按同样方式传递。
@@ -1901,8 +1925,8 @@ def playwright_proxy(proxy_url: str) -> dict:
     # 是临时应急，全走代理也行——反正那台只转 Apple，别的 403 掉。
     del out["bypass"]
     if u.username:
-        out["username"] = u.username
-        out["password"] = u.password or ""
+        out["username"] = unquote(u.username)
+        out["password"] = unquote(u.password or "")
     return out
 
 

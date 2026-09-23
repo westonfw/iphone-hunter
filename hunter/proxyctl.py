@@ -10,7 +10,7 @@ import base64
 import json
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 class ProxyControlError(RuntimeError):
@@ -32,8 +32,9 @@ class ProxyControl:
         self.timeout = float(timeout)
         self._auth = ""
         if u.username:
+            # 地址里的密码是 URL 编码的（@ 写成 %40），发 Basic 之前要解回来
             self._auth = "Basic " + base64.b64encode(
-                f"{u.username}:{u.password or ''}".encode()).decode()
+                f"{unquote(u.username)}:{unquote(u.password or '')}".encode()).decode()
 
     def _get(self, path: str) -> dict:
         req = urllib.request.Request(self.base + path, method="GET")
