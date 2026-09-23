@@ -1326,7 +1326,7 @@ class FastCheckout:
         return False
 
     def camp(self, page, *, wake=None, stop=None, cadence: float = 8.0,
-             idle_cadence: float = 180.0, hot_seconds: float = 25.0,
+             idle_cadence: float = 120.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
         """守株待兔：停在 step1 之后反复打 search，命中就走完下单；查不到不退。
@@ -1338,7 +1338,7 @@ class FastCheckout:
         **节奏跟着主程序走（冷热两档）。** 主程序（scout）看不到货时，search 打了
         也是白打（失败全是「主程序看到、search 没跟上」，没有反过来的），
         而且每 8 秒空打一发几分钟就把 checkoutx 打成 541。所以：
-          * 主程序安静时 → **冷档**：`idle_cadence`（默认 180s）慢打 search 保温。
+          * 主程序安静时 → **冷档**：`idle_cadence`（默认 120s）慢打 search 保温。
             **不能只续期不 search**：一个会话里冷的 search 要 20s（2026-09-22 起
             两个买手 150+ 发无一例外，之前是 8~10s），而放货窗口只有 6~15s；
             只有隔几分钟就打一发的会话，下一发才是 1~3s（buyerB 09-22 00:00~00:40
@@ -1346,7 +1346,7 @@ class FastCheckout:
             search 本身就是交互，顺带把 5 分钟空闲计时也续了。但也别密：
             checkoutx/fulfillment 有按出口 IP 的累计预算，09-23 90s 一发跑了
             92 分钟、68 个 POST 就 541（09-21 10s 一发 12 分钟 ~70 个也是）；
-            180s 一发实测仍是 1~3s（buyerB 09-22 00:16~00:31）。
+            180s 一发实测仍是 1~3s（buyerB 09-22 00:16~00:31），120 取折中。
           * 主程序报这个型号有货（wake 被 set）→ **热档**：`cadence`（默认 8s）
             密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。

@@ -26,7 +26,7 @@ class CampWorker:
 
     def __init__(self, buyer, report, *, url: str,
                  in_stock_numbers=None, cadence: float = 8.0,
-                 idle_cadence: float = 180.0, hot_seconds: float = 25.0,
+                 idle_cadence: float = 120.0, hot_seconds: float = 25.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
         self.buyer = buyer          # AutoBuy
@@ -39,7 +39,7 @@ class CampWorker:
         #: 凉的 search 一发 20s（2026-09-22 起两个买手实测，之前 8~10s），隔几分钟
         #: 打一发的会话下一发才是 1~3s。只续期不 search 保不住热（15fd1bc 试过，
         #: 09-23 13:53 放货信号 1s 内打出去、17.6s 才回）。但 90s 一发 92 分钟
-        #: 68 个 POST 就 541（09-23 16:11），180s 一发实测仍是 1~3s，就用 180。
+        #: 68 个 POST 就 541（09-23 16:11），180s 一发实测仍是 1~3s，120 取折中。
         #: 也顺带把 interactionMs 压着不弹「还在吗」。
         self.idle_cadence = max(self.cadence, float(idle_cadence))
         #: 收到放货信号后热档持续多久，之后没有新信号就回冷档。
