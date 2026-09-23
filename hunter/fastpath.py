@@ -1199,6 +1199,10 @@ class FastCheckout:
         first_day = cands[0]["dayOfMonth"]
         same_day = [c for c in cands if c["dayOfMonth"] == first_day]
         if want in ("", "latest", "最晚"):
+            # 按时刻取最晚的一档，不信响应里的排列顺序：10 点和 18 点都有就要 18 点
+            timed = [(slot_minutes(c["slot"]), i) for i, c in enumerate(same_day)]
+            if all(m >= 0 for m, _ in timed):
+                return same_day[max(timed)[1]]
             return same_day[-1]
         if want in ("earliest", "最早"):
             return cands[0]

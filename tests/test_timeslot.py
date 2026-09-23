@@ -121,6 +121,18 @@ class ChooseTests(unittest.TestCase):
         推后了几天，那不是这个工具该做的决定。"""
         self.assertEqual("18-17:00-17:15", self.pick("latest")["slot"]["timeSlotValue"])
 
+    def test_latest_is_by_clock_not_by_list_order(self):
+        """10 点和 18 点都有就要 18 点，哪怕响应里 18 点排在前面。"""
+        import copy
+        data = copy.deepcopy(FUL_SLOTS["json"])
+        for node in FastCheckout._walk(data, "timeSlotWindows"):
+            for bucket in node["timeSlotWindows"]:
+                for day, slots in bucket.items():
+                    slots.reverse()
+            break
+        got = placer(pickup_time="latest").choose_slot(data)
+        self.assertEqual("18-17:00-17:15", got["slot"]["timeSlotValue"])
+
     def test_clock_picks_first_slot_not_earlier(self):
         self.assertEqual("18-12:30-12:45", self.pick("12:00")["slot"]["timeSlotValue"])
         self.assertEqual("18-12:30-12:45", self.pick("12:30")["slot"]["timeSlotValue"])
