@@ -623,7 +623,7 @@ jq -r .ms logs/watch-*.requests.jsonl | sort -n | awk '{a[NR]=$1} END{print "中
 | `autobuy.enabled` | 命中时是否自动走到结账页，默认 `false`（**先跑 `rehearse`**） |
 | `autobuy.warm` | 是否预热产品页，**默认 `false`**。只在知道几点开卖时才开（发布会当晚提前半小时）；补货监控不知道什么时候放货，挂久了预热页的会话会过期 |
 | `autobuy.pickup_stores` | 门店名显示偏好，兼容老字段 `pickup_store_name`；不限制快车道候选。限制取货门店请配置 `pickup.stores` / `autobuy.pickup_store_numbers` 编号 |
-| `autobuy.pickup_time` | 自提要选的取货时段：`earliest`（默认，最早可选）/ `latest`（最早那天里最晚的一档）/ `"HH:MM"`（当天第一档不早于它的）。见[自提要选「具体时间」了](#自提要选具体时间了2026-09-17-起) |
+| `autobuy.pickup_time` | 自提要选的取货时段：`latest`（默认，最早那天里最晚的一档：时段是所有买家抢同一池子，人人挑最早那档，最早那档最先没；挑当天最后一档，命中后那 50 秒里它还在的概率最大）/ `earliest`（最早可选）/ `"HH:MM"`（当天第一档不早于它的）。见[自提要选「具体时间」了](#自提要选具体时间了2026-09-17-起) |
 | `autobuy.clear_bag_before_add` | 加购前先清空购物袋，默认 `true`。**别关**，见[限购](#坑-6限购-2-台超限时静默卡死) |
 | `autobuy.preflight_interval` | 保活间隔（秒），默认 `300`。实测登录态约**每 2 小时掉一次**，而且是绝对寿命——每 10 分钟的真实导航也续不动。掉线到下一次保活之间就是裸奔窗口，这个值决定它有多长 |
 | `autobuy.preflight_warm_checkout` | 空闲期把结账那道登录墙提前撞掉，默认 `false`。**会往购物袋里加一台再清掉**，所以要你明确打开。实测墙一次付清后面全免（跨清袋、跨型号、跨门店），有效期 12~45 分钟，由 10 分钟一次的保活维持；换掉的是放货时 5~20 秒的登录。开着它就**不再翻订单页**——结账页认了你，那是比订单页更硬的登录证据 |
@@ -903,7 +903,8 @@ continueFromBillingToReview ✓ 10517ms （TTFB 10349ms / 排队 1ms / 收包 0m
   有这一步，哪怕继续看着可点也得等下拉出来：不选就点继续，校验不过又不报错，
   外层要等满一个 12s 冷却才会重来。
 
-选哪一档由 `autobuy.pickup_time` 决定：`earliest`（默认）/ `latest` /
+选哪一档由 `autobuy.pickup_time` 决定：`latest`（默认，当天最后一档——人人挑最早
+那档，最早那档最先没）/ `earliest` /
 `"HH:MM"`（当天第一档不早于它的；当天没有更晚的就退到最后一档）。
 **日子一律只看最早有档期的那天**：自提的意义就是当天/次日拿货，为了一个
 时间点把取货日推后几天不是这个工具该替人做的决定。
@@ -1069,7 +1070,7 @@ checkStatus                 → 302 .../shop/checkout        ← 驳回
   "installment_months": 24,
   "pickup_store_numbers": ["R581", "R359", "R389"],
   "pickup_city": "上海", "pickup_state": "上海", "pickup_district": "杨浦区",
-  "pickup_time": "earliest"
+  "pickup_time": "latest"
 }
 ```
 

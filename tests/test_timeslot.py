@@ -109,9 +109,10 @@ class ChooseTests(unittest.TestCase):
     def pick(self, want=""):
         return placer(pickup_time=want).choose_slot(FUL_SLOTS["json"])
 
-    def test_default_is_the_earliest(self):
-        """抢购场景默认越早拿到越好。"""
-        self.assertEqual("18-10:00-10:15", self.pick()["slot"]["timeSlotValue"])
+    def test_default_is_the_latest_slot_of_the_first_day(self):
+        """人人都挑最早那档，最早那档最先没；默认挑当天最后一档，命中后那 50 秒
+        它还在的概率最大。要最早的得明说。"""
+        self.assertEqual("18-17:00-17:15", self.pick()["slot"]["timeSlotValue"])
         self.assertEqual("18-10:00-10:15",
                          self.pick("earliest")["slot"]["timeSlotValue"])
 
@@ -130,8 +131,8 @@ class ChooseTests(unittest.TestCase):
         取不到时段这一步就过不去。"""
         self.assertEqual("18-17:00-17:15", self.pick("23:00")["slot"]["timeSlotValue"])
 
-    def test_garbage_preference_falls_back_to_earliest(self):
-        self.assertEqual("18-10:00-10:15", self.pick("下午")["slot"]["timeSlotValue"])
+    def test_garbage_preference_falls_back_to_the_default(self):
+        self.assertEqual("18-17:00-17:15", self.pick("下午")["slot"]["timeSlotValue"])
 
     def test_nothing_to_choose_when_flow_has_no_slots(self):
         self.assertEqual({}, placer().choose_slot(FUL_PLAIN["json"]))

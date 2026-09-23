@@ -541,3 +541,28 @@ class UnparkTests(unittest.TestCase):
         q = [c["query"] for c in page.calls]
         self.assertEqual("_s=Fulfillment-init", q[2])
         self.assertIn("selectFulfillmentLocationAction", q[3])
+
+
+class ProvinceCityDistrictTests(unittest.TestCase):
+    def test_omits_a_duplicated_municipality(self):
+        """直辖市是「上海 杨浦区」，其余省份是「浙江 宁波 海曙区」（2026-09-23 21:31
+        手动实录，那个地址是页面按定位自己填的，格式照抄、值不照抄）。"""
+        self.assertEqual("上海 杨浦区", placer(city="上海", state="上海",
+                                                district="杨浦区")._province_city_district())
+        self.assertEqual("浙江 宁波 海曙区", placer(city="宁波", state="浙江",
+                                                   district="海曙区")._province_city_district())
+
+
+class StallHintTemplateTests(unittest.TestCase):
+    def test_form_validation_templates_are_not_reported_as_errors(self):
+        """每个正常响应的 b 子树里都带着「请选择区。」「请选择一个时段。」这类校验
+        模板，不是服务端这次说的话。09-23 22:12 把它们当成了地址配置错。"""
+        from hunter.fastpath import stall_hints
+        data = {"body": {"checkout": {"fulfillment": {
+            "d": {"billingErrorMessageKey": "transaction.offer.availability.lost"},
+            "b": {"provinceCityDistrict": {"p": {"valid": {"then": {"error": "请选择区。"},
+                                                          "else": {"then": {"error": "请选择城市。"}}}}},
+                  "timeSlotValue": {"p": {"valid": {"then": {"error": "请选择一个时段。"}}}}}}}}}
+        got = stall_hints(data)
+        self.assertIn("availability.lost", got)
+        self.assertNotIn("请选择", got)

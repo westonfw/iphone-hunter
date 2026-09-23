@@ -590,6 +590,12 @@ def stall_hints(data, limit: int = 4) -> str:
     而我们当时完全看不到原因。这个函数就是为了下次能看到。
 
     只捞短文本，不落盘整个响应体：那里面有姓名、手机、地址。
+
+    **跳过每个模块的 `b` 子树。** 那是表单绑定，里面 `p.valid.then.error` 之类
+    是校验模板文字（「请选择区。」「请选择一个时段。」），每一个正常响应里
+    都原样带着，不是服务端这次说的话。2026-09-23 22:12 buyerC 第 3 步被打回，
+    捞出来的「请选择区 / 请选择城市」就是这种模板，害得人往地址配置上找原因，
+    而真相跟 buyerB 同一步一样：时段刚被拿走。
     """
     out, seen, walked = [], set(), set()
     stack = [data]
@@ -602,6 +608,8 @@ def stall_hints(data, limit: int = 4) -> str:
         if isinstance(cur, dict):
             for k, v in cur.items():
                 kl = str(k).lower()
+                if k == "b":
+                    continue
                 if isinstance(v, str) and v.strip() and any(e in kl for e in _ERR_KEYS):
                     txt = " ".join(v.split())[:120]
                     if txt not in seen:
@@ -994,6 +1002,14 @@ class FastCheckout:
     def _search_input(self) -> str:
         return f"{self.city} {self.district}".strip()
 
+    def _province_city_district(self) -> str:
+        """直辖市是「上海 普陀区」，其余省份是「浙江 宁波 海曙区」（2026-09-23
+        21:31 手动实录）。省市同名时只写一次。"""
+        parts = [self.state, self.city, self.district]
+        if self.state == self.city:
+            parts = parts[1:]
+        return " ".join(x for x in parts if x).strip()
+
     def _store_fields(self) -> list[tuple[str, str]]:
         return [
             (f"{_LOC}.showAllStores", "false"),
@@ -1001,7 +1017,7 @@ class FastCheckout:
             (f"{_LOC}.searchInput", self._search_input()),
             (f"{_ADDR}.city", self.city),
             (f"{_ADDR}.state", self.state),
-            (f"{_ADDR}.provinceCityDistrict", f"{self.city} {self.district}"),
+            (f"{_ADDR}.provinceCityDistrict", self._province_city_district()),
             (f"{_ADDR}.countryCode", "CN"),
             (f"{_ADDR}.district", self.district),
         ]
@@ -1167,8 +1183,10 @@ class FastCheckout:
     def choose_slot(self, data: dict) -> dict:
         """按配置挑一档。挑不出来返回空 dict。
 
-        * 空 / earliest：最早那一档（默认——抢购场景就是越早拿到越好）
-        * latest：**最早那一天**里最晚的一档，不是最后一天
+        * 空 / latest：**最早那一天**里最晚的一档（默认）。时段是所有买家抢
+          同一池子里的格子，人人都挑最早那档，最早那档就最先被拿走；挑当天
+          最后一档，命中之后那 50 秒里它还在的概率最大。不是最后一天。
+        * earliest：最早那一档
         * "HH:MM"：那天里第一档不早于它的；当天没有就退到当天最后一档
 
         日子一律只看最早有档期的那天：自提的意义就在当天/次日拿货，
@@ -1178,19 +1196,18 @@ class FastCheckout:
         if not cands:
             return {}
         want = self.pickup_time.lower()
-        if want in ("", "earliest", "最早"):
-            return cands[0]
-
         first_day = cands[0]["dayOfMonth"]
         same_day = [c for c in cands if c["dayOfMonth"] == first_day]
-        if want in ("latest", "最晚"):
+        if want in ("", "latest", "最晚"):
             return same_day[-1]
+        if want in ("earliest", "最早"):
+            return cands[0]
 
         mins = clock_minutes(want)
         if mins < 0:
             self.log(f"[快车道] ⚠️ 看不懂取货时段「{self.pickup_time}」"
-                     f"（要 earliest / latest / HH:MM），按最早的那档选")
-            return cands[0]
+                     f"（要 earliest / latest / HH:MM），按当天最后一档选")
+            return same_day[-1]
         later = [c for c in same_day if slot_minutes(c["slot"]) >= mins]
         if later:
             return later[0]
@@ -1673,7 +1690,7 @@ class FastCheckout:
         self.slot = self.choose_slot(data)
         if self.slot:
             self.log(f"[快车道] 取货时段 {slot_label(self.slot)}"
-                     f"（{self.pickup_time or 'earliest'}）")
+                     f"（{self.pickup_time or 'latest'}）")
             return self.slot
         if self._walk(data, "timeSlotWindows"):
             raise Stalled(
