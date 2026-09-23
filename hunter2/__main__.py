@@ -106,8 +106,8 @@ def cmd_doctor(args) -> int:
         print(f"  autobuy.camp.enabled = true   ← 守株待兔：常驻蹲在结账页反复打 search")
         print(f"    蹲的型号 = {note}（{part}）"
               f"   ← 单账号一次只能蹲一个，由 buyer_offset 挑；只有它放货才有意义")
-        print(f"    camp.cadence(热档) = {camp.get('cadence', 8)}s"
-              f"   ← 主程序报货后密打的间隔")
+        print(f"    camp.cadence(热档) = {camp.get('cadence', 0)}s"
+              f"   ← 报货后两发的最小间隔，0 = 一发回来立刻发下一发（服务端每会话 10s 放行一发）")
         print(f"    camp.idle_cadence(冷档) = {camp.get('idle_cadence', 120)}s"
               f"   ← 空闲时慢打 search 保温的间隔；凉了的会话一发要 20s，保温着才是 1~3s；90 跑 1.5 小时就 541，180 实测仍热；120 是折中")
         print(f"    camp.session_seconds = {camp.get('session_seconds', 1080)}s"

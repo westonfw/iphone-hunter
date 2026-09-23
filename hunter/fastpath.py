@@ -1314,7 +1314,7 @@ class FastCheckout:
             self.store = cand[0]
         return False
 
-    def camp(self, page, *, wake=None, hint=None, stop=None, cadence: float = 8.0,
+    def camp(self, page, *, wake=None, hint=None, stop=None, cadence: float = 0.0,
              idle_cadence: float = 120.0, hot_seconds: float = 25.0,
              max_seconds: float = 1080.0, clock=time.monotonic,
              sleep=None) -> tuple[bool, str, str]:
@@ -1337,8 +1337,10 @@ class FastCheckout:
             92 分钟、68 个 POST 就 541（09-21 10s 一发 12 分钟 ~70 个也是）；
             180s 一发实测仍是 1~3s（buyerB 09-22 00:16~00:31），120 取折中。
           * 主程序报这个型号有货（wake 被 set，hint 带着哪家店）→ **热档**：这一发
-            直接 selectStore 信号里那家店，然后按 `cadence`（默认 8s）
-            密打，持续 `hot_seconds`（默认 25s）再没有新信号就回冷档。
+            直接 selectStore 信号里那家店，之后**一发回来立刻发下一发**（`cadence`
+            是可选的最小间隔，默认 0），持续 `hot_seconds`（默认 25s）再没有新信号
+            就回冷档。服务端每会话 10s 放行一发，紧挨着发只是在它那边排队，读库存
+            的时刻是返回时刻——所以要做的就是让队列里永远有一发在等。
         放货信号一来立刻插一发、并进热档，不必等满当前间隔。
 
         max_seconds：这个会话最多蹲多久，必须 < 20 分钟 TTL（默认 18 分钟）。
@@ -1348,8 +1350,8 @@ class FastCheckout:
         sleep = sleep or time.sleep
         t0 = clock()
         deadline = t0 + max(1.0, float(max_seconds))
-        cadence = max(1.0, float(cadence))
-        idle_cadence = max(cadence, float(idle_cadence))
+        cadence = max(0.0, float(cadence))
+        idle_cadence = max(cadence, 1.0, float(idle_cadence))
         hot_seconds = max(0.0, float(hot_seconds))
         try:
             self.bring = page.bring_to_front
@@ -1380,8 +1382,8 @@ class FastCheckout:
         # 保活（点对话框、切 tab）不受 search 间隔限制，照常按短 tick 做。
         shots = 0
         last_shot = clock()
-        #: 上一发 search 返回的时刻：热档的 cadence 从它算。服务端每会话 10s 放行
-        #: 一发，紧挨着发只是排队；wake 每条心跳都会 set，不守这个的话 cadence 形同虚设。
+        #: 上一发 search 返回的时刻。热档默认一发接一发（cadence=0），配了 cadence
+        #: 就从这个时刻起算最小间隔。
         last_return = clock()
         #: 已经用过的信号 (store, seq)：同一条信号只覆盖一次选店，之后交给
         #: arm_from_search 按结账侧库存换店——不然 hint 和换店互相打架，整段热档
@@ -1481,8 +1483,8 @@ class FastCheckout:
                 # 踹醒客户端计时器。服务端那边靠下面的 search 本身续着。
                 self.keep_awake(page)
                 hot = clock() < hot_until
-                # 热档到点 = 距上一发返回满 cadence；新一条信号（换了店或新 seq）
-                # 可以插队。wake 每条心跳都会 set，不这么守的话 cadence 形同虚设。
+                # 热档：一发回来立刻发下一发（cadence=0）；配了最小间隔就等它满。
+                # 新一条信号（换了店或新 seq）随时插队。
                 fresh = hot and hint_key() is not None and hint_key() != applied
                 due = clock() - last_return >= cadence
                 try:
@@ -1522,7 +1524,7 @@ class FastCheckout:
                     if soft_fails >= 3:
                         return False, "rebuild", f"连着 {soft_fails} 发 search 出错，换个会话"
 
-                # 热档：等到下一发到点（距上一发返回满 cadence）；空闲：按 keep_tick 只保活。
+                # 热档：不等（或等满可选的最小间隔）；空闲：按 keep_tick 只保活。
                 if clock() < hot_until:
                     wait = max(0.0, last_return + cadence - clock())
                 else:

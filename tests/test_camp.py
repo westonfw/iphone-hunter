@@ -173,11 +173,29 @@ class CadenceTests(unittest.TestCase):
         def clock():
             t[0] += 1
             return t[0]
-        fc.camp(page, wake=threading.Event(), cadence=8, idle_cadence=240,
+        fc.camp(page, wake=threading.Event(), idle_cadence=240,
                 hot_seconds=60, max_seconds=1e9,
                 clock=clock, sleep=lambda *_: None)
         self.assertEqual(15, waits[0])   # 空闲：保活 tick
-        # 被信号敲醒后：热档等到「上一发返回 + cadence」，不超过 cadence 且大于 0
+        self.assertEqual(0, waits[1])    # 被信号敲醒后：一发回来立刻发下一发，不等
+
+    def test_an_explicit_hot_cadence_is_honoured(self):
+        import threading
+        page = FakePage([FUL] + [MISS] * 8)
+        fc = self.fc()
+        waits = []
+        n = [0]
+        def fake_nap(w, seconds, stop, clock, sleep):
+            waits.append(seconds)
+            n[0] += 1
+            return (n[0] >= 3, n[0] == 1)
+        fc._nap = fake_nap
+        t = [1000.0]
+        def clock():
+            t[0] += 1
+            return t[0]
+        fc.camp(page, wake=threading.Event(), cadence=8, idle_cadence=240,
+                hot_seconds=60, max_seconds=1e9, clock=clock, sleep=lambda *_: None)
         self.assertTrue(0 < waits[1] <= 8, waits)
 
 

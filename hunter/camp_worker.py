@@ -28,7 +28,7 @@ class CampWorker:
     DEAD_COOLDOWNS = (30.0, 60.0, 120.0)
 
     def __init__(self, buyer, report, *, url: str,
-                 in_stock_numbers=None, cadence: float = 8.0,
+                 in_stock_numbers=None, cadence: float = 0.0,
                  idle_cadence: float = 120.0, hot_seconds: float = 25.0,
                  session_seconds: float = 1080.0, rebuild_pause: float = 3.0,
                  log=print, clock=time.monotonic):
@@ -36,8 +36,9 @@ class CampWorker:
         self.report = report
         self.url = url
         self.in_stock_numbers = list(in_stock_numbers or [])
-        #: 主程序报货后热档密打的间隔。像人一样，别打成 541。
-        self.cadence = max(1.0, float(cadence))
+        #: 主程序报货后热档两发之间的最小间隔，默认 0：一发回来立刻发下一发。
+        #: 服务端每会话 10s 放行一发，密发只是在它那边排队，不会更快也不会更慢。
+        self.cadence = max(0.0, float(cadence))
         #: 冷档（主程序安静）间隔。也一直打 search，只是慢些——目的是把会话**保温**：
         #: 凉的 search 一发 20s（2026-09-22 起两个买手实测，之前 8~10s），隔几分钟
         #: 打一发的会话下一发才是 1~3s。只续期不 search 保不住热（15fd1bc 试过，
@@ -124,7 +125,7 @@ class CampWorker:
 
     def _run(self):
         self.log(f"[蹲守] 开始守株待兔：{self.url}"
-                 f"（主程序报货时 {self.cadence:.0f}s 一发，安静时 {self.idle_cadence:.0f}s "
+                 f"（主程序报货时{'一发接一发' if self.cadence <= 0 else f' {self.cadence:.0f}s 一发'}，安静时 {self.idle_cadence:.0f}s "
                  f"一发保持会话热，{self.session_seconds / 60:.0f} 分钟重建）")
         try:
             while not self.closed:

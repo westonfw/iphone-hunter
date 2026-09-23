@@ -152,7 +152,7 @@ class Buyer:
                 self.autobuy, self._report,
                 url=self._buy_url(self.camp_part),
                 in_stock_numbers=self.only_stores,
-                cadence=float(camp_cfg.get("cadence", 8)),
+                cadence=float(camp_cfg.get("cadence", 0)),
                 idle_cadence=float(camp_cfg.get("idle_cadence", 120)),
                 hot_seconds=float(camp_cfg.get("hot_seconds", 25)),
                 session_seconds=float(camp_cfg.get("session_seconds", 1080)),
