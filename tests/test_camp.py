@@ -472,3 +472,72 @@ class KeepAliveTests(unittest.TestCase):
         fc = self.fc()
         page = Mock(); page.evaluate.side_effect = RuntimeError("boom")
         fc.keep_awake(page)   # 不抛就行
+
+
+class UnparkTests(unittest.TestCase):
+    """命中后第 4~6 步没走通时，会话停在 billing：得先退回选店页再上膛。
+
+    2026-09-23 22:02 / 22:11 实录：continueFromBillingToReview 回
+    availability.lost，之后 selectFulfillmentLocationAction 和 search 全都原样回
+    billing，20 发「没推进」卡了 3 分多钟。
+    """
+
+    #: 第 6 步被打回：响应里只有 billing，没有 review
+    BILLING_AGAIN = resp("billing", {"options": []})
+
+    def _run(self, page, extra_stops=1):
+        import threading
+        fc = placer(store="R581", stores=["R581"], place_order=False, stk_timeout_ms=50)
+        wake = threading.Event(); wake.set()
+        n = [0]
+        def stop():
+            n[0] += 1
+            return n[0] > extra_stops
+        t = [1000.0]
+        def clock():
+            t[0] += 10
+            return t[0]
+        return fc, fc.camp(page, wake=wake, stop=stop, cadence=1, idle_cadence=1e6,
+                           hot_seconds=1e6, max_seconds=1e9, clock=clock,
+                           sleep=lambda *_: None)
+
+    def test_billing_stall_after_a_hit_goes_back_to_fulfillment_first(self):
+        # step1, 命中, 3/4/5 步走通, 第 6 步回 billing → Fulfillment-init → step1 → search
+        page = FakePage([FUL, HIT, CONTACT, BANKS, MONTHS, self.BILLING_AGAIN,
+                         FUL, FUL, MISS])
+        fc, (ok, stage, _) = self._run(page)
+        self.assertEqual("已停止", stage)
+        q = [c["query"] for c in page.calls]
+        i6 = next(i for i, x in enumerate(q) if "continueFromBillingToReview" in x)
+        self.assertEqual("_s=Fulfillment-init", q[i6 + 1])
+        self.assertEqual("/shop/checkoutx", page.calls[i6 + 1]["path"])
+        self.assertEqual("", page.calls[i6 + 1]["body"])
+        self.assertIn("selectFulfillmentLocationAction", q[i6 + 2])
+        self.assertIn("_a=search", q[i6 + 3])
+        self.assertFalse(fc.slot)
+
+    def test_step3_stall_still_resets_without_the_extra_shot(self):
+        # 第 3 步就被打回（响应里还是 fulfillment）：会话没离开选店页，不必多发一发
+        from test_fastpath import FUL_NO_SLOT
+        page = FakePage([FUL, HIT, FUL_NO_SLOT, FUL, MISS])
+        fc, (ok, stage, _) = self._run(page)
+        q = [c["query"] for c in page.calls]
+        self.assertFalse(any("Fulfillment-init" in x for x in q))
+
+    def test_a_parked_session_that_will_not_come_back_is_rebuilt(self):
+        # Fulfillment-init 本身也只回 billing → 别在这个会话里耗，重建
+        page = FakePage([FUL, HIT, CONTACT, BANKS, MONTHS, self.BILLING_AGAIN,
+                         self.BILLING_AGAIN])
+        fc, (ok, stage, detail) = self._run(page, extra_stops=99)
+        self.assertFalse(ok)
+        self.assertEqual("rebuild", stage)
+        q = [c["query"] for c in page.calls]
+        self.assertEqual(1, sum("Fulfillment-init" in x for x in q))
+
+    def test_a_search_stalled_on_billing_unparks_too(self):
+        # 不经过命中：保温 search 回 billing（会话被别的东西推到了后面）→ 退回、上膛
+        page = FakePage([FUL, self.BILLING_AGAIN, FUL, FUL, MISS])
+        fc, (ok, stage, _) = self._run(page, extra_stops=2)
+        q = [c["query"] for c in page.calls]
+        self.assertEqual("_s=Fulfillment-init", q[2])
+        self.assertIn("selectFulfillmentLocationAction", q[3])

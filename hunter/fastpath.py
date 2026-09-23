@@ -651,7 +651,16 @@ class Stalled(Exception):
     200 不等于生效，这一点栽过一次：四步全 200，服务端却一直停在 Fulfillment，
     结果是找不到付款选项、再退回点页面时又对着一个状态错位的页面死点。
     判据见 EXPECT——每个 continue 步骤必须在响应里产出下一节。
+
+    `sections` 是响应里 body.checkout 实际有的那几节：它说明服务端此刻把会话
+    停在哪一步。停在 billing 上时再发选店那族请求只会原样回 billing，得先退回
+    选店页（见 back_to_fulfillment）。
     """
+
+    def __init__(self, message: str, action: str = "", sections=()):
+        super().__init__(message)
+        self.action = action
+        self.sections = tuple(sections)
 
 
 #: 每一步做完之后，body.checkout 里必须出现的那一节。
@@ -663,6 +672,7 @@ EXPECT = {
     "continueFromPickupContactToBilling": "billing",
     "selectBillingOptionAction": "billing",
     "continueFromBillingToReview": "review",
+    "Fulfillment-init": "fulfillment",
 }
 
 
@@ -930,9 +940,10 @@ class FastCheckout:
             self.log(f"[蹲守] 页面维护（{what}）")
 
     def _post(self, page, path: str, action: str, module: str,
-              fields: list[tuple[str, str]], model_page: str = "") -> dict:
+              fields: list[tuple[str, str]], model_page: str = "",
+              query: str = "") -> dict:
         t0 = time.monotonic()
-        query = encode([("_a", action), ("_m", module)])
+        query = query or encode([("_a", action), ("_m", module)])
         body = encode(fields)
         r = page.evaluate(JS_POST, [path, query, body, self.stk, new_call_id(),
                                     model_page or "checkoutPage"]) or {}
@@ -968,7 +979,8 @@ class FastCheckout:
                     f"{action} 返回 200，但响应里没有 `{want}` 这一节"
                     f"（实际有：{', '.join(list(got)[:8]) or '空'}）——这一步没生效"
                     + (f"。响应里捞到的说法：{hints}" if hints
-                       else "。响应里没有任何错误文字，服务端没说为什么"))
+                       else "。响应里没有任何错误文字，服务端没说为什么"),
+                    action=action, sections=list(got))
         seg = r.get("ms") or {}
         net = r.get("net") or {}
         extra = f"（等服务端 {seg.get('head', '?')}ms / 收包 {seg.get('body', '?')}ms"
@@ -998,6 +1010,41 @@ class FastCheckout:
         self._post(page, "/shop/checkoutx/fulfillment",
                    "selectFulfillmentLocationAction", f"{_FUL}.fulfillmentOptions",
                    [(f"{_FUL}.fulfillmentOptions.selectFulfillmentLocation", "RETAIL")])
+
+    def back_to_fulfillment(self, page) -> dict:
+        """把结账向导退回选店页。
+
+        手动流程里从取货人/付款页点「返回」时页面发的就是这一发（2026-09-23
+        21:31 实录）：`POST /shop/checkoutx?_s=Fulfillment-init`，没有 _a/_m、空
+        请求体，响应重新带出 fulfillment 那一节。会话停在 billing 上时，
+        selectFulfillmentLocationAction 和 search 都只会原样回 billing——09-23
+        22:02 和 22:11 两次 availability.lost 之后就是这样，20 发全「没推进」，
+        卡了 3 分多钟，而那几分钟门店一直在放货。
+        """
+        return self._post(page, "/shop/checkoutx", "Fulfillment-init", "", [],
+                          query=encode([("_s", "Fulfillment-init")]))
+
+    @staticmethod
+    def parked_past_fulfillment(e) -> bool:
+        """这个 Stalled 是不是说明服务端把会话停在了选店页之后的某一步。"""
+        sections = getattr(e, "sections", ())
+        return bool(sections) and "fulfillment" not in sections
+
+    def _unpark(self, page, e) -> bool:
+        """会话卡在选店页之后：退回选店页、重新上膛。做了事返回 True。
+
+        退不回去就抛 SessionExpired 让蹲守重建会话——在同一个卡死的会话里
+        再打任何一发都是白烧 10 秒的坑位和 checkoutx 的 IP 预算。
+        """
+        if not self.parked_past_fulfillment(e):
+            return False
+        self.log(f"[蹲守] 会话停在 {'/'.join(e.sections)}，退回选店页再上膛")
+        try:
+            self.back_to_fulfillment(page)
+            self.step1_pickup(page)
+        except Stalled as e2:
+            raise SessionExpired(f"退不回选店页（{e2}），换个会话重建") from e2
+        return True
 
     def step2_store(self, page) -> dict:
         """选门店。**返回值别丢**：取货时段就挂在这一步的响应里。"""
@@ -1443,7 +1490,10 @@ class FastCheckout:
                     # 退出等于 30~40s 盲区，而放货是成串来的。复位到第 1 步接着蹲。
                     self.log(f"[蹲守] 命中后没走通（{e}），复位到第 1 步接着蹲")
                     self.slot = None
-                    self.step1_pickup(page)
+                    # 第 4~6 步没走通时会话已经过了选店页（停在 pickupContact /
+                    # billing），直接发第 1 步只会原样回那一节；先退回选店页。
+                    if not self._unpark(page, e):
+                        self.step1_pickup(page)
                     last_return = clock()
                     return None
             return None
@@ -1466,6 +1516,14 @@ class FastCheckout:
             return False, "⚠️ 预热被拦", f"{e}。checkoutx 被 541，冷却后重建。"
         except Stalled as e:
             self.log(f"[蹲守] 预热 search 没推进（{e}），接着蹲")
+            try:
+                self._unpark(page, e)
+            except SessionExpired as e2:
+                return False, "rebuild", f"{e2}"
+            except Blocked as e2:
+                self.failure_kind = "blocked"
+                self.retry_after = max(self.retry_after, getattr(e2, "retry_after", 0.0) or 0.0)
+                return False, "⚠️ 预热被拦", f"{e2}。checkoutx 被 541，冷却后重建。"
         except RuntimeError as e:
             soft_fails += 1
             self.log(f"[蹲守] 预热 search 出错（{e}），接着蹲")
@@ -1515,6 +1573,8 @@ class FastCheckout:
                         f"{e}。checkoutx 被 541，静默冷却后换个新会话重建。")
                 except Stalled as e:
                     self.log(f"[蹲守] 这一发没推进（{e}），接着蹲")
+                    if self._unpark(page, e):
+                        last_return = clock()
                 except RuntimeError as e:
                     # fetch 超时 / 瞬时断连 / 非 200：一次不算数，连着 3 次才重建。
                     # 原来任何一次都直接丢掉整段会话，30~40s 盲区，偏偏最容易在
