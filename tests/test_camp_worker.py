@@ -188,3 +188,25 @@ class BlockedCooldownTests(unittest.TestCase):
         w._pause = pause
         w._run()
         self.assertEqual(1, len(self.reports))     # 第 5 次那一条
+
+
+class BlockedBeforeArmingTests(unittest.TestCase):
+    """541 发生在上膛之前（页面被扔到 /shop/404、读不到 stk）也要按被拦报，
+    这样 CampWorker 才会走静默冷却，而不是 30 秒一次地重撞。"""
+
+    def test_stk_failure_with_a_541_hit_becomes_a_blocked_result(self):
+        from hunter.autobuy import AutoBuy
+        blocked = {"hits": [{"status": 541, "url": "x", "retry_after": 0.0}], "retry_after": 0.0}
+        r = AutoBuy._blocked_before_arming((False, "⚠️ 读不到 x-aos-stk", "不在结账页上"), blocked, "u")
+        self.assertIsNotNone(r)
+        self.assertFalse(r.ok)
+        self.assertEqual(120, r.retry_after)
+        self.assertIn("被限流", r.stage)
+
+    def test_other_outcomes_are_left_alone(self):
+        from hunter.autobuy import AutoBuy
+        blocked = {"hits": [{"status": 541, "url": "x", "retry_after": 0.0}], "retry_after": 0.0}
+        self.assertIsNone(AutoBuy._blocked_before_arming((False, "rebuild", "到点"), blocked, "u"))
+        self.assertIsNone(AutoBuy._blocked_before_arming((True, "✅", ""), blocked, "u"))
+        self.assertIsNone(AutoBuy._blocked_before_arming(
+            (False, "⚠️ 读不到 x-aos-stk", ""), {"hits": [], "retry_after": 0.0}, "u"))

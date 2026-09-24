@@ -153,16 +153,6 @@ class CampWorker:
                 # 541 是常态噪音，不是要通知人的结论；关键是别 3 秒一撞把它捶深。
                 back = float(getattr(result, "retry_after", 0.0) or 0.0)
                 if back > 0 and not result.ok:
-                    # 走代理固定口的买手：换个出口 IP 就是干净的，不必干等静默期。
-                    # 541 按 (IP + 端点) 记，旧会话绑在旧 IP 上，换完立刻回主站重建。
-                    switched = getattr(self.buyer, "switch_exit", None)
-                    new_ip = switched(result.stage) if callable(switched) else ""
-                    if isinstance(new_ip, str) and new_ip:
-                        self._fails = 0
-                        self.log(f"[蹲守] {result.stage}——已换出口 IP {new_ip}，"
-                                 f"{self.rebuild_pause:.0f}s 后重新上膛")
-                        self._pause(self.rebuild_pause)
-                        continue
                     self._fails += 1
                     # 连击加档：跟主程序的熔断器一个思路（README「被拦之后」），
                     # 静默期里探一次就续一次，越探越出不来，所以越连击停得越久。

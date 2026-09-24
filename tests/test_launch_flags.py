@@ -80,3 +80,10 @@ class CheckoutProxyTests(unittest.TestCase):
         logs.clear()
         ab._check_proxy_flag(ctx)
         self.assertTrue(any("结账走代理" in x for x in logs), logs)
+
+
+class ProxyCredentialTests(unittest.TestCase):
+    def test_percent_encoded_password_is_decoded(self):
+        from hunter.autobuy import playwright_proxy
+        self.assertEqual({"server": "http://203.0.113.1:8081", "username": "hunter", "password": "Nw@x"},
+                         playwright_proxy("http://hunter:Nw%40x@203.0.113.1:8081"))

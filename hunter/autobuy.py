@@ -250,14 +250,9 @@ class AutoBuy:
         self.mode = self.cfg.get("mode", "auto")
         self.cdp_url = self.cfg.get("cdp_url", "")
         self.cdp_port = int(self.cfg.get("cdp_port", DEFAULT_CDP_PORT))
-        #: 结账走的固定 IP 代理（tools/rotating-proxy.py 的 --sticky 口），如
-        #: "http://1.2.3.4:8081"。留空直连。只对 Apple 的域生效，其余流量直连。
+        #: 结账走的固定 IP 代理，如 "http://1.2.3.4:8081"。留空直连。
+        #: 只对 Apple 的域生效，其余流量直连。
         self.proxy = str(self.cfg.get("proxy") or "").strip()
-        #: 固定口的控制接口：被 541 之后换出口 IP。没配代理就是 None。
-        self.proxyctl = None
-        if self.proxy:
-            from .proxyctl import ProxyControl
-            self.proxyctl = ProxyControl(self.proxy)
         self.profile = root / self.cfg.get("profile_dir", ".browser-profile")
         self.headless = bool(self.cfg.get("headless", False))
         self.trade_in_text = self.cfg.get("trade_in", "不折抵")
@@ -944,27 +939,6 @@ class AutoBuy:
                 else:
                     self.log("[自动下单] 浏览器保持打开，等你确认付款")
 
-    def switch_exit(self, why: str = "") -> str:
-        """被 541 了：让固定口换一个出站 IP。换成了返回新 IP，否则返回空串。
-
-        换 IP 只对「按 IP 记的封」有用，也就是 checkoutx 的 541。换完调用方要
-        立刻回主站重建会话——旧会话绑在旧 IP 上，接着用只会一路 541。
-        """
-        if self.proxyctl is None:
-            return ""
-        from .proxyctl import ProxyControlError
-        try:
-            got = self.proxyctl.rotate()
-        except (ProxyControlError, ValueError) as e:
-            self.log(f"[自动下单] ⚠️ 换出口 IP 失败（{e}），只能按老办法静默冷却")
-            return ""
-        if not got.get("rotated"):
-            self.log(f"[自动下单] 固定口只有一个 IP（{got.get('ip')}），换不了，静默冷却")
-            return ""
-        self.log(f"[自动下单] {why or '被拦'}——出口 IP 已换：{got.get('previous')} → {got.get('ip')}"
-                 f"（这个口共 {got.get('pool')} 个），立刻重建会话")
-        return str(got.get("ip") or "")
-
     def _check_proxy_flag(self, ctx) -> None:
         """配了 autobuy.proxy 但挂的是别人起的 Chrome：代理只能在启动参数里给，
         挂上去之后改不了。读一眼 chrome://version 的命令行，没带就喊出来——
@@ -1047,9 +1021,6 @@ class AutoBuy:
                 return self._drive_inner(ctx, page, url, False, in_stock, in_stock_numbers)
         except Blocked as e:
             self._reload_next = True   # 购物袋/入口被 541 也绑在页面状态上，下一轮回主站
-            if self.switch_exit("购买链路被 541"):
-                return BuyResult(False, "⚠️ 购买链路被限流，已换出口", page.url, str(e),
-                                 retriable=False, retry_after=3.0)
             return BuyResult(False, "⚠️ 购买链路被限流，已停止", page.url, str(e),
                              retriable=False, retry_after=max(120, e.retry_after))
         except QuotaReached as e:
@@ -1349,7 +1320,7 @@ class AutoBuy:
         实录（2026-09-24 00:37）：进结账那一刻 URL 还是 /shop/checkout，页面自己的
         fulfillment XHR 被 541，前端把标签扔到 /shop/404，蹲守随后读不到 x-aos-stk。
         这个结果原来走的是普通失败路径：30/60/120 秒一次地重试，每次都再撞一下
-        checkoutx，而被拦分支（静默冷却、或走代理时换出口 IP）根本没进去。
+        checkoutx，而被拦分支（静默冷却）根本没进去。
         """
         ok, stage = outcome[0], outcome[1]     # OrderPlacer.camp 回的是 4 元组（多一个订单号）
         if ok or not blocked.get("hits") or "读不到 x-aos-stk" not in str(stage):
@@ -1885,8 +1856,7 @@ def windows_userprofile() -> str | None:
         return None
 
 
-#: 结账代理只接管这些域（含子域）：跟 tools/rotating-proxy.py 放行的一致。
-#: 其余流量直连——那台代理只转 Apple，别的走它只会被 403。
+#: 结账代理只接管这些域（含子域），其余流量直连。
 PROXY_HOSTS = ("apple.com.cn", "apple.com", "icloud.com.cn", "cdn-apple.com", "mzstatic.com")
 
 
@@ -1895,7 +1865,7 @@ def proxy_pac(proxy_url: str) -> str:
 
     Chrome 的 --proxy-server 是全局的、--proxy-bypass-list 只能写「不走代理的」，
     表达不了「只有 Apple 走」；PAC 可以。代理凭据 PAC 带不了，所以那台代理
-    用 --allow 放行买手机器的 IP。
+    得按来源 IP 放行买手机器。
     """
     u = urlparse(proxy_url if "://" in proxy_url else "http://" + proxy_url)
     if not u.hostname or not u.port:
@@ -1922,7 +1892,7 @@ def playwright_proxy(proxy_url: str) -> dict:
     out = {"server": f"{u.scheme or 'http'}://{u.hostname}:{u.port}",
            "bypass": ""}
     # Playwright 的 bypass 是「不走代理的」，写不出「只有 Apple 走」；兜底模式
-    # 是临时应急，全走代理也行——反正那台只转 Apple，别的 403 掉。
+    # 是临时应急，全走代理也行。
     del out["bypass"]
     if u.username:
         out["username"] = unquote(u.username)
